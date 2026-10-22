@@ -333,6 +333,37 @@ def _captured_logprobs(sampler: _LogitsSampler, expected_steps: int) -> Tensor:
     return stacked
 
 
+def _make_generation_config_savable(model: Module) -> None:
+    """Enable sampling in a generation config that sets sampling parameters.
+
+    Transformers refuses to save a generation config that sets sampling
+    parameters without ``do_sample`` (GLM-5.3 ships ``top_p`` alone), which
+    aborts the whole export. Such parameters show the model's authors intended
+    sampling, so enable it, unless the config is invalid for other reasons.
+    """
+    import copy
+
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None:
+        return
+    try:
+        generation_config.validate(strict=True)
+        return
+    except ValueError:
+        pass
+    repaired = copy.deepcopy(generation_config)
+    repaired.do_sample = True
+    try:
+        repaired.validate(strict=True)
+    except ValueError:
+        return
+    print(
+        "* [yellow]Enabling sampling in the generation config, which sets "
+        "sampling parameters without it[/]"
+    )
+    model.generation_config = repaired
+
+
 def _forward_supports_logits_to_keep(model: Module) -> bool:
     """Return whether the underlying model explicitly limits output logits.
 
@@ -787,6 +818,23 @@ class SteeringEngine:
         encode_fn = mod.encode_messages
         tok = self.tokenizer
 
+        # DeepSeek-V4's official encoder has no add_generation_prompt: it ends a
+        # conversation whose last message is from the user with the assistant
+        # prefix itself. Only pass the flag to encoders that accept it.
+        params = inspect.signature(encode_fn).parameters.values()
+        takes_generation_prompt = any(
+            p.name == "add_generation_prompt" or p.kind is p.VAR_KEYWORD for p in params
+        )
+
+        def _encode(messages, add_generation_prompt: bool) -> str:
+            if takes_generation_prompt:
+                return encode_fn(
+                    messages,
+                    add_generation_prompt=add_generation_prompt,
+                    **encoder_kwargs,
+                )
+            return encode_fn(messages, **encoder_kwargs)
+
         def _patched(
             conversation,
             tokenize: bool = True,
@@ -800,20 +848,9 @@ class SteeringEngine:
                 and conversation
                 and isinstance(conversation[0], list)
             ):
-                texts = [
-                    encode_fn(
-                        c,
-                        add_generation_prompt=add_generation_prompt,
-                        **encoder_kwargs,
-                    )
-                    for c in conversation
-                ]
+                texts = [_encode(c, add_generation_prompt) for c in conversation]
             else:
-                texts = encode_fn(
-                    conversation,
-                    add_generation_prompt=add_generation_prompt,
-                    **encoder_kwargs,
-                )
+                texts = _encode(conversation, add_generation_prompt)
 
             if not tokenize:
                 return texts
@@ -1153,6 +1190,10 @@ class SteeringEngine:
             _register("attn.v_proj", layer.self_attn.v_proj)  # ty:ignore[possibly-missing-attribute]
         with suppress(Exception):
             _register("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
+        # DeepSeek-V4 — the grouped attention output goes through o_a_proj,
+        # then o_b_proj back to the hidden size; o_b_proj writes the residual.
+        with suppress(Exception):
+            _register("attn.o_proj", layer.self_attn.o_b_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Multi-head Latent Attention (MLA) projections — DeepSeek-V2/V3,
         # GLM-4.7-Flash, Qwen3-Next. Q goes through a low-rank LoRA pair
@@ -1661,11 +1702,14 @@ class SteeringEngine:
                     p.data = adapter_state[n].to(p.device)
 
             print("* Merging LoRA adapters into base model...")
-            return peft_model.merge_and_unload()
+            merged = peft_model.merge_and_unload()
+            _make_generation_config_savable(merged)
+            return merged
         else:
             print("* Merging LoRA adapters into base model...")
             merged = self.model.merge_and_unload()
             self.needs_reload = True
+            _make_generation_config_savable(merged)
             return merged
 
     def _cache_dequant(self, mid: int, weight: Tensor) -> None:
@@ -2016,8 +2060,18 @@ class SteeringEngine:
         outputs = self.model(**inputs, **forward_kwargs)
         hidden_states = outputs.hidden_states
 
+        def at_offset(hs: Tensor) -> Tensor:
+            residual = hs[:, token_offset]
+            # Models with Hyper-Connections (DeepSeek-V4, GLM-5.3) carry several
+            # residual streams: (batch, seq, streams, hidden). Their mixing is
+            # doubly stochastic, so the sum of the streams evolves like an
+            # ordinary residual, to which each block adds its output; use the mean.
+            if residual.dim() == 3:
+                residual = residual.mean(dim=1)
+            return residual
+
         residuals = torch.stack(
-            [hs[:, token_offset, :] for hs in hidden_states],
+            [at_offset(hs) for hs in hidden_states],
             dim=1,
         ).to(torch.float32)
 
