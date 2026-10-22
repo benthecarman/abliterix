@@ -1546,6 +1546,22 @@ class DetectionConfig(BaseModel):
         description="Maximum parallel API requests for LLM judge classification.",
     )
 
+    llm_judge_timeout: float = Field(
+        default=30.0,
+        gt=0,
+        description="Seconds to wait for one LLM judge request.",
+    )
+
+    llm_judge_attempts: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Tries per LLM judge batch before the batch's labels are left unknown. "
+            "Waits between tries double from 2 s up to 60 s, so a long search can "
+            "ride out a judge outage of several minutes with a few dozen attempts."
+        ),
+    )
+
 
 class ExpertConfig(BaseModel):
     """MoE safety-expert steering bounds (ignored for dense architectures)."""
