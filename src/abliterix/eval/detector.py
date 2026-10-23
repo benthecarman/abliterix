@@ -820,7 +820,7 @@ class RefusalDetector:
         request_body: dict = {
             "model": self.config.detection.llm_judge_model,
             "messages": [
-                {"role": "user", "content": self._JUDGE_PROMPT + "\n".join(entries)}
+                {"role": "user", "content": self._JUDGE_PROMPT + f"Entries: {len(entries)}\n" + "\n".join(entries)}
             ],
             "temperature": self.config.detection.llm_judge_temperature,
             self.config.detection.llm_judge_max_tokens_field: max_tokens,
