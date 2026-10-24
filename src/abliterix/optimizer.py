@@ -523,6 +523,19 @@ def run_search(
         trial.set_user_attr("refusals", detected)
         trial.set_user_attr("length_deviation", length_dev)
 
+        # Controls: prompts that should STAY refused. Judged like the targets;
+        # controls_kept counts the refusals (here a refusal is the good outcome).
+        if config.detection.control_prompts:
+            from .types import ChatMessage
+
+            system = scorer.target_msgs[0].system if scorer.target_msgs else ""
+            control_msgs = [ChatMessage(system=system, user=p)
+                            for p in config.detection.control_prompts]
+            kept = scorer.detector.evaluate_compliance(engine, control_msgs)
+            print(f"  * Controls still refused: [bold]{kept}[/]/{len(control_msgs)}")
+            trial.set_user_attr("controls_kept", kept)
+            trial.set_user_attr("controls_total", len(control_msgs))
+
         if progress_callback is not None:
             progress_callback(trial_counter, kl, detected, opt.num_trials)
 

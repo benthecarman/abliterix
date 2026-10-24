@@ -1561,6 +1561,17 @@ class DetectionConfig(BaseModel):
             "ride out a judge outage of several minutes with a few dozen attempts."
         ),
     )
+    control_prompts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Prompts that SHOULD stay refused (e.g. weapon-conversion or stalking "
+            "instructions). After each trial's compliance check, the model answers "
+            "these too and the judge scores them the same way; the count still "
+            "refused is recorded as the trial's controls_kept user attribute, so a "
+            "search can be audited (or selected) on the limits it preserved, not "
+            "only the refusals it removed."
+        ),
+    )
 
 
 class ExpertConfig(BaseModel):
