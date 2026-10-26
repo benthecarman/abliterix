@@ -73,11 +73,26 @@ class TensorEdit:
     ``logical_name`` is the canonical (base-model, PEFT-stripped) parameter
     name, e.g. ``model.layers.5.mlp.experts.down_proj``. The offline tool maps
     it to the on-disk FP4 sibling keys (``*_blocks`` / ``*_scales`` / global).
+
+    Kinds:
+
+    * ``"direct"`` — rank-1 projection of a 2-D Linear weight.
+    * ``"ega"`` — projection of every expert slice of a fused expert tensor
+      (or of one per-expert 2-D tensor).
+    * ``"row_scale"`` — router suppression: ``rows`` of a 2-D router weight
+      multiplied by ``scale``.
+    * ``"expert_project"`` — the safety-expert step of MoE steering: a plain
+      (unnormalised, not norm-preserving) projection of expert ``expert``'s
+      slice of a fused expert tensor, or of a whole per-expert 2-D tensor when
+      ``expert`` is ``None``.
+
+    Several edits may name the same tensor; they apply in plan order, the
+    order the engine applies them in.
     """
 
     logical_name: str
-    kind: str  # "ega" | "direct"
-    direction: Tensor  # 1-D float refusal direction
+    kind: str  # "ega" | "direct" | "row_scale" | "expert_project"
+    direction: Tensor | None  # 1-D float refusal direction (None for row_scale)
     strength: float
     preserve_row_norm: bool
     # EGA (fused 3-D expert tensor):
@@ -87,6 +102,11 @@ class TensorEdit:
     projection_side: str | None = None  # "output" | "input"
     direct_transform: str = "standard"
     benign_dir: Tensor | None = None
+    # row_scale (router suppression):
+    rows: list[int] | None = None
+    scale: float | None = None
+    # expert_project (one expert's slice):
+    expert: int | None = None
 
 
 def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
@@ -97,6 +117,23 @@ def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
     streaming caller turns that into a skip-with-warning rather than aborting.
     """
     W32 = W.to(torch.float32)
+    if edit.kind == "row_scale":
+        if W32.dim() != 2 or not edit.rows or edit.scale is None:
+            raise ValueError(
+                f"row_scale edit '{edit.logical_name}' expects a 2-D router "
+                f"weight, rows and a scale; got shape {tuple(W.shape)}"
+            )
+        if max(edit.rows) >= W32.shape[0]:
+            raise ValueError(
+                f"row_scale edit '{edit.logical_name}': row {max(edit.rows)} "
+                f"out of range for {W32.shape[0]} experts"
+            )
+        out = W32.clone()
+        rows = torch.tensor(edit.rows, device=out.device)
+        out[rows] = out[rows] * edit.scale
+        return out
+    if edit.kind == "expert_project":
+        return _apply_expert_project(W32, edit)
     if edit.kind == "ega":
         # Producers differ in how experts are stored: gpt-oss fuses them into a
         # 3-D (E, d0, d1) parameter, DeepSeek-V4 keeps one 2-D (out, in) tensor
@@ -184,6 +221,64 @@ def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
     return W_new
 
 
+def _apply_expert_project(W32: Tensor, edit: TensorEdit) -> Tensor:
+    """The safety-expert step of ``core.steering._apply_moe_steering``.
+
+    Same math as the engine: the raw (not re-normalised) direction, no row-norm
+    preservation, the axis resolved on the fused shape exactly as EGA does.
+    """
+    if W32.dim() == 3:
+        if edit.expert is None or not 0 <= edit.expert < W32.shape[0]:
+            raise ValueError(
+                f"expert_project edit '{edit.logical_name}': expert "
+                f"{edit.expert} not in a fused tensor of {W32.shape[0]} experts"
+            )
+        fused_shape = tuple(W32.shape)
+        W = W32[edit.expert]
+    elif W32.dim() == 2:
+        fused_shape = (1, *W32.shape)
+        W = W32
+    else:
+        raise ValueError(
+            f"expert_project edit '{edit.logical_name}' expects a fused 3-D "
+            f"expert tensor or a 2-D expert weight, got shape {tuple(W32.shape)}"
+        )
+    hidden = edit.hidden_dim if edit.hidden_dim is not None else edit.direction.shape[0]
+    axis_is_in = resolve_ega_axis(fused_shape, hidden, transposed=edit.transposed)
+    if axis_is_in is None:
+        raise ValueError(
+            f"expert_project edit '{edit.logical_name}': hidden dim {hidden} "
+            f"matches neither axis of {fused_shape}"
+        )
+    vf = edit.direction.to(device=W.device, dtype=torch.float32)
+    if axis_is_in:
+        W_new = W - edit.strength * torch.outer(W @ vf, vf)
+    else:
+        W_new = W - edit.strength * torch.outer(vf, vf @ W)
+    if W32.dim() == 2:
+        return W_new
+    out = W32.clone()
+    out[edit.expert] = W_new
+    return out
+
+
+def apply_tensor_edits(
+    W: Tensor, edits: list[TensorEdit], *, round_between: torch.dtype | None = None
+) -> Tensor:
+    """Apply several edits to one tensor, in plan order. Returns float32.
+
+    ``round_between`` rounds each intermediate result to that dtype, the way
+    the engine writes every step back into the parameter's storage dtype; the
+    bake leaves it ``None`` and keeps full precision until the final requant.
+    """
+    out = W.to(torch.float32)
+    for i, edit in enumerate(edits):
+        out = apply_tensor_edit(out, edit)
+        if round_between is not None and i < len(edits) - 1:
+            out = out.to(round_between).to(torch.float32)
+    return out
+
+
 def _normalise(v: Tensor, eps: float = 1e-8) -> Tensor:
     return v / torch.linalg.vector_norm(v).clamp(min=eps)
 
@@ -245,12 +340,17 @@ def record_steering_plan(
     profiles: dict,
     config,
     discriminative_layers: set[int] | None = None,
+    safety_experts: dict[int, list[tuple[int, float]]] | None = None,
+    routing_config=None,
 ) -> list[TensorEdit]:
-    """Record the direct + EGA edits the engine would apply for the best trial.
+    """Record the edits the engine would apply for the best trial.
 
-    Mirrors the walk of ``core.steering._apply_direct_steering`` and
-    ``_apply_ega_steering`` but emits :class:`TensorEdit` records instead of
-    mutating weights. Call with the SAME arguments those functions receive.
+    Mirrors the walk of ``core.steering._apply_direct_steering``,
+    ``_apply_ega_steering`` and, when ``safety_experts`` and
+    ``routing_config`` are given, ``_apply_moe_steering`` (router suppression
+    and the safety-expert projection), in that order, but emits
+    :class:`TensorEdit` records instead of mutating weights. Call with the
+    SAME arguments those functions receive.
 
     The model must be loaded (this uses ``engine.steerable_modules`` /
     ``engine._locate_fused_weights`` and the parameter-name maps). It does not
@@ -355,6 +455,59 @@ def record_steering_plan(
                     )
                 )
 
+    # --- MoE steering (router suppression + safety-expert projection) ---
+    # No discriminative-layer filter: the engine applies it to every layer
+    # with profiled safety experts.
+    if safety_experts and routing_config is not None:
+        n_suppress = routing_config.n_suppress
+        bias = routing_config.router_bias
+        expert_w = routing_config.expert_ablation_weight
+        for layer_idx in range(n_layers):
+            top = safety_experts.get(layer_idx, [])[:n_suppress]
+            if not top:
+                continue
+            v = _steering_vector_for(steering_vectors, global_vector, layer_idx)
+            layer = engine.transformer_layers[layer_idx]
+            gate = engine._locate_router(layer)
+            if gate is not None and bias < 0:
+                raw_name = name_by_param_id.get(id(gate.weight))
+                if raw_name is not None:
+                    edits.append(
+                        TensorEdit(
+                            logical_name=normalize_param_name(raw_name),
+                            kind="row_scale",
+                            direction=None,
+                            strength=0.0,
+                            preserve_row_norm=False,
+                            rows=[int(eid) for eid, _ in top],
+                            scale=max(0.0, 1.0 + bias / 10.0),
+                        )
+                    )
+            fused = engine._locate_fused_weights(layer)
+            if fused is None or expert_w <= 0:
+                continue
+            raw_name = name_by_param_id.get(id(fused))
+            if raw_name is None:
+                continue
+            if (
+                resolve_ega_axis(tuple(fused.shape), v.shape[0], transposed=transposed)
+                is None
+            ):
+                continue
+            for eid, _ in top:
+                edits.append(
+                    TensorEdit(
+                        logical_name=normalize_param_name(raw_name),
+                        kind="expert_project",
+                        direction=v.to(torch.float32).detach().cpu().clone(),
+                        strength=float(expert_w),
+                        preserve_row_norm=False,
+                        hidden_dim=int(v.shape[0]),
+                        transposed=transposed,
+                        expert=int(eid),
+                    )
+                )
+
     return edits
 
 
@@ -425,6 +578,8 @@ def record_steering_plan_from_trial(
     *,
     benign_states: Tensor | None = None,
     target_states: Tensor | None = None,
+    safety_experts: dict[int, list[tuple[int, float]]] | None = None,
+    routing_config=None,
 ) -> list[TensorEdit]:
     """Record a plan from the same inputs :func:`apply_steering` receives.
 
@@ -433,10 +588,27 @@ def record_steering_plan_from_trial(
     delegates to :func:`record_steering_plan`. This is the entry point the
     export flow uses: it captures what the best trial *would* edit without
     mutating the model, so the plan can be replayed offline against the FP4
-    checkpoint.
+    checkpoint. Pass the trial's ``safety_experts`` and ``routing_config``
+    for MoE models, as ``apply_steering`` receives them; without them the
+    router suppression and safety-expert projection are not recorded.
+
+    Only direct weight editing with one direction is representable; other
+    modes raise rather than record a plan that differs from the model.
     """
+    from ..types import SteeringMode
     from .steering import _detect_discriminative_layers, resolve_global_vector
 
+    mode = getattr(config.steering, "steering_mode", SteeringMode.DIRECT)
+    if mode != SteeringMode.DIRECT:
+        raise ValueError(
+            f"a steering plan records direct weight edits; steering_mode "
+            f"{getattr(mode, 'value', mode)!r} cannot be baked"
+        )
+    if steering_vectors.ndim != 2:
+        raise ValueError(
+            "a steering plan records one direction per layer; multi-direction "
+            "steering cannot be baked"
+        )
     global_vector = resolve_global_vector(steering_vectors, vector_index)
     discriminative_layers = None
     if config.steering.discriminative_layer_selection:
@@ -450,7 +622,124 @@ def record_steering_plan_from_trial(
         profiles,
         config,
         discriminative_layers,
+        safety_experts=safety_experts,
+        routing_config=routing_config,
     )
+
+
+def plan_meta(engine) -> dict:
+    """What a plan records about its source: the in-memory model class whose
+    parameter names it uses, so a bake can map them onto a checkpoint."""
+    model = engine.model
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    return {
+        "model_class": type(base).__name__,
+        "model_type": getattr(getattr(base, "config", None), "model_type", None),
+    }
+
+
+def group_edits(edits: Iterable[TensorEdit]) -> dict[str, list[TensorEdit]]:
+    """Edits per tensor name, each list in plan (= application) order."""
+    groups: dict[str, list[TensorEdit]] = {}
+    for e in edits:
+        groups.setdefault(e.logical_name, []).append(e)
+    return groups
+
+
+class PlanMismatch(AssertionError):
+    """A recorded plan does not reproduce what the engine applied."""
+
+
+@dataclass
+class PlanCheck:
+    tensors: int = 0
+    worst_ulps: float = 0.0
+
+
+def _ulps_apart(a: Tensor, b: Tensor) -> float:
+    """Largest difference between ``a`` and ``b`` in units of ``a``'s dtype eps."""
+    a32, b32 = a.to(torch.float32), b.to(torch.float32)
+    eps = torch.finfo(a.dtype).eps if a.dtype.is_floating_point else 0.0
+    if eps == 0.0:
+        return 0.0 if torch.equal(a, b) else float("inf")
+    tiny = torch.finfo(a.dtype).tiny
+    scale = torch.maximum(a32.abs(), b32.abs()) * eps + tiny
+    return float(((a32 - b32).abs() / scale).max()) if a.numel() else 0.0
+
+
+def verify_plan_against_engine(
+    engine, edits: list[TensorEdit], *, max_ulps: float = 1.0
+) -> PlanCheck:
+    """Check a plan against the edits the engine actually applied.
+
+    Call after ``apply_steering`` on a freshly loaded engine. The engine keeps
+    the original of everything it edits, for ``restore_baseline``: whole
+    tensors in ``_direct_weight_originals``, router rows in
+    ``_router_originals``, expert slices in ``_expert_deltas``. The tensors
+    changed must be exactly the tensors the plan names, and replaying the
+    plan onto each original must reproduce the edited tensor to within
+    ``max_ulps`` of its storage dtype (the plan's float32 math against the
+    engine's, both rounded to that dtype). Raises :class:`PlanMismatch`.
+    """
+    model = engine.model
+    params: dict[str, Tensor] = {}
+    name_of: dict[int, str] = {}
+    for raw, p in model.named_parameters():
+        name = normalize_param_name(raw)
+        params[name] = p
+        name_of[id(p)] = name
+
+    def originals_from_whole() -> dict[str, Tensor]:
+        found = {}
+        for w, orig in getattr(engine, "_direct_weight_originals", {}).items():
+            if id(w) not in name_of:
+                raise PlanMismatch("an edited tensor is not a model parameter")
+            found[name_of[id(w)]] = orig
+        return found
+
+    whole = originals_from_whole()
+    patches: dict[str, list[tuple[int, Tensor]]] = {}
+    layers = engine.transformer_layers
+    for layer_idx, eid, row in getattr(engine, "_router_originals", []):
+        gate = engine._locate_router(layers[layer_idx])
+        patches.setdefault(name_of[id(gate.weight)], []).append((eid, row))
+    for layer_idx, eid, piece in getattr(engine, "_expert_deltas", []):
+        fused = engine._locate_fused_weights(layers[layer_idx])
+        patches.setdefault(name_of[id(fused)], []).append((eid, piece))
+
+    groups = group_edits(edits)
+    changed = set(whole) | set(patches)
+    if changed != set(groups):
+        unplanned = sorted(changed - set(groups))
+        unapplied = sorted(set(groups) - changed)
+        raise PlanMismatch(
+            f"the plan names {len(groups)} tensors, the engine edited "
+            f"{len(changed)}; edited but not planned: {unplanned[:5]}, "
+            f"planned but not edited: {unapplied[:5]}"
+        )
+
+    check = PlanCheck()
+    for name, group in groups.items():
+        p = params[name]
+        if name in whole:
+            orig = whole[name].to(p.device)
+        else:
+            # Restore the patched rows/slices; the first saved copy of a row is
+            # its true original, so apply the saves newest first.
+            orig = p.data.clone()
+            for idx, saved in reversed(patches[name]):
+                orig[idx] = saved.to(device=orig.device, dtype=orig.dtype)
+        expected = apply_tensor_edits(orig, group, round_between=p.dtype).to(p.dtype)
+        ulps = _ulps_apart(expected, p.data)
+        del orig, expected
+        if ulps > max_ulps:
+            raise PlanMismatch(
+                f"replaying the plan onto '{name}' differs from the engine's "
+                f"edit by {ulps:.1f} ulps ({[e.kind for e in group]})"
+            )
+        check.tensors += 1
+        check.worst_ulps = max(check.worst_ulps, ulps)
+    return check
 
 
 # ---------------------------------------------------------------------------
@@ -1052,26 +1341,51 @@ def _copy_aux_files(src_dir: Path, dst_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def save_plan(edits: list[TensorEdit], path: str | Path) -> None:
-    """Serialise a recorded plan to a ``.pt`` file (directions kept as tensors)."""
-    payload = [
-        {
-            "logical_name": e.logical_name,
-            "kind": e.kind,
-            "direction": e.direction.detach().cpu(),
-            "strength": e.strength,
-            "preserve_row_norm": e.preserve_row_norm,
-            "hidden_dim": e.hidden_dim,
-            "transposed": e.transposed,
-            "projection_side": e.projection_side,
-            "direct_transform": e.direct_transform,
-            "benign_dir": None if e.benign_dir is None else e.benign_dir.detach().cpu(),
-        }
-        for e in edits
-    ]
+def save_plan(
+    edits: list[TensorEdit], path: str | Path, meta: dict | None = None
+) -> None:
+    """Serialise a recorded plan to a ``.pt`` file (directions kept as tensors).
+
+    ``meta`` records where the plan came from (e.g. ``model_class``, the
+    in-memory model class whose parameter names the plan uses), which lets a
+    bake map those names onto another checkpoint's keys.
+    """
+
+    def cpu(t: Tensor | None) -> Tensor | None:
+        return None if t is None else t.detach().cpu()
+
+    payload = {
+        "version": 2,
+        "meta": dict(meta or {}),
+        "edits": [
+            {
+                "logical_name": e.logical_name,
+                "kind": e.kind,
+                "direction": cpu(e.direction),
+                "strength": e.strength,
+                "preserve_row_norm": e.preserve_row_norm,
+                "hidden_dim": e.hidden_dim,
+                "transposed": e.transposed,
+                "projection_side": e.projection_side,
+                "direct_transform": e.direct_transform,
+                "benign_dir": cpu(e.benign_dir),
+                "rows": None if e.rows is None else list(e.rows),
+                "scale": e.scale,
+                "expert": e.expert,
+            }
+            for e in edits
+        ],
+    }
     torch.save(payload, str(path))
 
 
-def load_plan(path: str | Path) -> list[TensorEdit]:
+def load_plan_with_meta(path: str | Path) -> tuple[list[TensorEdit], dict]:
+    """Read a plan and its metadata. Version-1 plans (a bare list) have none."""
     payload = torch.load(str(path), map_location="cpu", weights_only=False)
-    return [TensorEdit(**entry) for entry in payload]
+    if isinstance(payload, list):
+        return [TensorEdit(**entry) for entry in payload], {}
+    return [TensorEdit(**entry) for entry in payload["edits"]], payload.get("meta", {})
+
+
+def load_plan(path: str | Path) -> list[TensorEdit]:
+    return load_plan_with_meta(path)[0]

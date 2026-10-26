@@ -894,3 +894,233 @@ def test_fp8_without_scale_is_refused_not_mangled(tmp_path):
     ]
     with pytest.raises(ValueError, match="no scale sibling"):
         rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+
+
+# ---------------------------------------------------------------------------
+# MoE steering in plans: router suppression + safety-expert projection, and
+# the check of a plan against what the engine applied
+# ---------------------------------------------------------------------------
+
+
+class _MoeLayer(nn.Module):
+    def __init__(self, hidden, inter, E):
+        super().__init__()
+        self.self_attn = _TinyAttn(hidden)
+        self.mlp = nn.Module()
+        self.mlp.gate = nn.Linear(hidden, E, bias=False)
+        self.mlp.experts_down = nn.Parameter(torch.randn(E, hidden, inter) * 0.1)
+
+
+class _MoeModel(nn.Module):
+    def __init__(self, n_layers, hidden, inter, E):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_MoeLayer(hidden, inter, E) for _ in range(n_layers)]
+        )
+
+
+def _moe_engine(n_layers=3, hidden=8, inter=16, E=6, dtype=torch.float32):
+    torch.manual_seed(7)
+    model = _MoeModel(n_layers, hidden, inter, E).to(dtype)
+    layers = list(model.layers)
+    return SimpleNamespace(
+        model=model,
+        transformer_layers=layers,
+        steerable_modules=lambda i: {"attn.o_proj": [layers[i].self_attn.o_proj]},
+        _locate_fused_weights=lambda layer: layer.mlp.experts_down,
+        _locate_router=lambda layer: layer.mlp.gate,
+        has_expert_routing=lambda: True,
+        _fused_down_proj_transposed=False,
+        _router_originals=[],
+        _expert_deltas=[],
+    )
+
+
+def _moe_trial(n_layers=3, hidden=8):
+    from abliterix.types import ExpertRoutingConfig
+
+    svs = torch.randn(n_layers + 1, hidden)
+    svs = svs / svs.norm(dim=1, keepdim=True)
+    profiles = {
+        "attn.o_proj": SteeringProfile(1.5, 1.0, 0.5, 2.0),
+        "mlp.down_proj": SteeringProfile(2.0, 1.0, 1.0, 2.0),
+    }
+    safety = {0: [(4, 0.9), (1, 0.5)], 2: [(0, 0.7), (3, 0.6), (5, 0.2)]}
+    routing = ExpertRoutingConfig(
+        n_suppress=2, router_bias=-4.0, expert_ablation_weight=0.8
+    )
+    return svs, profiles, safety, routing
+
+
+def _engine_cfg():
+    """What the engine's own steering functions read, beyond _cfg()."""
+    from abliterix.types import DirectTransform
+
+    cfg = _cfg(norm=WeightNorm.FULL)
+    cfg.steering.direct_transform = DirectTransform.STANDARD
+    cfg.steering.direct_transform_preserve_row_norm = True
+    return cfg
+
+
+def _apply_engine_steering(eng, svs, profiles, cfg, safety, routing):
+    from abliterix.core.steering import (
+        _apply_direct_steering,
+        _apply_ega_steering,
+        _apply_moe_steering,
+    )
+
+    _apply_direct_steering(eng, svs, None, profiles, cfg, None)
+    _apply_ega_steering(eng, svs, None, profiles, cfg, None)
+    _apply_moe_steering(eng, svs, None, safety, routing)
+
+
+def test_row_scale_edit_scales_only_the_named_rows():
+    W = torch.randn(6, 8)
+    edit = rp.TensorEdit("g", "row_scale", None, 0.0, False, rows=[1, 4], scale=0.6)
+    out = rp.apply_tensor_edit(W, edit)
+    assert torch.allclose(out[[1, 4]], W[[1, 4]] * 0.6)
+    keep = [0, 2, 3, 5]
+    assert torch.equal(out[keep], W[keep])
+
+
+def test_expert_project_on_fused_matches_per_expert_2d():
+    torch.manual_seed(3)
+    W = torch.randn(4, 8, 16)
+    d = torch.randn(8)
+    fused = rp.TensorEdit("f", "expert_project", d, 0.7, False, hidden_dim=8, expert=2)
+    single = rp.TensorEdit("f", "expert_project", d, 0.7, False, hidden_dim=8)
+    out = rp.apply_tensor_edit(W, fused)
+    assert torch.equal(out[[0, 1, 3]], W[[0, 1, 3]])
+    assert torch.allclose(out[2], rp.apply_tensor_edit(W[2], single))
+
+
+def test_plan_records_moe_steering_and_matches_the_engine():
+    eng = _moe_engine()
+    svs, profiles, safety, routing = _moe_trial()
+    cfg = _engine_cfg()
+    edits = rp.record_steering_plan(
+        eng,
+        svs,
+        None,
+        profiles,
+        cfg,
+        None,
+        safety_experts=safety,
+        routing_config=routing,
+    )
+    kinds = [e.kind for e in edits]
+    assert kinds.count("row_scale") == 2  # one per layer with safety experts
+    assert kinds.count("expert_project") == 4  # top-2 experts in layers 0 and 2
+    # MoE edits come after EGA, the order the engine applies them in.
+    assert kinds.index("row_scale") > max(i for i, k in enumerate(kinds) if k == "ega")
+    row = next(e for e in edits if e.kind == "row_scale" and ".0." in e.logical_name)
+    assert row.rows == [4, 1] and row.scale == pytest.approx(0.6)
+
+    _apply_engine_steering(eng, svs, profiles, cfg, safety, routing)
+    check = rp.verify_plan_against_engine(eng, edits)
+    assert check.tensors == len(rp.group_edits(edits))
+
+
+def test_plan_check_holds_in_bfloat16():
+    eng = _moe_engine(dtype=torch.bfloat16)
+    svs, profiles, safety, routing = _moe_trial()
+    cfg = _engine_cfg()
+    edits = rp.record_steering_plan(
+        eng,
+        svs,
+        None,
+        profiles,
+        cfg,
+        None,
+        safety_experts=safety,
+        routing_config=routing,
+    )
+    _apply_engine_steering(eng, svs, profiles, cfg, safety, routing)
+    assert rp.verify_plan_against_engine(eng, edits).worst_ulps <= 1.0
+
+
+def test_plan_without_moe_steering_fails_the_check():
+    """The old recorder's plan (no router/expert edits) must not pass."""
+    eng = _moe_engine()
+    svs, profiles, safety, routing = _moe_trial()
+    cfg = _engine_cfg()
+    edits = rp.record_steering_plan(eng, svs, None, profiles, cfg, None)
+    _apply_engine_steering(eng, svs, profiles, cfg, safety, routing)
+    with pytest.raises(rp.PlanMismatch, match="edited but not planned"):
+        rp.verify_plan_against_engine(eng, edits)
+
+
+def test_plan_with_wrong_strength_fails_the_check():
+    eng = _moe_engine()
+    svs, profiles, safety, routing = _moe_trial()
+    cfg = _engine_cfg()
+    edits = rp.record_steering_plan(
+        eng,
+        svs,
+        None,
+        profiles,
+        cfg,
+        None,
+        safety_experts=safety,
+        routing_config=routing,
+    )
+    _apply_engine_steering(eng, svs, profiles, cfg, safety, routing)
+    next(e for e in edits if e.kind == "expert_project").strength *= 1.5
+    with pytest.raises(rp.PlanMismatch, match="ulps"):
+        rp.verify_plan_against_engine(eng, edits)
+
+
+def test_record_from_trial_refuses_lora_mode():
+    from abliterix.types import SteeringMode
+
+    eng = _mock_engine()
+    cfg = _cfg()
+    cfg.steering.steering_mode = SteeringMode.LORA
+    with pytest.raises(ValueError, match="cannot be baked"):
+        rp.record_steering_plan_from_trial(
+            eng,
+            torch.randn(3, 8),
+            None,
+            {},
+            cfg,
+            benign_states=None,
+            target_states=None,
+        )
+
+
+def test_plan_roundtrip_keeps_moe_fields_and_meta(tmp_path):
+    edits = [
+        rp.TensorEdit("g", "row_scale", None, 0.0, False, rows=[3, 1], scale=0.4),
+        rp.TensorEdit(
+            "f", "expert_project", torch.randn(8), 0.9, False, hidden_dim=8, expert=3
+        ),
+    ]
+    p = tmp_path / "plan.pt"
+    rp.save_plan(edits, p, meta={"model_class": "Glm5NextForConditionalGeneration"})
+    back, meta = rp.load_plan_with_meta(p)
+    assert back[0].rows == [3, 1] and back[0].scale == 0.4 and back[0].direction is None
+    assert back[1].expert == 3
+    assert meta == {"model_class": "Glm5NextForConditionalGeneration"}
+
+
+def test_version_one_plans_still_load(tmp_path):
+    p = tmp_path / "v1.pt"
+    torch.save(
+        [
+            {
+                "logical_name": "a",
+                "kind": "direct",
+                "direction": torch.randn(8),
+                "strength": 1.0,
+                "preserve_row_norm": True,
+                "hidden_dim": None,
+                "transposed": False,
+                "projection_side": "output",
+                "direct_transform": "standard",
+                "benign_dir": None,
+            }
+        ],
+        str(p),
+    )
+    edits, meta = rp.load_plan_with_meta(p)
+    assert edits[0].logical_name == "a" and edits[0].rows is None and meta == {}

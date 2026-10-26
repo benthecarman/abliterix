@@ -119,10 +119,14 @@ def main():
 
     # FP4 plan-only path: record the resolved edits and stop, so they can be
     # replayed offline against the FP4 checkpoint (no BF16 merge / upload).
+    # The plan is checked against the edits the engine itself applies, so a
+    # step it does not record fails here instead of vanishing from the bake.
     if args.emit_fp4_plan is not None:
         from abliterix.core.fp4_repack import (
+            plan_meta,
             record_steering_plan_from_trial,
             save_plan,
+            verify_plan_against_engine,
         )
 
         print(f"\nRecording FP4 steering plan to {args.emit_fp4_plan}...")
@@ -134,12 +138,29 @@ def main():
             config,
             benign_states=benign_states,
             target_states=target_states,
+            safety_experts=safety_experts,
+            routing_config=routing,
         )
-        save_plan(edits, args.emit_fp4_plan)
-        n_ega = sum(1 for e in edits if e.kind == "ega")
-        n_direct = sum(1 for e in edits if e.kind == "direct")
+        apply_steering(
+            engine,
+            vectors,
+            direction_index,
+            parameters,
+            config,
+            safety_experts=safety_experts,
+            routing_config=routing,
+            benign_states=benign_states,
+            target_states=target_states,
+        )
+        check = verify_plan_against_engine(engine, edits)
+        save_plan(edits, args.emit_fp4_plan, meta=plan_meta(engine))
+        counts = {
+            k: sum(1 for e in edits if e.kind == k)
+            for k in sorted({e.kind for e in edits})
+        }
         print(
-            f"Plan saved: {n_ega} EGA + {n_direct} direct edits. Bake with:\n"
+            f"Plan saved: {counts}, matching the engine on {check.tensors} "
+            f"tensors. Bake with:\n"
             f"  abliterix-abliterate-fp4 <fp4_snapshot_dir> "
             f"{args.emit_fp4_plan} <out_dir>"
         )
