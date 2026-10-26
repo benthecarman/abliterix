@@ -1359,3 +1359,123 @@ def test_nvfp4_layout_check_accepts_negative_zero_codes():
     rp._assert_layout_roundtrip(
         {"w": neg_zero, "s": scale, "g": g}, keys, f4.Fp4Format("nvfp4", 16), name="w"
     )
+
+
+# ---------------------------------------------------------------------------
+# Mapping plan names (recorded on the loaded model) onto a checkpoint's keys
+# ---------------------------------------------------------------------------
+
+
+def _tiny_qwen3_moe(path, E=4, hidden=16, inter=8):
+    """A Qwen3-MoE checkpoint the way the Hub stores it: one tensor per expert."""
+    from transformers import Qwen3MoeConfig
+
+    cfg = Qwen3MoeConfig(
+        vocab_size=32,
+        hidden_size=hidden,
+        intermediate_size=32,
+        moe_intermediate_size=inter,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        num_experts=E,
+        num_experts_per_tok=2,
+        architectures=["Qwen3MoeForCausalLM"],
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    cfg.save_pretrained(path)
+    torch.manual_seed(21)
+    tensors = {
+        f"model.layers.0.mlp.experts.{e}.down_proj.weight": torch.randn(hidden, inter)
+        for e in range(E)
+    }
+    tensors["model.layers.0.self_attn.o_proj.weight"] = torch.randn(hidden, 16)
+    tensors["model.layers.0.mlp.gate.weight"] = torch.randn(E, hidden)
+    save_file(tensors, str(path / "model.safetensors"), metadata={"format": "pt"})
+    return tensors
+
+
+def test_plan_on_fused_experts_bakes_into_per_expert_checkpoint(tmp_path):
+    src, dst = tmp_path / "q", tmp_path / "q_abl"
+    stored = _tiny_qwen3_moe(src)
+    d = torch.randn(16)
+    d = d / d.norm()
+    fused = "model.layers.0.mlp.experts.down_proj"
+    plan = [
+        rp.TensorEdit(
+            "model.layers.0.self_attn.o_proj.weight",
+            "direct",
+            d,
+            1.0,
+            True,
+            projection_side="output",
+        ),
+        rp.TensorEdit(fused, "ega", d, 1.2, True, hidden_dim=16),
+        rp.TensorEdit(
+            "model.layers.0.mlp.gate.weight",
+            "row_scale",
+            None,
+            0.0,
+            False,
+            rows=[2],
+            scale=0.3,
+        ),
+        rp.TensorEdit(fused, "expert_project", d, 0.5, False, hidden_dim=16, expert=2),
+    ]
+    mapped = rp.map_plan_to_checkpoint(plan, src, model_class="Qwen3MoeForCausalLM")
+    assert sum(1 for e in mapped if e.kind == "ega") == 4  # one per expert
+    rp.abliterate_fp4_to_disk(src, dst, mapped, use_cuda=False, verbose=False)
+    out, _ = _read_all(dst)
+
+    # The baked experts equal the plan applied to the stacked (fused) weight.
+    stack = torch.stack(
+        [stored[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] for e in range(4)]
+    )
+    want = rp.apply_tensor_edits(stack, [plan[1], plan[3]])
+    for e in range(4):
+        got = out[f"model.layers.0.mlp.experts.{e}.down_proj.weight"]
+        assert torch.allclose(got, want[e], atol=1e-6)
+    gate = out["model.layers.0.mlp.gate.weight"]
+    assert torch.allclose(gate[2], stored["model.layers.0.mlp.gate.weight"][2] * 0.3)
+
+
+def test_unmappable_plan_names_stay_unmatched(tmp_path):
+    src = tmp_path / "q2"
+    _tiny_qwen3_moe(src)
+    plan = [
+        rp.TensorEdit(
+            "model.layers.7.self_attn.o_proj.weight",
+            "direct",
+            torch.randn(16),
+            1.0,
+            True,
+            projection_side="output",
+        )
+    ]
+    mapped = rp.map_plan_to_checkpoint(plan, src, model_class="Qwen3MoeForCausalLM")
+    assert mapped[0].logical_name == plan[0].logical_name
+    with pytest.raises(ValueError, match="match no tensor"):
+        rp.abliterate_fp4_to_disk(
+            src, tmp_path / "o", mapped, use_cuda=False, verbose=False
+        )
+
+
+def test_bake_cli_maps_plan_names_from_plan_meta(tmp_path):
+    from abliterix.scripts.abliterate_fp4 import main
+
+    src, dst = tmp_path / "q", tmp_path / "q_abl"
+    stored = _tiny_qwen3_moe(src)
+    d = torch.randn(16)
+    d = d / d.norm()
+    edit = rp.TensorEdit(
+        "model.layers.0.mlp.experts.down_proj", "ega", d, 1.0, True, hidden_dim=16
+    )
+    plan = tmp_path / "plan.pt"
+    rp.save_plan([edit], plan, meta={"model_class": "Qwen3MoeForCausalLM"})
+    assert main([str(src), str(plan), str(dst), "--cpu", "--quiet"]) == 0
+    out, _ = _read_all(dst)
+    key = "model.layers.0.mlp.experts.1.down_proj.weight"
+    assert torch.allclose(
+        out[key], rp.apply_tensor_edits(stored[key], [edit]), atol=1e-6
+    )

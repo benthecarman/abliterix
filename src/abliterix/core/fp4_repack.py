@@ -43,9 +43,10 @@ from __future__ import annotations
 import gc
 import json
 import math
+import re
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -1494,6 +1495,123 @@ def abliterate_fp4_to_disk(
             f"{stats.copied} copied. Worst requant rel-err {worst:.4f}."
         )
     return stats
+
+
+def checkpoint_name_map(
+    src_dir: str | Path, keys: Iterable[str], model_class: str | None = None
+) -> dict[str, list[tuple[str, int | None]]]:
+    """In-memory parameter name → the checkpoint keys it is loaded from.
+
+    Builds the model on the meta device from the checkpoint's config and runs
+    each key through transformers' own load-time renaming
+    (``get_model_conversion_mapping`` + ``rename_source_key``), so a plan
+    recorded on the loaded model can find its tensors in any export of the same
+    architecture: DeepSeek-V4's ``layers.N.ffn.experts.E.w2``, or ModelOpt's
+    per-expert ``...experts.E.down_proj.weight`` behind a fused
+    ``...experts.down_proj`` parameter. Each entry is ``(key, expert)``, with
+    ``expert`` set when the key is one expert of a fused parameter. Keys whose
+    conversion does more than stack experts (concatenation, transposes) are
+    left out: an edit cannot be mapped through those, so it stays unmatched.
+
+    ``model_class`` is the class the plan was recorded on (``plan_meta``); it
+    defaults to the config's first architecture.
+    """
+    import transformers
+    from transformers import AutoConfig
+    from transformers.conversion_mapping import get_model_conversion_mapping
+    from transformers.core_model_loading import (
+        MergeModulelist,
+        WeightConverter,
+        WeightRenaming,
+        rename_source_key,
+    )
+
+    config = AutoConfig.from_pretrained(str(src_dir))
+    name = model_class or (getattr(config, "architectures", None) or [None])[0]
+    cls = getattr(transformers, name, None) if name else None
+    if cls is None:
+        raise ValueError(
+            f"{src_dir}: transformers has no model class {name!r} to map plan "
+            "names onto this checkpoint"
+        )
+    with torch.device("meta"):
+        model = cls._from_config(config)
+    transforms = get_model_conversion_mapping(model)
+    renamings = [t for t in transforms if isinstance(t, WeightRenaming)]
+    converters = [t for t in transforms if isinstance(t, WeightConverter)]
+    meta_state = model.state_dict()
+
+    names: dict[str, list[tuple[str, int | None]]] = {}
+    for key in keys:
+        target, pattern = rename_source_key(
+            key, renamings, converters, model.base_model_prefix, meta_state
+        )
+        expert = None
+        if pattern is not None:
+            conv = next(c for c in converters if pattern in c.source_patterns)
+            if not all(isinstance(op, MergeModulelist) for op in conv.operations):
+                continue
+            found = re.findall(r"experts\.(\d+)\.", key)
+            if len(found) != 1:
+                continue
+            expert = int(found[0])
+        names.setdefault(target, []).append((key, expert))
+    return names
+
+
+def map_plan_to_checkpoint(
+    edits: list[TensorEdit],
+    src_dir: str | Path,
+    *,
+    model_class: str | None = None,
+) -> list[TensorEdit]:
+    """Rename a plan's edits to the tensors they touch in ``src_dir``.
+
+    Edits whose name already resolves are kept. Others go through
+    :func:`checkpoint_name_map`: a renamed tensor takes its checkpoint name;
+    an EGA edit on a fused expert parameter stored one tensor per expert
+    becomes one edit per expert; an ``expert_project`` edit goes to its
+    expert's tensor. Edits that still match nothing are returned unchanged for
+    the bake to report. Plan order is kept for every tensor.
+    """
+    src_dir = Path(src_dir)
+    meta = _checkpoint_layout(src_dir, _iter_shards(src_dir))
+
+    def resolves(name: str) -> bool:
+        try:
+            return _resolve_encoding(name, meta) is not None
+        except ValueError:
+            return True  # found but not editable: the bake raises with details
+
+    if all(resolves(e.logical_name) for e in edits):
+        return list(edits)
+    names = checkpoint_name_map(src_dir, meta, model_class)
+
+    mapped: list[TensorEdit] = []
+    for e in edits:
+        targets = None if resolves(e.logical_name) else names.get(e.logical_name)
+        if not targets:
+            mapped.append(e)
+            continue
+        per_expert = {expert: key for key, expert in targets if expert is not None}
+        whole = [key for key, expert in targets if expert is None]
+        if whole and not per_expert and len(whole) == 1:
+            mapped.append(replace(e, logical_name=whole[0]))
+        elif per_expert and not whole and e.kind == "ega":
+            for expert in sorted(per_expert):
+                mapped.append(replace(e, logical_name=per_expert[expert]))
+        elif per_expert and not whole and e.kind == "expert_project":
+            if e.expert not in per_expert:
+                raise ValueError(
+                    f"'{e.logical_name}': expert {e.expert} has no tensor in {src_dir}"
+                )
+            mapped.append(replace(e, logical_name=per_expert[e.expert], expert=None))
+        else:
+            raise ValueError(
+                f"cannot map {e.kind} edit '{e.logical_name}' onto {src_dir}: "
+                f"it is stored as {[key for key, _ in targets][:3]}"
+            )
+    return mapped
 
 
 def _copy_aux_files(src_dir: Path, dst_dir: Path) -> None:

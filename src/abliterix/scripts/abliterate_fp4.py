@@ -103,9 +103,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: plan {args.plan} not found", file=sys.stderr)
         return 2
 
-    from ..core.fp4_repack import abliterate_fp4_to_disk, load_plan
+    from ..core.fp4_repack import (
+        abliterate_fp4_to_disk,
+        load_plan_with_meta,
+        map_plan_to_checkpoint,
+    )
 
-    edits = load_plan(args.plan)
+    edits, meta = load_plan_with_meta(args.plan)
+    try:
+        # The plan names the loaded model's parameters; the checkpoint may
+        # store them under other keys (renamed, or one tensor per expert).
+        edits = map_plan_to_checkpoint(
+            edits, args.src, model_class=meta.get("model_class")
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     if not args.quiet:
         counts = {
             k: sum(1 for e in edits if e.kind == k)
