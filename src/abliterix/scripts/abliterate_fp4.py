@@ -81,6 +81,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "ignores it."
         ),
     )
+    p.add_argument(
+        "--allow-unmatched",
+        action="store_true",
+        help="Skip planned edits that match no tensor (or do not fit theirs) "
+        "instead of failing; the output then lacks part of the plan.",
+    )
     p.add_argument("--quiet", action="store_true", help="Suppress per-shard output.")
     return p.parse_args(argv)
 
@@ -101,9 +107,11 @@ def main(argv: list[str] | None = None) -> int:
 
     edits = load_plan(args.plan)
     if not args.quiet:
-        n_ega = sum(1 for e in edits if e.kind == "ega")
-        n_direct = sum(1 for e in edits if e.kind == "direct")
-        print(f"Loaded plan: {n_ega} EGA + {n_direct} direct edits")
+        counts = {
+            k: sum(1 for e in edits if e.kind == k)
+            for k in sorted({e.kind for e in edits})
+        }
+        print(f"Loaded plan: {counts}")
 
     try:
         abliterate_fp4_to_disk(
@@ -113,8 +121,12 @@ def main(argv: list[str] | None = None) -> int:
             use_cuda=not args.cpu,
             verify_idempotent=not args.no_verify,
             scale_search=args.scale_search,
+            strict=not args.allow_unmatched,
             verbose=not args.quiet,
         )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130

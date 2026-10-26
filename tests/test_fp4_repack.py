@@ -425,8 +425,14 @@ def test_streaming_bake_reports_unmatched_edits(tmp_path):
             projection_side="output",
         )
     ]
-    stats = rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+    with pytest.raises(ValueError, match="match no tensor"):
+        rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+    assert not dst.exists()  # refused before writing anything
+    stats = rp.abliterate_fp4_to_disk(
+        src, dst, edits, use_cuda=False, verbose=False, strict=False
+    )
     assert stats.fp4_edited == 0 and stats.dense_edited == 0
+    assert stats.unmatched_edits == ["model.layers.99.does.not.exist"]
 
 
 # ---------------------------------------------------------------------------
@@ -1124,3 +1130,232 @@ def test_version_one_plans_still_load(tmp_path):
     )
     edits, meta = rp.load_plan_with_meta(p)
     assert edits[0].logical_name == "a" and edits[0].rows is None and meta == {}
+
+
+# ---------------------------------------------------------------------------
+# Bakes across shards, per-tensor formats, and refusals
+# ---------------------------------------------------------------------------
+
+
+def _write_sharded(path, shards, config):
+    """Write ``{shard_name: {key: tensor}}`` with an index, like a Hub export."""
+    path.mkdir(parents=True, exist_ok=True)
+    weight_map = {}
+    for fname, tensors in shards.items():
+        save_file(tensors, str(path / fname), metadata={"format": "pt"})
+        weight_map.update({k: fname for k in tensors})
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map})
+    )
+    (path / "config.json").write_text(json.dumps(config))
+
+
+def _read_all(path):
+    from safetensors import safe_open
+
+    out, where = {}, {}
+    for shard in sorted(path.glob("*.safetensors")):
+        with safe_open(shard, framework="pt") as f:
+            for k in f.keys():
+                out[k], where[k] = f.get_tensor(k), shard.name
+    return out, where
+
+
+def _modelopt_nvfp4(w):
+    """(packed uint8, e4m3 block scale, fp32 global) the way ModelOpt stores them."""
+    blocks, scales, g = f4.quantize_to_nvfp4(w, 16)
+    return blocks.reshape(w.shape[0], -1), scales, g
+
+
+def test_bake_finds_nvfp4_scales_in_another_shard(tmp_path):
+    """ModelOpt exports put a weight and its scales in different shards."""
+    torch.manual_seed(11)
+    hidden, inter = 32, 64
+    base = "model.layers.0.mlp.experts.0.down_proj"
+    w = torch.randn(hidden, inter) * 0.05
+    packed, scale, g = _modelopt_nvfp4(w)
+    o_proj = (torch.randn(hidden, hidden) * 0.05).to(torch.bfloat16)
+    src, dst = tmp_path / "mo", tmp_path / "mo_abl"
+    _write_sharded(
+        src,
+        {
+            "model-00001-of-00002.safetensors": {
+                base + ".weight": packed,
+                base + ".input_scale": torch.tensor(0.5),
+                "model.layers.0.self_attn.o_proj.weight": o_proj,
+            },
+            "model-00002-of-00002.safetensors": {
+                base + ".weight_scale": scale,
+                base + ".weight_scale_2": g,
+            },
+        },
+        {"quantization_config": {"quant_method": "modelopt"}},
+    )
+    (src / "hf_quant_config.json").write_text("{}")
+    d = torch.randn(hidden)
+    d = d / d.norm()
+    edits = [
+        rp.TensorEdit(base + ".weight", "ega", d, 1.5, True, hidden_dim=hidden),
+        rp.TensorEdit(
+            base + ".weight", "expert_project", d, 0.5, False, hidden_dim=hidden
+        ),
+        rp.TensorEdit(
+            "model.layers.0.self_attn.o_proj.weight",
+            "direct",
+            d,
+            1.0,
+            True,
+            projection_side="output",
+        ),
+    ]
+    stats = rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+    assert stats.fp4_edited == 1 and stats.dense_edited == 1
+
+    out, where = _read_all(dst)
+    # Every piece went back to the shard it came from.
+    assert where[base + ".weight"] == "model-00001-of-00002.safetensors"
+    assert where[base + ".weight_scale"] == "model-00002-of-00002.safetensors"
+    # The global scale and the activation scale are the producer's.
+    assert torch.equal(out[base + ".weight_scale_2"], g)
+    assert torch.equal(out[base + ".input_scale"], torch.tensor(0.5))
+    # The packed bytes decode to the planned edits, applied in order.
+    W0 = f4.dequantize_nvfp4(packed.reshape(hidden, -1, 8), scale, g, 16, torch.float32)
+    W1 = f4.dequantize_nvfp4(
+        out[base + ".weight"].reshape(hidden, -1, 8),
+        out[base + ".weight_scale"],
+        out[base + ".weight_scale_2"],
+        16,
+        torch.float32,
+    )
+    want = rp.apply_tensor_edits(W0, edits[:2])
+    assert (W1 - want).abs().mean() / want.abs().mean() < 0.2
+    assert not torch.allclose(W1, W0, atol=1e-3)
+    assert (dst / "hf_quant_config.json").exists()
+
+
+def test_bake_reads_fp4_format_off_the_tensors(tmp_path):
+    """DeepSeek-V4 ships quant_method fp8 with FP4 experts; no FP4 config."""
+    torch.manual_seed(12)
+    hidden, inter = 16, 64
+    w2 = torch.randn(hidden, inter) * 0.05
+    flat, sc = _pack_deepseek_style(w2)
+    src, dst = tmp_path / "ds", tmp_path / "ds_abl"
+    _write_sharded(
+        src,
+        {
+            "model.safetensors": {
+                "layers.0.ffn.experts.0.w2.weight": flat,
+                "layers.0.ffn.experts.0.w2.scale": sc,
+            }
+        },
+        {"quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4"}},
+    )
+    edits = [
+        rp.TensorEdit(
+            "layers.0.ffn.experts.0.w2.weight",
+            "ega",
+            torch.randn(hidden),
+            2.0,
+            True,
+            hidden_dim=hidden,
+        )
+    ]
+    stats = rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+    assert stats.fp4_edited == 1
+
+
+def test_bake_refuses_packed_bytes_without_scales(tmp_path):
+    """A packed tensor whose scales are missing must not be edited as dense."""
+    src, dst = tmp_path / "pk", tmp_path / "pk_abl"
+    _write_sharded(
+        src,
+        {
+            "model.safetensors": {
+                "layers.0.o_proj.weight": torch.randint(
+                    0, 255, (16, 8), dtype=torch.uint8
+                )
+            }
+        },
+        {},
+    )
+    edits = [
+        rp.TensorEdit(
+            "layers.0.o_proj.weight",
+            "direct",
+            torch.randn(16),
+            1.0,
+            True,
+            projection_side="output",
+        )
+    ]
+    with pytest.raises(ValueError, match="packed quantised data"):
+        rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+
+
+def test_bake_onto_plain_bf16_checkpoint(tmp_path):
+    """No quantisation at all: the bake is a plain replay."""
+    torch.manual_seed(13)
+    o = (torch.randn(8, 8) * 0.1).to(torch.bfloat16)
+    gate = torch.randn(4, 8).to(torch.bfloat16)
+    src, dst = tmp_path / "bf", tmp_path / "bf_abl"
+    _write_sharded(src, {"model.safetensors": {"o.weight": o, "gate.weight": gate}}, {})
+    edits = [
+        rp.TensorEdit(
+            "o.weight", "direct", torch.randn(8), 1.0, True, projection_side="output"
+        ),
+        rp.TensorEdit(
+            "gate.weight", "row_scale", None, 0.0, False, rows=[2], scale=0.5
+        ),
+    ]
+    rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+    out, _ = _read_all(dst)
+    for e in edits:
+        src_t = {"o.weight": o, "gate.weight": gate}[e.logical_name]
+        assert torch.equal(
+            out[e.logical_name], rp.apply_tensor_edit(src_t, e).to(torch.bfloat16)
+        )
+
+
+def test_bake_edit_that_does_not_fit_raises_unless_lenient(tmp_path):
+    o = torch.randn(8, 8).to(torch.bfloat16)
+    src = tmp_path / "fit"
+    _write_sharded(src, {"model.safetensors": {"o.weight": o}}, {})
+    edits = [
+        rp.TensorEdit(
+            "o.weight", "direct", torch.randn(5), 1.0, True, projection_side="output"
+        )
+    ]
+    with pytest.raises(ValueError, match="out_features"):
+        rp.abliterate_fp4_to_disk(
+            src, tmp_path / "a", edits, use_cuda=False, verbose=False
+        )
+    stats = rp.abliterate_fp4_to_disk(
+        src, tmp_path / "b", edits, use_cuda=False, verbose=False, strict=False
+    )
+    assert stats.skipped_edits == ["o.weight"]
+
+
+def test_nvfp4_dequant_reads_e4m3_scales_as_values():
+    """NVFP4 block scales are e4m3 numbers, not exponent bytes like MXFP4's."""
+    torch.manual_seed(14)
+    w = torch.randn(16, 64) * 0.05
+    packed, scale, g = _modelopt_nvfp4(w)
+    keys = rp._Fp4KeySet("w", "s", "g")
+    src = {"w": packed, "s": scale, "g": g}
+    got = rp._dequant_fp4_tensor(src, keys, f4.Fp4Format("nvfp4", 16))
+    want = f4.dequantize_nvfp4(packed.reshape(16, -1, 8), scale, g, 16, torch.float32)
+    assert torch.equal(got, want)
+
+
+def test_nvfp4_layout_check_accepts_negative_zero_codes():
+    """Producers may store -0 (code 8); it decodes to the same zero."""
+    torch.manual_seed(15)
+    w = torch.randn(16, 64) * 0.05
+    packed, scale, g = _modelopt_nvfp4(w)
+    codes = f4.unpack_nibbles(packed.reshape(16, -1, 8))
+    codes[codes == 0] = 8  # write every zero as -0
+    neg_zero = f4.pack_nibbles(codes).reshape(16, -1)
+    keys = rp._Fp4KeySet("w", "s", "g")
+    rp._assert_layout_roundtrip(
+        {"w": neg_zero, "s": scale, "g": g}, keys, f4.Fp4Format("nvfp4", 16), name="w"
+    )

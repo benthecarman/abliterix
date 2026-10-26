@@ -795,15 +795,20 @@ GPT_OSS_LAYOUT = Fp4Layout("gpt_oss", "_blocks", "_scales", 4, True)
 # i.e. the same MXFP4 math fp4_utils already decodes bit-exactly.
 DEEPSEEK_V4_LAYOUT = Fp4Layout("deepseek_v4", ".weight", ".scale", 2, False)
 
-# NVFP4 (ModelOpt / llm-compressor): packed weight under the bare name plus a
-# `_scale` block scale and a per-tensor global. Implemented, unvalidated.
+# NVFP4 as ModelOpt exports it: `<name>.weight` U8 (out, in/2), e4m3
+# `<name>.weight_scale` (out, in/16) and an fp32 `<name>.weight_scale_2` that
+# multiplies (dequant = code * block scale * global). Checked against
+# nvidia/GLM-5.3-Flash-NVFP4: an expert decodes to within 9% of the BF16
+# release, the same error as a fresh NVFP4 quant. llm-compressor's layout
+# (`weight_packed`, and a `weight_global_scale` that divides) is different and
+# deliberately not matched.
 NVFP4_LAYOUT = Fp4Layout(
     "nvfp4",
     "",
     "_scale",
     2,
     False,
-    ("_scale_2", "_weight_scale_2", "_global_scale", "_weight_global_scale"),
+    ("_scale_2", "_weight_scale_2"),
 )
 
 _ALL_LAYOUTS = (GPT_OSS_LAYOUT, DEEPSEEK_V4_LAYOUT, NVFP4_LAYOUT)
@@ -966,10 +971,13 @@ def _dequant_fp4_tensor(
     """Dequantise an on-disk FP4 tensor into the model's logical orientation.
 
     Siblings are pulled onto ``blocks``' device: a shard's tensors may be a
-    mix of freshly-repacked GPU tensors and untouched CPU ones.
+    mix of freshly-repacked GPU tensors and untouched CPU ones. MXFP4 scales
+    are exponent bytes; NVFP4 scales are e4m3 values and stay as they are.
     """
     stored = tensors[keys.blocks]
-    scales = _scale_bytes(tensors[keys.scales].to(stored.device))
+    scales = tensors[keys.scales].to(stored.device)
+    if fmt.kind == "mxfp4":
+        scales = _scale_bytes(scales)
     blocks = _as_blocked(stored, scales)
     g = tensors[keys.global_scale].to(stored.device) if keys.global_scale else None
     W = f4.dequantize_fp4(fmt, blocks, scales, global_scale=g, out_dtype=torch.float32)
@@ -1027,7 +1035,15 @@ def _assert_layout_roundtrip(
     reshape (flat vs blocked), a lossy dtype cast (int8 clamping a packed byte
     above 127), or a bad transpose shows up as value drift here rather than as
     silently corrupted weights on disk.
+
+    NVFP4 is checked against the producer's own block scales: re-deriving them
+    from decoded values is not a fixed point (an e4m3-rounded scale rarely
+    leaves a block's largest code at the top of the E2M1 range), so encoding
+    with the stored scales must reproduce the stored bytes exactly instead.
     """
+    if fmt.kind == "nvfp4":
+        _assert_nvfp4_layout_roundtrip(src, keys, fmt, name=name)
+        return
     W0 = _dequant_fp4_tensor(src, keys, fmt)
     re = _requant_fp4_tensor(W0, keys, fmt, src, scale_search=0)
     W1 = _dequant_fp4_tensor({**src, **re}, keys, fmt)
@@ -1037,6 +1053,34 @@ def _assert_layout_roundtrip(
             f"FP4 repack of '{name}' is not a fixed point on unedited weights "
             f"(max drift {drift:g}) — the on-disk layout handling (shape, byte "
             "dtype, or orientation) does not match this producer."
+        )
+
+
+def _assert_nvfp4_layout_roundtrip(
+    src: dict[str, Tensor], keys: _Fp4KeySet, fmt: f4.Fp4Format, *, name: str
+) -> None:
+    """Decode, re-encode with the stored scales, and compare the codes.
+
+    Producers may write a tiny negative value as -0 (code 8); the encoder
+    canonicalises zero to +0, so the stored side is canonicalised the same way.
+    """
+    stored = src[keys.blocks]
+    scales = src[keys.scales].to(stored.device)
+    g = src[keys.global_scale].to(device=stored.device, dtype=torch.float32)
+    W = _to_ondisk(
+        _dequant_fp4_tensor(src, keys, fmt), _packed_moe_is_transposed(stored)
+    )
+    blocked = W.reshape(*scales.shape, fmt.block_size)
+    eff = (scales.to(torch.float32) * g).unsqueeze(-1)
+    codes = f4.quantize_to_e2m1_codes(blocked / torch.where(eff == 0, 1.0, eff))
+    original = f4.unpack_nibbles(_as_blocked(stored.view(torch.uint8), scales))
+    original = torch.where(original == 8, torch.zeros_like(original), original)
+    if not torch.equal(codes, original):
+        bad = int((codes != original).sum())
+        raise AssertionError(
+            f"NVFP4 re-encode of '{name}' with its own scales changes {bad} "
+            "codes — the on-disk layout handling (shape, byte dtype, nibble "
+            "order, or orientation) does not match this producer."
         )
 
 
@@ -1053,6 +1097,7 @@ class RepackStats:
     dense_edited: int = 0
     copied: int = 0
     skipped_edits: list[str] = field(default_factory=list)
+    unmatched_edits: list[str] = field(default_factory=list)
     requant_rel_err: dict[str, float] = field(default_factory=dict)
 
 
@@ -1075,6 +1120,187 @@ def _iter_shards(src_dir: Path) -> dict[str, list[str]]:
     return shards
 
 
+# safetensors header dtype names → torch dtypes, for reading a checkpoint's
+# layout without loading it. Unknown names map to uint8 (a byte payload), which
+# the encoding resolver treats as not editable in place.
+_ST_DTYPES: dict[str, torch.dtype] = {
+    "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+}
+for _st, _attr in (
+    ("F8_E4M3", "float8_e4m3fn"),
+    ("F8_E5M2", "float8_e5m2"),
+    ("F8_E8M0", "float8_e8m0fnu"),
+):
+    if hasattr(torch, _attr):
+        _ST_DTYPES[_st] = getattr(torch, _attr)
+
+
+def _checkpoint_layout(
+    src_dir: Path, shards: dict[str, list[str]]
+) -> dict[str, Tensor]:
+    """Every tensor key → a meta tensor of its stored shape and dtype."""
+    from safetensors import safe_open
+
+    meta: dict[str, Tensor] = {}
+    for fname, keys in shards.items():
+        with safe_open(src_dir / fname, framework="pt") as f:
+            for k in keys:
+                sl = f.get_slice(k)
+                dtype = _ST_DTYPES.get(sl.get_dtype(), torch.uint8)
+                meta[k] = torch.empty(sl.get_shape(), dtype=dtype, device="meta")
+    return meta
+
+
+@dataclass
+class _Encoding:
+    """How one edited tensor is stored: its keys (primary first) and format."""
+
+    kind: str  # "fp4" | "fp8" | "dense"
+    keys: tuple[str, ...]
+    fp4: _Fp4KeySet | None = None
+    fmt: f4.Fp4Format | None = None
+    fp8: tuple[str, str] | None = None
+
+
+def _infer_fp4_format(meta: dict[str, Tensor], keys: _Fp4KeySet) -> f4.Fp4Format:
+    """The FP4 element format, from the stored tensors themselves.
+
+    An e4m3 block scale is NVFP4, a byte (or e8m0) one MXFP4; the block size is
+    the elements one scale covers. Reading it off the tensor rather than the
+    config handles mixed checkpoints and configs that name no FP4 method
+    (DeepSeek-V4 ships ``quant_method: fp8`` with FP4 experts).
+    """
+    blocks, scales = meta[keys.blocks], meta[keys.scales]
+    e4m3 = getattr(torch, "float8_e4m3fn", None)
+    kind = "nvfp4" if scales.dtype == e4m3 else "mxfp4"
+    if blocks.dim() == scales.dim() + 1:
+        bytes_per_block = blocks.shape[-1]
+    else:
+        bytes_per_block = blocks.shape[-1] // max(1, scales.shape[-1])
+    if kind == "nvfp4" and keys.global_scale is None:
+        raise ValueError(
+            f"'{keys.blocks}' has e4m3 block scales but no per-tensor global "
+            "scale; this NVFP4 layout is not supported"
+        )
+    return f4.Fp4Format(kind, int(bytes_per_block) * 2)
+
+
+def _resolve_encoding(
+    name: str,
+    meta: dict[str, Tensor],
+    fmt: f4.Fp4Format | None = None,
+    layout: Fp4Layout | None = None,
+) -> _Encoding | None:
+    """Find how the tensor an edit names is stored, across all shards.
+
+    ``name`` may be a parameter name (``...o_proj.weight``) or a module prefix
+    (``...experts.3.w2``). Returns ``None`` when no key matches. Raises when
+    the tensor exists but its storage cannot be edited safely: packed or FP8
+    bytes without a recognised scale, which a dense edit would corrupt.
+    """
+    present = set(meta)
+    candidates = [name]
+    if name.endswith(".weight"):
+        candidates.append(name[: -len(".weight")])
+    for cand in candidates:
+        keys = resolve_fp4_keys(cand, present, fmt, layout, tensors=meta)
+        if keys is not None:
+            found = fmt or _infer_fp4_format(meta, keys)
+            all_keys = (keys.blocks, keys.scales) + (
+                (keys.global_scale,) if keys.global_scale else ()
+            )
+            return _Encoding("fp4", all_keys, fp4=keys, fmt=found)
+    for cand in candidates:
+        fp8_keys = resolve_fp8_keys(cand, present, meta)
+        if fp8_keys is not None:
+            return _Encoding("fp8", fp8_keys, fp8=fp8_keys)
+    for cand in (name, f"{name}.weight"):
+        if cand not in present:
+            continue
+        dtype = meta[cand].dtype
+        if dtype in f8._FP8_DTYPES:
+            # An FP8 weight whose scale sibling we could not find. The dense
+            # path would project raw e4m3 values as if they were the real
+            # weights — silently wrong. Refuse.
+            raise ValueError(
+                f"'{cand}' is FP8 but no scale sibling was found among "
+                f"{f8._SCALE_ATTRS}; editing it as a dense tensor would "
+                "ignore the block scaling and corrupt the weight."
+            )
+        if not dtype.is_floating_point:
+            raise ValueError(
+                f"'{cand}' is stored as {dtype} with no recognised scale "
+                "sibling; it is packed quantised data, and editing it as a "
+                "dense tensor would corrupt it."
+            )
+        return _Encoding("dense", (cand,))
+    return None
+
+
+def _edit_encoded(
+    enc: _Encoding,
+    group: list[TensorEdit],
+    tensors: dict[str, Tensor],
+    device: str,
+    *,
+    verify_idempotent: bool,
+    reference_dequant: Any,
+    scale_search: int,
+) -> tuple[dict[str, Tensor], float | None]:
+    """Dequantise, edit and re-encode one tensor. Returns every key of its
+    encoding (on CPU) and the requant relative error, if it was requantised.
+    Raises ``ValueError`` when an edit does not fit the tensor."""
+    name = enc.keys[0]
+    if enc.kind == "fp4":
+        keys, fmt = enc.fp4, enc.fmt
+        W = _dequant_fp4_tensor(tensors, keys, fmt).to(device)
+        if verify_idempotent:
+            _assert_layout_roundtrip(tensors, keys, fmt, name=name)
+        if reference_dequant is not None:
+            ref = reference_dequant(group[0].logical_name, W)
+            if ref is not None:
+                f4.assert_matches_reference(W, ref.to(device), name=name)
+        W_new = apply_tensor_edits(W, group)
+        repacked = _requant_fp4_tensor(
+            W_new, keys, fmt, tensors, scale_search=scale_search
+        )
+        # Requant round-trip error (steered vs re-decoded), for the log.
+        W_chk = _dequant_fp4_tensor({**tensors, **repacked}, keys, fmt).to(device)
+        err = float((W_chk - W_new).abs().mean() / W_new.abs().mean().clamp(min=1e-9))
+        return {k: v.cpu() for k, v in repacked.items()}, err
+    if enc.kind == "fp8":
+        # Block-wise FP8 (DeepSeek-V4 attention + shared experts). Editing this
+        # through the dense branch would project the raw e4m3 values with the
+        # block scale ignored, so it gets its own dequant -> project -> requant,
+        # preserving the stored dtypes.
+        w_key, s_key = enc.fp8
+        w, s = tensors[w_key].to(device), tensors[s_key].to(device)
+        W = f8.dequant_blockwise(w, s, is_inv=True, out_dtype=torch.float32)
+        if verify_idempotent:
+            f8.assert_fp8_repack_idempotent(w, s, name=name)
+        W_new = apply_tensor_edits(W, group)
+        br = max(1, w.shape[0] // s.shape[0])
+        bc = max(1, w.shape[1] // s.shape[1])
+        new_w, new_s = f8.quantize_to_fp8_blockwise(
+            W_new, (br, bc), weight_dtype=w.dtype, scale_dtype=s.dtype
+        )
+        chk = f8.dequant_blockwise(new_w, new_s, is_inv=True, out_dtype=torch.float32)
+        err = float((chk - W_new).abs().mean() / W_new.abs().mean().clamp(min=1e-9))
+        return {w_key: new_w.cpu(), s_key: new_s.cpu()}, err
+    stored = tensors[name]
+    W_new = apply_tensor_edits(stored.to(device), group)
+    return {name: W_new.to(stored.dtype).cpu()}, None
+
+
 def abliterate_fp4_to_disk(
     src_dir: str | Path,
     dst_dir: str | Path,
@@ -1086,21 +1312,28 @@ def abliterate_fp4_to_disk(
     verify_idempotent: bool = True,
     reference_dequant: Any = None,
     scale_search: int = 1,
+    strict: bool = True,
     verbose: bool = True,
 ) -> RepackStats:
-    """Replay ``edits`` against a native-FP4 checkpoint, streaming shard by shard.
+    """Replay ``edits`` against a checkpoint, streaming shard by shard.
 
     Edited FP4 tensors are dequantised, projected, and re-packed into the same
-    FP4 layout; edited plain-BF16 tensors (e.g. gpt-oss ``attn.o_proj``, which
-    is not quantised) are projected and written back in their storage dtype;
-    every other tensor is copied through unchanged. ``quantization_config`` is
-    preserved in ``config.json`` because the output is still FP4.
+    FP4 layout; block-wise FP8 tensors likewise; edited plain tensors (e.g.
+    gpt-oss ``attn.o_proj``, which is not quantised) are projected and written
+    back in their storage dtype; every other tensor is copied through
+    unchanged. ``config.json`` is kept as is, because the output keeps the
+    source's precision.
+
+    Each edit is resolved against the whole checkpoint first, from the shard
+    headers: a tensor's packed weight and its scales may sit in different
+    shards (ModelOpt exports do this), and each piece is written back to the
+    shard it came from. Several edits on one tensor apply in plan order.
 
     Parameters
     ----------
     fmt
-        FP4 format; auto-detected from ``config.json`` ``quantization_config``
-        when ``None``.
+        FP4 format override; by default each FP4 tensor's format is read from
+        its own scale dtype and shape.
     verify_idempotent
         Cross-check each source FP4 tensor's pack/unpack self-consistency
         before editing (cheap; catches an internal kernel bug).
@@ -1115,164 +1348,111 @@ def abliterate_fp4_to_disk(
         restores the plain amax scale. Higher trades a little bake time for
         lower requant error; ignored for NVFP4. See
         :func:`fp4_utils.quantize_to_mxfp4`.
+    strict
+        Raise, before anything is written, when an edit names no tensor in the
+        checkpoint, and raise when an edit does not fit its tensor. With
+        ``strict=False`` those edits are skipped and listed in the stats; the
+        output then lacks part of the plan.
     """
     from safetensors import safe_open
     from safetensors.torch import save_file
 
     src_dir = Path(src_dir)
     dst_dir = Path(dst_dir)
-    dst_dir.mkdir(parents=True, exist_ok=True)
     device = "cuda" if use_cuda and torch.cuda.is_available() else "cpu"
-
     cfg = json.loads((src_dir / "config.json").read_text())
-    if fmt is None:
-        qc = cfg.get("quantization_config")
-        if qc is None and isinstance(cfg.get("text_config"), dict):
-            qc = cfg["text_config"].get("quantization_config")
-        fmt = f4.detect_fp4_format(qc)
-    if fmt is None:
-        raise ValueError(
-            f"{src_dir}: no FP4 quantization_config detected and no fmt given. "
-            "Use fp8_utils.dequant_model_to_disk for FP8, or pass fmt=."
-        )
 
-    edit_by_name = {e.logical_name: e for e in edits}
-    remaining = set(edit_by_name)
     stats = RepackStats()
     shards = _iter_shards(src_dir)
+    shard_of = {k: fname for fname, keys in shards.items() for k in keys}
+    meta = _checkpoint_layout(src_dir, shards)
 
-    if layout is None:
-        layout = detect_layout({k for ks in shards.values() for k in ks}, fmt)
-    if verbose:
-        print(
-            f"* FP4 {fmt.kind} (block {fmt.block_size}), on-disk layout: "
-            f"{layout.name if layout else 'unknown — trying all'}"
+    resolved: dict[str, tuple[_Encoding, list[TensorEdit]]] = {}
+    for name, group in group_edits(edits).items():
+        enc = _resolve_encoding(name, meta, fmt, layout)
+        if enc is None:
+            stats.unmatched_edits.append(name)
+        else:
+            resolved[name] = (enc, group)
+    if stats.unmatched_edits and strict:
+        raise ValueError(
+            f"{len(stats.unmatched_edits)} planned edits match no tensor in "
+            f"{src_dir} (first few: {sorted(stats.unmatched_edits)[:3]}); "
+            "map the plan's names onto this checkpoint first"
         )
+    if verbose:
+        formats = sorted(
+            {
+                f"{e.fmt.kind}/{e.fmt.block_size}" if e.fmt else e.kind
+                for e, _ in resolved.values()
+            }
+        )
+        print(f"* {len(resolved)} tensors to edit ({', '.join(formats)})")
+
+    def read(key: str, loaded: dict[str, Tensor]) -> Tensor:
+        if key in loaded:
+            return loaded[key]
+        with safe_open(src_dir / shard_of[key], framework="pt") as f:
+            return f.get_tensor(key)
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
     new_weight_map: dict[str, str] = {}
     total_bytes = 0
     t0 = time.time()
+    skipped: set[str] = set()
 
     for i, (fname, keys) in enumerate(sorted(shards.items()), 1):
-        present = set(keys)
         with safe_open(src_dir / fname, framework="pt") as f:
             src = {k: f.get_tensor(k) for k in keys}
 
         out: dict[str, Tensor] = {}
-        consumed: set[str] = set()
-
-        for name, edit in edit_by_name.items():
-            fp4_keys = resolve_fp4_keys(name, present, fmt, layout, tensors=src)
-            if fp4_keys is not None:
-                W = _dequant_fp4_tensor(src, fp4_keys, fmt).to(device)
-                if verify_idempotent:
-                    _assert_layout_roundtrip(src, fp4_keys, fmt, name=name)
-                if reference_dequant is not None:
-                    ref = reference_dequant(name, W)
-                    if ref is not None:
-                        f4.assert_matches_reference(W, ref.to(device), name=name)
-                try:
-                    W_new = apply_tensor_edit(W, edit)
-                except ValueError as e:
-                    if verbose:
-                        print(f"  [yellow]skip FP4 edit {name}: {e}[/]")
-                    stats.skipped_edits.append(name)
-                    continue
-                repacked = _requant_fp4_tensor(
-                    W_new, fp4_keys, fmt, src, scale_search=scale_search
+        for name, (enc, group) in resolved.items():
+            here = [k for k in enc.keys if shard_of[k] == fname]
+            if not here or name in skipped:
+                continue
+            # A tensor split across shards is re-derived for each shard it
+            # touches (deterministically), which keeps memory to one tensor.
+            tensors = {k: read(k, src) for k in enc.keys}
+            try:
+                edited, err = _edit_encoded(
+                    enc,
+                    group,
+                    tensors,
+                    device,
+                    verify_idempotent=verify_idempotent,
+                    reference_dequant=reference_dequant,
+                    scale_search=scale_search,
                 )
-                # Requant round-trip error (steered vs re-decoded), for the log.
-                W_chk = _dequant_fp4_tensor({**src, **repacked}, fp4_keys, fmt).to(
-                    device
+            except ValueError as e:
+                if strict:
+                    raise
+                if verbose:
+                    print(f"  [yellow]skip {enc.kind} edit {name}: {e}[/]")
+                stats.skipped_edits.append(name)
+                skipped.add(name)
+                continue
+            for k in here:
+                out[k] = edited[k]
+            if shard_of[enc.keys[0]] == fname:
+                setattr(
+                    stats,
+                    f"{enc.kind}_edited",
+                    getattr(stats, f"{enc.kind}_edited") + 1,
                 )
-                denom = W_new.abs().mean().clamp(min=1e-9)
-                stats.requant_rel_err[name] = float(
-                    (W_chk - W_new).abs().mean() / denom
-                )
-                out.update({k: v.cpu() for k, v in repacked.items()})
-                consumed.update(
-                    {fp4_keys.blocks, fp4_keys.scales}
-                    | ({fp4_keys.global_scale} if fp4_keys.global_scale else set())
-                )
-                stats.fp4_edited += 1
-                remaining.discard(name)
-            elif (fp8_keys := resolve_fp8_keys(name, present, src)) is not None:
-                # Block-wise FP8 (DeepSeek-V4 attention + shared experts).
-                # Editing this through the dense branch would project the raw
-                # e4m3 values with the block scale ignored, so it gets its own
-                # dequant -> project -> requant, preserving the stored dtypes.
-                w_key, s_key = fp8_keys
-                W = f8.dequant_blockwise(
-                    src[w_key].to(device),
-                    src[s_key].to(device),
-                    is_inv=True,
-                    out_dtype=torch.float32,
-                )
-                if verify_idempotent:
-                    f8.assert_fp8_repack_idempotent(
-                        src[w_key].to(device), src[s_key].to(device), name=name
-                    )
-                try:
-                    W_new = apply_tensor_edit(W, edit)
-                except ValueError as e:
-                    if verbose:
-                        print(f"  [yellow]skip fp8 edit {name}: {e}[/]")
-                    stats.skipped_edits.append(name)
-                    continue
-                br = max(1, src[w_key].shape[0] // src[s_key].shape[0])
-                bc = max(1, src[w_key].shape[1] // src[s_key].shape[1])
-                new_w, new_s = f8.quantize_to_fp8_blockwise(
-                    W_new,
-                    (br, bc),
-                    weight_dtype=src[w_key].dtype,
-                    scale_dtype=src[s_key].dtype,
-                )
-                chk = f8.dequant_blockwise(
-                    new_w, new_s, is_inv=True, out_dtype=torch.float32
-                )
-                stats.requant_rel_err[name] = float(
-                    (chk - W_new).abs().mean() / W_new.abs().mean().clamp(min=1e-9)
-                )
-                out[w_key] = new_w.cpu()
-                out[s_key] = new_s.cpu()
-                consumed.update({w_key, s_key})
-                stats.fp8_edited += 1
-                remaining.discard(name)
-            elif name in present:
-                if src[name].dtype in f8._FP8_DTYPES:
-                    # An FP8 weight whose scale sibling we could not find. The
-                    # dense path would project raw e4m3 values as if they were
-                    # the real weights — silently wrong. Refuse.
-                    raise ValueError(
-                        f"'{name}' is FP8 but no scale sibling was found among "
-                        f"{f8._SCALE_ATTRS}; editing it as a dense tensor would "
-                        "ignore the block scaling and corrupt the weight."
-                    )
-                # Plain (non-quantised) weight, e.g. gpt-oss attn.o_proj.
-                W = src[name].to(device)
-                try:
-                    W_new = apply_tensor_edit(W, edit)
-                except ValueError as e:
-                    if verbose:
-                        print(f"  [yellow]skip dense edit {name}: {e}[/]")
-                    stats.skipped_edits.append(name)
-                    continue
-                out[name] = W_new.to(src[name].dtype).cpu()
-                consumed.add(name)
-                stats.dense_edited += 1
-                remaining.discard(name)
+                if err is not None:
+                    stats.requant_rel_err[name] = err
+            del tensors, edited
 
         # Copy through everything not produced by an edit.
         for k in keys:
-            if k in consumed or k in out:
-                continue
-            out[k] = src[k]
-            stats.copied += 1
+            if k not in out:
+                out[k] = src[k]
+                stats.copied += 1
 
         save_file(out, str(dst_dir / fname), metadata={"format": "pt"})
         for k in out:
             new_weight_map[k] = fname
-        shard_bytes = (dst_dir / fname).stat().st_size
-        total_bytes += shard_bytes
+        total_bytes += (dst_dir / fname).stat().st_size
         if verbose:
             print(
                 f"[{i}/{len(shards)}] {fname}: "
@@ -1294,20 +1474,21 @@ def abliterate_fp4_to_disk(
             indent=2,
         )
     )
-    # Keep config.json AS-IS (still FP4) but write it out for a standalone dir.
+    # Keep config.json AS-IS (same precision) but write it out for a standalone dir.
     (dst_dir / "config.json").write_text(json.dumps(cfg, indent=2))
     _copy_aux_files(src_dir, dst_dir)
 
-    if remaining and verbose:
+    if (stats.unmatched_edits or stats.skipped_edits) and verbose:
         print(
-            f"  [yellow]{len(remaining)} planned edits matched no tensor key "
-            f"(first few: {sorted(remaining)[:3]})[/]"
+            f"  [yellow]{len(stats.unmatched_edits)} planned edits matched no "
+            f"tensor, {len(stats.skipped_edits)} did not fit theirs (first few: "
+            f"{sorted(stats.unmatched_edits + stats.skipped_edits)[:3]})[/]"
         )
     if verbose:
         rerr = stats.requant_rel_err
         worst = max(rerr.values()) if rerr else 0.0
         print(
-            f"\nDone. FP4 model at {dst_dir} ({total_bytes / 1e9:.1f} GB). "
+            f"\nDone. Model at {dst_dir} ({total_bytes / 1e9:.1f} GB). "
             f"{stats.fp4_edited} FP4 + {stats.fp8_edited} FP8 + "
             f"{stats.dense_edited} dense tensors edited, "
             f"{stats.copied} copied. Worst requant rel-err {worst:.4f}."
@@ -1315,24 +1496,14 @@ def abliterate_fp4_to_disk(
     return stats
 
 
-_AUX_FILES = (
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "vocab.json",
-    "merges.txt",
-    "special_tokens_map.json",
-    "generation_config.json",
-    "chat_template.jinja",
-    "added_tokens.json",
-)
-
-
 def _copy_aux_files(src_dir: Path, dst_dir: Path) -> None:
-    for name in _AUX_FILES:
-        p = src_dir / name
-        if p.exists():
-            shutil.copy2(p, dst_dir / name)
-    for p in src_dir.glob("*.py"):
+    """Every non-weight file of the source (tokenizer, chat template, processor
+    and quantisation configs, remote code), so the output stands alone."""
+    for p in src_dir.iterdir():
+        if not p.is_file() or p.suffix == ".safetensors":
+            continue
+        if p.name in ("model.safetensors.index.json", "config.json"):
+            continue
         shutil.copy2(p, dst_dir / p.name)
 
 
