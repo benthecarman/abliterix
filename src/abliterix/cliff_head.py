@@ -59,18 +59,23 @@ class HeadScore:
 # ---------------------------------------------------------------------------
 
 
-def _get_head_dim(engine) -> tuple[int, int]:
+def _get_head_dim(engine, layer_idx: int | None = None) -> tuple[int, int]:
     """Return ``(num_attention_heads, head_dim)`` for the engine's model.
 
     Reads ``num_attention_heads`` / ``hidden_size`` from the model config,
     falling back to ``head_dim`` if the model exposes it directly (some
     MLA / MoE configs). Raises on missing attributes — cliff-head ablation
-    cannot proceed without head-level addressing.
+    cannot proceed without head-level addressing. Heterogeneous configs must
+    be resolved for a specific layer because these dimensions may vary.
     """
     cfg = getattr(engine.model, "config", None)
     if cfg is None:
         raise RuntimeError("Engine has no loaded HF model — cannot read head shape.")
     text_cfg = getattr(cfg, "text_config", cfg)
+    if layer_idx is not None:
+        per_layer_config = getattr(text_cfg, "per_layer_config", None)
+        if per_layer_config is not None:
+            text_cfg = per_layer_config[layer_idx]
 
     num_heads = getattr(text_cfg, "num_attention_heads", None)
     if num_heads is None:
@@ -141,11 +146,11 @@ def identify_safety_heads(
         Sorted by score descending (most refusal-aligned first), truncated
         to the requested fraction.
     """
-    num_heads, head_dim = _get_head_dim(engine)
     n_layers = engine.get_n_layers()
 
     scores: list[HeadScore] = []
     for layer_idx in range(n_layers):
+        num_heads, head_dim = _get_head_dim(engine, layer_idx)
         modules = engine.steerable_modules(layer_idx)
         o_proj_list = modules.get("attn.o_proj", [])
         if not o_proj_list:
@@ -224,8 +229,6 @@ def apply_cliff_head_ablation(
     if strength <= 0.0:
         return 0
 
-    num_heads, head_dim = _get_head_dim(engine)
-
     if not hasattr(engine, "_cliff_head_originals"):
         engine._cliff_head_originals = {}
 
@@ -237,7 +240,11 @@ def apply_cliff_head_ablation(
     n_modified = 0
     for layer_idx, heads in by_layer.items():
         modules = engine.steerable_modules(layer_idx)
-        for o_proj in modules.get("attn.o_proj", []):
+        o_proj_list = modules.get("attn.o_proj", [])
+        if not o_proj_list:
+            continue
+        num_heads, head_dim = _get_head_dim(engine, layer_idx)
+        for o_proj in o_proj_list:
             base = o_proj.base_layer if hasattr(o_proj, "base_layer") else o_proj
             weight = base.weight
             in_features = weight.shape[1]
