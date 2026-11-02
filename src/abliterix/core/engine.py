@@ -333,8 +333,8 @@ def _captured_logprobs(sampler: _LogitsSampler, expected_steps: int) -> Tensor:
     return stacked
 
 
-def _forward_supports_logits_to_keep(model: Module) -> bool:
-    """Return whether the underlying model explicitly limits output logits.
+def _forward_supports_kwarg(model: Module, name: str) -> bool:
+    """Return whether the underlying model explicitly accepts a keyword.
 
     PEFT and ``torch.compile`` expose generic ``**kwargs`` forward signatures,
     so inspect their wrapped base model instead.  A generic ``**kwargs`` alone
@@ -364,9 +364,17 @@ def _forward_supports_logits_to_keep(model: Module) -> bool:
         break
 
     try:
-        return "logits_to_keep" in inspect.signature(current.forward).parameters
-    except (TypeError, ValueError):
+        parameter = inspect.signature(current.forward).parameters.get(name)
+        return parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    except (AttributeError, TypeError, ValueError):
         return False
+
+
+def _forward_supports_logits_to_keep(model: Module) -> bool:
+    return _forward_supports_kwarg(model, "logits_to_keep")
 
 
 def _required_lora_rank(config: AbliterixConfig) -> int:
@@ -1955,6 +1963,7 @@ class SteeringEngine:
         min_new_tokens: int | None = None,
     ) -> tuple[list[str], Tensor]:
         """Batched wrapper around :meth:`generate_and_score`."""
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
         all_resp: list[str] = []
         all_lp: list[Tensor] = []
         for batch in chunk_batches(messages, self.config.inference.batch_size):
@@ -1966,6 +1975,8 @@ class SteeringEngine:
                 min_new_tokens=min_new_tokens,
             )
             all_resp.extend(resp)
+            if offload:
+                lp = lp.cpu()
             all_lp.append(lp)
         return all_resp, torch.cat(all_lp, dim=0)
 
@@ -2079,12 +2090,23 @@ class SteeringEngine:
     # Log-probability measurement
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
     def _logprobs_forward_pass(self, messages: list[ChatMessage]) -> Tensor:
         """Next-token logprobs via a single forward pass (no generation overhead)."""
         inputs = self._tokenize(messages)
         self._reset_position_cache()
-        outputs = self.model(**inputs)
-        return F.log_softmax(outputs.logits[:, -1, :], dim=-1)
+        cache = getattr(self, "_logprobs_forward_options", None)
+        model_identity = id(self.model)
+        if cache is None or cache[0] != model_identity:
+            forward_kwargs: dict[str, Any] = {}
+            if _forward_supports_logits_to_keep(cast(Module, self.model)):
+                forward_kwargs["logits_to_keep"] = 1
+            if _forward_supports_kwarg(cast(Module, self.model), "use_cache"):
+                forward_kwargs["use_cache"] = False
+            cache = (model_identity, forward_kwargs)
+            self._logprobs_forward_options = cache
+        outputs = self.model(**inputs, **cache[1])
+        return F.log_softmax(outputs.logits[:, -1, :], dim=-1, dtype=torch.float32)
 
     def compute_logprobs(self, messages: list[ChatMessage]) -> Tensor:
         """Compute next-token log-probabilities over ``token_count`` steps.
@@ -2167,6 +2189,7 @@ class SteeringEngine:
         ordered_messages = [messages[index] for index in original_indices]
         ordered_continuations = [continuations[index] for index in original_indices]
 
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
         all_logprobs: list[Tensor] = []
         batch_size = self.config.inference.batch_size
         for start in range(0, len(ordered_messages), batch_size):
@@ -2204,7 +2227,10 @@ class SteeringEngine:
                 max_new_tokens=token_count,
                 logits_processor=[sampler, forcing],
             )
-            all_logprobs.append(_captured_logprobs(sampler, token_count))
+            logprobs = _captured_logprobs(sampler, token_count)
+            if offload:
+                logprobs = logprobs.cpu()
+            all_logprobs.append(logprobs)
 
         logprobs = torch.cat(all_logprobs, dim=0)
         if not sort_by_length:
