@@ -45,6 +45,7 @@ from torch import Tensor
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
 from ..util import print
+from .bnb_utils import dequantize_bnb_int8_weight, is_bnb_int8_weight
 
 
 # Abliterix's ProjectionCache emits rank-1 adapters. Declaring vLLM rank 1
@@ -1808,7 +1809,6 @@ class ProjectionCache:
                     base_layer = getattr(mod, "base_layer", mod)
                     base_weight = cast(Tensor, base_layer.weight)
                     qs = getattr(base_weight, "quant_state", None)
-                    CB = getattr(base_weight, "CB", None)
 
                     if qs is not None:
                         if bnb is None:
@@ -1824,9 +1824,8 @@ class ProjectionCache:
                                 qs,
                             ).to(torch.float32),
                         )
-                    elif CB is not None:
-                        SCB = base_weight.SCB
-                        W = CB.float() * SCB.float().unsqueeze(1) / 127.0
+                    elif is_bnb_int8_weight(base_layer):
+                        W = dequantize_bnb_int8_weight(base_layer)
                     elif _FP8_DTYPES and base_weight.dtype in _FP8_DTYPES:
                         weight_scale = getattr(base_layer, "weight_scale", None)
                         if weight_scale is not None:
