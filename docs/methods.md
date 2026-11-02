@@ -123,7 +123,21 @@ cliff_head_top_k_frac = 0.03     # 3% of all (layer, head) pairs
 cliff_head_strength = 1.0        # 1.0 = full ablation, 0.5 = halve, 0.0 = no-op
 ```
 
-**When to use.** Any model with `<think>` tags or strong reasoning behaviour. For dense Llama/Mistral models the safety circuit is often even more concentrated — try 1–2 %. Skipped automatically when the HF model is not loaded (fast-extraction vLLM path).
+**Evidence scope.** This is an experimental weight-alignment heuristic, not a
+validated recommendation for every reasoning model. The current
+[maturity assessment](method_maturity.md) records a non-reasoning Qwen2.5 control
+and still requires reasoning-model evaluation. It is skipped when the HF model
+is not loaded (fast-extraction vLLM path).
+
+**Sparse-gate research ([issue #15](https://github.com/wuwangzhang1216/abliterix/issues/15)).**
+This implementation is distinct from Frank's
+[policy-routing circuit study](https://arxiv.org/abs/2604.04385v6).
+It does not perform activation interchange or causal gate-to-amplifier tests,
+so its head scores do not establish causal gate identity. The paper also
+distinguishes an upstream gate from the distributed circuitry that follows it.
+Neither the paper nor this heuristic establishes lower capability damage for
+Abliterix across model families or quantization levels; that requires independent,
+matched evaluations and reproducible result artifacts.
 
 ## Harmfulness ⊥ Refusal Joint Ablation *(new)*
 
