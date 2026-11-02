@@ -231,6 +231,7 @@ The deep details live in `docs/` and `benchmarks/`:
 - **[docs/method_maturity.md](docs/method_maturity.md)** — evidence levels for every method, from implementation to leading claims.
 - **[docs/evaluation.md](docs/evaluation.md)** — why most abliteration benchmarks lie, our standards, and the architecture A/B test.
 - **[docs/evidence_resources.md](docs/evidence_resources.md)** — GPU/API/storage resources needed to turn method claims into reproducible evidence.
+- **[November 2026 evaluation reliability review](docs/research/evaluation-reliability-2026-11.md)** — current research, bounded-memory KL, benchmark integrity, and measured performance tradeoffs.
 - **[docs/moe.md](docs/moe.md)** — the four independent MoE steering mechanisms and supported MoE models.
 - **[docs/fp4_repack.md](docs/fp4_repack.md)** — abliterate native FP4 (MXFP4/NVFP4) models and re-pack to 4-bit offline, no BF16 blow-up.
 - **[docs/configuration.md](docs/configuration.md)** — config loading order, the 150+ shipped configs, the Web UI, and research-mode visualization.
