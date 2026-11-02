@@ -29,7 +29,7 @@ def main() -> None:
         payload[field] = str(value if value.is_absolute() else config_root / value)
     config = H3TrainingConfig.model_validate(payload)
     plan = H3TrainingPlan.from_config(config)
-    write_h3_plan(plan, args.output)
+    write_h3_plan(plan, args.output, protected_paths=(args.config,))
     print(f"Validated {len(plan.samples)} H3 samples")
     print(f"Wrote training plan to {args.output}")
 
