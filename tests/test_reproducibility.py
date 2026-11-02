@@ -10,11 +10,15 @@ from abliterix.reproducibility import (
     SCHEMA_VERSION,
     assess_reproducibility,
     build_manifest,
+    canonical_manifest_sha256,
     compare_reproduction_metrics,
+    load_manifest,
     manifest_trial,
     pin_remote_sources,
     validate_manifest,
+    write_reproduce_artifacts,
 )
+from abliterix.scriptlib import build_trial_recipe, extract_trial_artifact
 from abliterix.settings import AbliterixConfig
 
 
@@ -39,17 +43,30 @@ def _pinned_config(*, llm_judge: bool = False) -> AbliterixConfig:
     return config
 
 
-def _trial() -> SimpleNamespace:
+def _trial(*, scope: str = "global") -> SimpleNamespace:
+    config = _pinned_config()
     return SimpleNamespace(
         user_attrs={
             "index": 3,
-            "vector_index": 0.42,
-            "parameters": {"attn.o_proj": {"min": 0.2, "max": 1.1}},
+            "vector_index": None if scope == "per layer" else 0.42,
+            "parameters": {
+                "attn.o_proj": {
+                    "min_weight": 0.2,
+                    "max_weight": 1.1,
+                    "max_weight_position": 0.5,
+                    "min_weight_distance": 0.3,
+                }
+            },
             "moe_parameters": None,
             "decay_kernel": "linear",
             "direct_transform": None,
             "steering_variant": "single",
-            "steering_recipe": {"schema_version": 1, "steering": {}},
+            "steering_recipe": build_trial_recipe(
+                config,
+                direct_transform=config.steering.direct_transform,
+                steering_variant="single",
+                vector_scope=scope,
+            ),
             "kl_divergence": 0.125,
             "refusals": 2,
         }
@@ -162,4 +179,68 @@ def test_manifest_without_weight_hashes_is_not_reproducible(monkeypatch):
     assert manifest["reproducible"] is False
     assert any("SHA256" in reason for reason in manifest["reproducibility_reasons"])
     with pytest.raises(ValueError, match="SHA256"):
+        validate_manifest(manifest)
+
+
+@pytest.fixture
+def manifest_factory(monkeypatch):
+    monkeypatch.setattr("abliterix.reproducibility.collect_environment", lambda: {})
+    monkeypatch.setattr("abliterix.reproducibility.collect_packages", lambda: {})
+    monkeypatch.setattr("abliterix.reproducibility._git_commit", lambda: None)
+
+    def make(scope="global"):
+        return build_manifest(
+            _pinned_config(),
+            _trial(scope=scope),
+            weight_shas={"model.safetensors": "a" * 64},
+        )
+
+    return make
+
+
+@pytest.mark.parametrize("scope", ["global", "per layer"])
+def test_manifest_round_trips_exact_vector_scope(manifest_factory, scope, tmp_path):
+    manifest = manifest_factory(scope)
+    write_reproduce_artifacts(tmp_path, manifest)
+    restored = load_manifest(tmp_path / "reproduce.json")
+    artifact = extract_trial_artifact(manifest_trial(restored))
+
+    assert manifest["reproducible"] is True
+    assert artifact.vector_index == (None if scope == "per layer" else 0.42)
+    assert artifact.recipe["steering"]["fixed_vector_scope"] == scope
+    assert artifact.profiles["attn.o_proj"].max_weight == 1.1
+
+
+@pytest.mark.parametrize(
+    ("scope", "vector_index"),
+    [
+        ("global", None),
+        ("global", True),
+        ("global", "0.42"),
+        ("global", float("nan")),
+        ("global", float("inf")),
+        ("per layer", 0.42),
+        (None, None),
+        ("invalid", None),
+    ],
+)
+def test_manifest_rejects_inconsistent_vector_scope(
+    manifest_factory, scope, vector_index
+):
+    manifest = manifest_factory()
+    manifest["trial"]["steering_recipe"]["steering"]["fixed_vector_scope"] = scope
+    manifest["trial"]["vector_index"] = vector_index
+    manifest["integrity"]["canonical_manifest"] = canonical_manifest_sha256(manifest)
+
+    with pytest.raises(ValueError, match="vector_index|fixed_vector_scope"):
+        manifest_trial(manifest)
+
+
+@pytest.mark.parametrize("scope", ["global", "per layer"])
+def test_manifest_requires_explicit_vector_index_key(manifest_factory, scope):
+    manifest = manifest_factory(scope)
+    del manifest["trial"]["vector_index"]
+    manifest["integrity"]["canonical_manifest"] = canonical_manifest_sha256(manifest)
+
+    with pytest.raises(ValueError, match="missing 'vector_index'"):
         validate_manifest(manifest)

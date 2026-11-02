@@ -29,8 +29,8 @@ from ..types import ChatMessage
 from ..util import print
 from .metrics import ComplianceResult
 
-# Bump whenever the cache table schema changes.
-_CACHE_SCHEMA_VERSION = 1
+# Bump whenever storage or cache-key semantics change.
+_CACHE_SCHEMA_VERSION = 2
 
 
 def _judge_api_key_env(config: AbliterixConfig) -> str:
@@ -102,9 +102,17 @@ class ClassificationCache:
         self._conn.commit()
 
     def _key(self, prompt: str, response: str) -> str:
-        blob = (
-            f"v{_CACHE_SCHEMA_VERSION}|{self._model}|{self._prompt_hash}"
-            f"|{self._judge_fingerprint}|{prompt}|{response}"
+        blob = json.dumps(
+            [
+                _CACHE_SCHEMA_VERSION,
+                self._model,
+                self._prompt_hash,
+                self._judge_fingerprint,
+                prompt,
+                response,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 

@@ -13,7 +13,6 @@ provides :meth:`score_trial` to evaluate each Optuna trial.
 import statistics
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from ..data import load_prompt_dataset
@@ -21,46 +20,13 @@ from ..settings import AbliterixConfig
 from ..types import ChatMessage
 from ..util import print
 from .detector import RefusalDetector
+from .kl import mean_token_kl
 from .metrics import ComplianceResult, MetricResult
 
 
-def _finite_logprobs(logprobs: Tensor) -> Tensor:
-    """Return normalized finite log-probabilities for KL scoring."""
-    cleaned = torch.nan_to_num(logprobs, nan=-30.0, posinf=0.0, neginf=-30.0)
-    return F.log_softmax(cleaned, dim=-1, dtype=torch.float32)
-
-
 def _safe_kl_divergence(current_logprobs: Tensor, baseline_logprobs: Tensor) -> float:
-    """Compute mean per-distribution KL with normalized finite inputs.
-
-    All leading dimensions are independent distributions.  This makes a
-    ``(batch, step, vocab)`` input the arithmetic mean of per-token KL values,
-    while preserving the historical behavior for ``(batch, vocab)`` inputs.
-    """
-    if current_logprobs.shape != baseline_logprobs.shape:
-        raise ValueError(
-            "Current and baseline log-probabilities must have the same shape: "
-            f"got {tuple(current_logprobs.shape)} and "
-            f"{tuple(baseline_logprobs.shape)}"
-        )
-
-    # Output offloading can place baseline and trial distributions on
-    # different devices. Align before normalization without changing shape.
-    if baseline_logprobs.device != current_logprobs.device:
-        baseline_logprobs = baseline_logprobs.to(current_logprobs.device)
-
-    current = _finite_logprobs(current_logprobs)
-    baseline = _finite_logprobs(baseline_logprobs)
-    per_distribution = F.kl_div(
-        current,
-        baseline,
-        reduction="none",
-        log_target=True,
-    ).sum(dim=-1)
-    kl = per_distribution.mean()
-    if torch.isfinite(kl):
-        return max(0.0, float(kl.item()))
-    return float("inf")
+    """Compatibility entry point for the shared full-vocabulary reducer."""
+    return mean_token_kl(current_logprobs, baseline_logprobs)
 
 
 class TrialScorer:

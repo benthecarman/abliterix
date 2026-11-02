@@ -35,6 +35,11 @@ from ..weight_transforms import (
     apply_ega_projection,
     resolve_ega_axis,
 )
+from .bnb_utils import (
+    dequantize_bnb_int8_weight,
+    is_bnb_int8_weight,
+    validate_bnb_int8_weight,
+)
 
 try:
     import bitsandbytes as bnb
@@ -490,7 +495,6 @@ def apply_steering(
                 # Obtain the full-precision weight matrix W.
                 base_weight = cast(Tensor, mod.base_layer.weight)
                 qs = getattr(base_weight, "quant_state", None)
-                CB = getattr(base_weight, "CB", None)
 
                 if qs is not None:
                     if bnb is None:
@@ -513,14 +517,15 @@ def apply_steering(
                             ).to(torch.float32),
                         )
                         engine._cache_dequant(mid, W)
-                elif CB is not None:
-                    # Int8 quantisation: dequantise from CB data and SCB row scales.
+                elif is_bnb_int8_weight(mod.base_layer):
+                    # The first bnb forward can move CB/SCB onto layer.state.
+                    # Cached dense weights do not certify live inference state.
+                    validate_bnb_int8_weight(mod.base_layer)
                     mid = id(mod)
                     if mid in engine._dequant_cache:
                         W = engine._dequant_cache[mid]
                     else:
-                        SCB = base_weight.SCB  # ty:ignore[unresolved-attribute]
-                        W = CB.float() * SCB.float().unsqueeze(1) / 127.0
+                        W = dequantize_bnb_int8_weight(mod.base_layer)
                         engine._cache_dequant(mid, W)
                 elif _FP8_DTYPES and base_weight.dtype in _FP8_DTYPES:
                     # FP8: dequantise to fp32 via block-wise or per-tensor scale.

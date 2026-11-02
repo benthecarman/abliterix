@@ -11,6 +11,7 @@ creation, checkpoint management, the TPE sampler, and the per-trial
 objective evaluation.
 """
 
+import math
 import time
 from collections.abc import Callable
 from dataclasses import asdict
@@ -598,10 +599,19 @@ def run_search(
     if _sampler_seed is not None:
         torch.manual_seed(_sampler_seed)
 
+    def _completed_trial_gamma(n: int) -> int:
+        # Optuna counts PRUNED trials toward TPE startup, but multi-objective
+        # hypervolume weights require actual objective values. Cap the default
+        # good-set size so valueless pruned trials stay in the above set. With
+        # no completed trials, TPE uses its prior for the empty good set.
+        completed = len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
+        return min(math.ceil(0.1 * n), 25, completed)
+
     sampler_kw: dict = dict(
         n_startup_trials=opt.num_warmup_trials,
         n_ei_candidates=128,
         multivariate=True,
+        gamma=_completed_trial_gamma,
     )
     if _sampler_seed is not None:
         sampler_kw["seed"] = _sampler_seed

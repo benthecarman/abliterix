@@ -4,6 +4,12 @@
 
 Why most abliteration benchmarks are broken, the standards Abliterix evaluates against, and the controlled architecture A/B test we use to validate new techniques. The headline-numbers table and the live HonestAbliterationBench leaderboard live in the [main README](../README.md).
 
+**Dataset scope:** the bilingual/private-corpus observations below describe
+historical runs. The current default prompt sources are the public `mlabonne`
+datasets, and the historical corpora are not bundled or currently publicly
+retrievable in our access check. See [dataset roles and availability](datasets.md)
+before attempting reproduction; switching corpora changes the evaluation.
+
 ## Key Findings
 
 > **Gemma 4 is the hardest model to abliterate.** Its double-norm architecture (4x RMSNorm/layer) + Per-Layer Embeddings (PLE) actively resist LoRA and hook-based steering. Direct weight editing with norm-preserving orthogonal projection across Q/K/V/O + MLP is the only proven approach. With SRA + direct orthogonal projection, Gemma-4-31B reached ~3/100 refusals at KL 0.0012.

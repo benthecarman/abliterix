@@ -37,7 +37,9 @@ from transformers.generation import (
 from ..settings import AbliterixConfig
 from ..types import ChatMessage, QuantMode, SteeringMode, VectorMethod, WeightNorm
 from ..util import chunk_batches, flush_memory, print
+from .bnb_utils import is_bnb_int8_weight, validate_bnb_int8_weight
 from . import fp8_utils
+from .quantization_validation import validate_quantization_state
 
 # transformers < 5.0 uses torch_dtype=, >= 5.0 uses dtype= in from_pretrained.
 import transformers as _tf
@@ -364,8 +366,8 @@ def _make_generation_config_savable(model: Module) -> None:
     model.generation_config = repaired
 
 
-def _forward_supports_logits_to_keep(model: Module) -> bool:
-    """Return whether the underlying model explicitly limits output logits.
+def _forward_supports_kwarg(model: Module, name: str) -> bool:
+    """Return whether the underlying model explicitly accepts a keyword.
 
     PEFT and ``torch.compile`` expose generic ``**kwargs`` forward signatures,
     so inspect their wrapped base model instead.  A generic ``**kwargs`` alone
@@ -395,9 +397,17 @@ def _forward_supports_logits_to_keep(model: Module) -> bool:
         break
 
     try:
-        return "logits_to_keep" in inspect.signature(current.forward).parameters
-    except (TypeError, ValueError):
+        parameter = inspect.signature(current.forward).parameters.get(name)
+        return parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    except (AttributeError, TypeError, ValueError):
         return False
+
+
+def _forward_supports_logits_to_keep(model: Module) -> bool:
+    return _forward_supports_kwarg(model, "logits_to_keep")
 
 
 def _required_lora_rank(config: AbliterixConfig) -> int:
@@ -691,12 +701,16 @@ class SteeringEngine:
                             "offline.[/]"
                         )
 
+                validate_quantization_state(self.model, stage="after loading")
+
                 # Smoke-test: a single forward pass catches dtype-related
                 # runtime errors (inf/nan probability tensors, etc.).
+                self._validate_int8_state()
                 self._generate(
                     [ChatMessage(system=config.system_prompt, user="What is 1+1?")],
                     max_new_tokens=1,
                 )
+                self._validate_int8_state()
             except (
                 Exception
             ) as error:  # Model loading may fail with diverse errors (OOM, dtype, CUDA)
@@ -996,6 +1010,7 @@ class SteeringEngine:
     def _init_adapters(self):
         """Wrap the base model in PEFT LoRA adapters targeting steerable modules."""
         assert isinstance(self.model, PreTrainedModel)
+        validate_quantization_state(self.model, stage="before adapter initialization")
 
         # Build a map from module id to its full path in the model tree.
         # We use full paths (not leaf names) to avoid collisions with identically
@@ -1005,6 +1020,7 @@ class SteeringEngine:
         id_to_path: dict[int, str] = {
             id(m): name for name, m in self.model.named_modules()
         }
+        self._validate_int8_state()
 
         target_paths: set[str] = set()
         for idx in range(len(self.transformer_layers)):
@@ -1028,6 +1044,9 @@ class SteeringEngine:
         )
 
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
+        # Adapter insertion can redispatch offloaded weights after the load
+        # smoke test, so validate the resulting metadata as well.
+        validate_quantization_state(self.model, stage="after adapter initialization")
 
         # PEFT inherits the base layer's dtype for LoRA A/B weights.  For FP8
         # models this produces Float8_e4m3fn parameters that crash F.linear
@@ -1037,6 +1056,8 @@ class SteeringEngine:
             for name, param in self.model.named_parameters():
                 if "lora_" in name and param.dtype in _fp8:
                     param.data = param.data.to(torch.bfloat16)
+
+        self._validate_int8_state()
 
         # Pre-cache references to every lora_B weight tensor for O(adapter-count)
         # resets instead of a full named_modules walk.
@@ -1051,6 +1072,20 @@ class SteeringEngine:
             f"* LoRA adapters initialised "
             f"({len(targets)} modules, leaves: {', '.join(leaf_summary)})"
         )
+
+    def _validate_int8_state(self) -> None:
+        """Check int8 metadata before expensive extraction and optimization."""
+        for name, module in self.model.named_modules():
+            # The underlying module is visited separately; skip PEFT wrappers.
+            if getattr(module, "base_layer", None) is not None:
+                continue
+            if is_bnb_int8_weight(module):
+                try:
+                    validate_bnb_int8_weight(module)
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        f"Invalid bitsandbytes int8 state in {name or '<root>'}: {error}"
+                    ) from error
 
     @staticmethod
     def _patch_moe_config_for_fp8(model_id: str, revision: str | None = None) -> None:
@@ -1999,6 +2034,7 @@ class SteeringEngine:
         min_new_tokens: int | None = None,
     ) -> tuple[list[str], Tensor]:
         """Batched wrapper around :meth:`generate_and_score`."""
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
         all_resp: list[str] = []
         all_lp: list[Tensor] = []
         for batch in chunk_batches(messages, self.config.inference.batch_size):
@@ -2010,6 +2046,8 @@ class SteeringEngine:
                 min_new_tokens=min_new_tokens,
             )
             all_resp.extend(resp)
+            if offload:
+                lp = lp.cpu()
             all_lp.append(lp)
         return all_resp, torch.cat(all_lp, dim=0)
 
@@ -2133,12 +2171,23 @@ class SteeringEngine:
     # Log-probability measurement
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
     def _logprobs_forward_pass(self, messages: list[ChatMessage]) -> Tensor:
         """Next-token logprobs via a single forward pass (no generation overhead)."""
         inputs = self._tokenize(messages)
         self._reset_position_cache()
-        outputs = self.model(**inputs)
-        return F.log_softmax(outputs.logits[:, -1, :], dim=-1)
+        cache = getattr(self, "_logprobs_forward_options", None)
+        model_identity = id(self.model)
+        if cache is None or cache[0] != model_identity:
+            forward_kwargs: dict[str, Any] = {}
+            if _forward_supports_logits_to_keep(cast(Module, self.model)):
+                forward_kwargs["logits_to_keep"] = 1
+            if _forward_supports_kwarg(cast(Module, self.model), "use_cache"):
+                forward_kwargs["use_cache"] = False
+            cache = (model_identity, forward_kwargs)
+            self._logprobs_forward_options = cache
+        outputs = self.model(**inputs, **cache[1])
+        return F.log_softmax(outputs.logits[:, -1, :], dim=-1, dtype=torch.float32)
 
     def compute_logprobs(self, messages: list[ChatMessage]) -> Tensor:
         """Compute next-token log-probabilities over ``token_count`` steps.
@@ -2221,6 +2270,7 @@ class SteeringEngine:
         ordered_messages = [messages[index] for index in original_indices]
         ordered_continuations = [continuations[index] for index in original_indices]
 
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
         all_logprobs: list[Tensor] = []
         batch_size = self.config.inference.batch_size
         for start in range(0, len(ordered_messages), batch_size):
@@ -2258,7 +2308,10 @@ class SteeringEngine:
                 max_new_tokens=token_count,
                 logits_processor=[sampler, forcing],
             )
-            all_logprobs.append(_captured_logprobs(sampler, token_count))
+            logprobs = _captured_logprobs(sampler, token_count)
+            if offload:
+                logprobs = logprobs.cpu()
+            all_logprobs.append(logprobs)
 
         logprobs = torch.cat(all_logprobs, dim=0)
         if not sort_by_length:
