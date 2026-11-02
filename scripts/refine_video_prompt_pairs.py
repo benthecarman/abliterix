@@ -526,7 +526,11 @@ async def build_pairs(args: argparse.Namespace) -> list[VideoPromptPair]:
     # Reserve temporary output paths too: none may overwrite the source input.
     paths += [path.with_suffix(path.suffix + ".tmp") for path in paths[1:5]]
     resolved = [path.resolve() for path in paths]
-    if len(set(resolved)) != len(resolved):
+    if len(set(resolved)) != len(resolved) or any(
+        left.exists() and right.exists() and left.samefile(right)
+        for index, left in enumerate(paths)
+        for right in paths[index + 1 :]
+    ):
         raise ValueError("input, output, progress and audit paths must be distinct")
     progress_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = paths[5]

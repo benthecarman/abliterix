@@ -338,6 +338,23 @@ def test_output_cannot_overwrite_source(tmp_path, monkeypatch):
     assert args.input.read_bytes() == before
 
 
+@pytest.mark.parametrize("destination", ["checkpoint_tmp", "output"])
+def test_hardlinked_artifact_cannot_truncate_source(tmp_path, monkeypatch, destination):
+    args = _args(tmp_path)
+    alias = (
+        args.output.with_suffix(".progress.jsonl.tmp")
+        if destination == "checkpoint_tmp"
+        else args.output
+    )
+    alias.hardlink_to(args.input)
+    before = args.input.read_bytes()
+    _forbid_client(monkeypatch)
+    with pytest.raises(ValueError, match="distinct"):
+        asyncio.run(refiner.build_pairs(args))
+    assert args.input.read_bytes() == before
+    assert alias.read_bytes() == before
+
+
 def test_generation_preserves_source_and_requests_only_benign_fields():
     client = FakeClient([_response()])
     pair = _generate(client)[0]
