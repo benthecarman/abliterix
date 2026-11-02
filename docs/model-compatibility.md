@@ -80,6 +80,13 @@ confirm finite forward outputs and the multi-stream shapes, and verify the
 explicit extraction error. They download no checkpoints and skip when the
 installed Transformers does not provide the architectures.
 
+The isolated upstream API checks used Transformers 5.20.2, huggingface-hub 2.4.0,
+tokenizers 0.23.3, PEFT 0.18.0, and PyTorch 2.11.0 on CPU. This overlay is **not** a
+validated project dependency resolution: hub 2.4.0 is outside the project's
+declared `huggingface-hub~=1.6` range. The normal full-suite check used the existing
+Transformers 5.7.0 environment. Neither the project lock nor its dependency
+constraints were upgraded for these upstream contract tests.
+
 These CPU checks do not cover full checkpoints, GPU kernels, quantized weights,
 GLM vision inputs, all attention variants, or model quality. Issue #19 remains
 open until its architecture and quality requirements have direct evidence.
