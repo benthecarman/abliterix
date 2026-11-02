@@ -243,6 +243,8 @@ The deep details live in `docs/` and `benchmarks/`:
 - **[docs/fp4_repack.md](docs/fp4_repack.md)** — abliterate native FP4 (MXFP4/NVFP4) models and re-pack to 4-bit offline, no BF16 blow-up.
 - **[docs/configuration.md](docs/configuration.md)** — config loading order, the 150+ shipped configs, the Web UI, and research-mode visualization.
 - **[docs/datasets.md](docs/datasets.md)** — current public defaults, prompt roles, and historical bilingual corpus availability. Bilingual coverage requires supplying those datasets; it is not included automatically.
+- **[docs/minimax-h3.md](docs/minimax-h3.md)** — source-preserving video Prompt Sets, media manifests, and the H3 training boundary.
+- **[docs/video-dataset-audit-2026-08.md](docs/video-dataset-audit-2026-08.md)** — historical video dataset report and current validation limitations.
 - **[docs/references.md](docs/references.md)** — paper references and BibTeX.
 - **[docs/benchmarks/2026-05-pod-validation.md](docs/benchmarks/2026-05-pod-validation.md)** — measured 10-feature sweep on Qwen2.5-7B-Instruct with LLM judge (Blackwell GPU).
 - **[benchmarks/METHOD_MATRIX.md](benchmarks/METHOD_MATRIX.md)** — cross-model method matrix for promoting methods through the maturity ladder.
