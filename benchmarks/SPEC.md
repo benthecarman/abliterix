@@ -17,8 +17,11 @@ are kept but rendered as stale.
 
 ## 1. Datasets (frozen)
 
-Both files live in this repository and are pinned by SHA256. The runner
-verifies the hash at startup and refuses to proceed on a mismatch.
+The two required files are pinned by SHA256 but are not bundled in this
+repository. They must be supplied at the local paths below; see
+[dataset availability](../docs/datasets.md). The runner verifies the hash at
+startup and refuses to proceed on a mismatch. A substitute or regenerated
+dataset cannot reproduce this frozen protocol.
 
 | Set    | Path                                              | Size | SHA256 |
 |--------|---------------------------------------------------|-----:|--------|
