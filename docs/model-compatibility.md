@@ -29,7 +29,9 @@ The official
 [DeepSeek-V4 encoder](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/blob/9e165c30e2704aec5d9d593cce3eebd58bbef1cb/encoding/encoding_dsv4.py)
 accepts `thinking_mode` and has no `add_generation_prompt` argument. Encoders own
 their special tokens, so tokenization uses `add_special_tokens=False` to avoid
-duplicating a BOS token.
+duplicating a BOS token. This also applies to the engine's render-then-tokenize
+paths for prompt batches, length sorting, and interactive chat; ordinary
+tokenizers keep their existing defaults.
 
 ## Dependencies and multi-stream states
 

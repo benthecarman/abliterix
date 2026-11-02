@@ -984,6 +984,7 @@ class SteeringEngine:
             return enc["input_ids"]
 
         tok.apply_chat_template = _patched  # type: ignore[assignment]
+        self._custom_encoder_installed = True
         print(
             f"  [dim]Installed custom encoder from {path.name} "
             f"(kwargs={encoder_kwargs or {}})[/]"
@@ -1925,6 +1926,13 @@ class SteeringEngine:
     # Tokenisation helpers
     # ------------------------------------------------------------------
 
+    def _chat_tokenizer_options(self) -> dict[str, bool]:
+        # The engine also tokenizes text rendered with tokenize=False. Keep
+        # that path consistent with the custom encoder's direct tokenization.
+        if getattr(self, "_custom_encoder_installed", False):
+            return {"add_special_tokens": False}
+        return {}
+
     def _render_messages(self, messages: list[ChatMessage]) -> list[str]:
         """Render messages exactly as the model-facing tokenizer sees them."""
         chats = []
@@ -1960,6 +1968,7 @@ class SteeringEngine:
             padding=False,
             return_attention_mask=False,
             return_token_type_ids=False,
+            **self._chat_tokenizer_options(),
         )
         input_ids = encoded["input_ids"]
         lengths = [len(row) for row in input_ids]
@@ -1991,6 +2000,7 @@ class SteeringEngine:
             return_tensors="pt",
             padding=True,
             return_token_type_ids=False,
+            **self._chat_tokenizer_options(),
         ).to(self.model.device)
 
     # ------------------------------------------------------------------
@@ -2445,6 +2455,7 @@ class SteeringEngine:
             text,
             return_tensors="pt",
             return_token_type_ids=False,
+            **self._chat_tokenizer_options(),
         ).to(self.model.device)
 
         streamer = TextStreamer(

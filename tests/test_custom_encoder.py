@@ -1,8 +1,15 @@
 """Local encoder signatures work without downloading model code or weights."""
 
 import pytest
+import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.processors import TemplateProcessing
+from transformers import PreTrainedTokenizerFast
 
 from abliterix.core.engine import SteeringEngine
+from abliterix.types import ChatMessage
 
 
 class _Tokenizer:
@@ -135,3 +142,71 @@ def test_encoder_reports_bad_options_at_installation(tmp_path, options):
             "def encode_messages(messages, mode):\n    return 'prompt'\n",
             options,
         )
+
+
+@pytest.mark.parametrize("custom_encoder", [False, True])
+def test_real_tokenizer_runtime_paths_preserve_single_bos(tmp_path, custom_encoder):
+    """Cover render-then-tokenize, sorting and chat, not just the wrapper."""
+    backend = Tokenizer(
+        WordLevel(
+            {"<PAD>": 0, "<BOS>": 1, "hello": 2, "there": 3, "<UNK>": 4},
+            unk_token="<UNK>",
+        )
+    )
+    backend.pre_tokenizer = Whitespace()
+    backend.post_processor = TemplateProcessing(
+        single="<BOS> $A", special_tokens=[("<BOS>", 1)]
+    )
+
+    class RecordingTokenizer(PreTrainedTokenizerFast):
+        def __call__(self, *args, **kwargs):
+            encoded = super().__call__(*args, **kwargs)
+            self.calls.append(encoded["input_ids"])
+            return encoded
+
+    tokenizer = RecordingTokenizer(
+        tokenizer_object=backend,
+        bos_token="<BOS>",
+        pad_token="<PAD>",
+        unk_token="<UNK>",
+        padding_side="left",
+    )
+    tokenizer.calls = []
+    tokenizer.chat_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+
+    class RecordingModel:
+        device = torch.device("cpu")
+
+        def generate(self, input_ids, **_kwargs):
+            self.last_input_ids = input_ids
+            return torch.cat((input_ids, torch.tensor([[2]])), dim=1)
+
+    engine = object.__new__(SteeringEngine)
+    engine.tokenizer = tokenizer
+    engine.model = RecordingModel()
+    engine.response_prefix = ""
+    if custom_encoder:
+        encoder_path = tmp_path / "bos_encoder.py"
+        encoder_path.write_text(
+            "def encode_messages(messages):\n"
+            "    return '<BOS>' + messages[-1]['content']\n",
+            encoding="utf-8",
+        )
+        engine._install_custom_encoder(str(encoder_path), {})
+
+    messages = [
+        ChatMessage(system="", user="hello there"),
+        ChatMessage(system="", user="hello"),
+    ]
+    rendered = engine._render_messages(messages)
+    assert rendered[0] == ("<BOS>" if custom_encoder else "") + "hello there"
+    tokenized = engine._tokenize(messages)
+    assert tokenized["input_ids"].tolist() == [[1, 2, 3], [0, 1, 2]]
+
+    assert engine._length_sorted_indices(messages) == [1, 0]
+    assert tokenizer.calls[-1] == [[1, 2, 3], [1, 2]]
+
+    assert (
+        engine.stream_chat_response([{"role": "user", "content": "hello"}]) == "hello"
+    )
+    assert engine.model.last_input_ids.tolist() == [[1, 2]]
