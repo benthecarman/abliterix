@@ -38,6 +38,7 @@ from ..settings import AbliterixConfig
 from ..types import ChatMessage, QuantMode, SteeringMode, VectorMethod, WeightNorm
 from ..util import chunk_batches, flush_memory, print
 from . import fp8_utils
+from .quantization_validation import validate_quantization_state
 
 # transformers < 5.0 uses torch_dtype=, >= 5.0 uses dtype= in from_pretrained.
 import transformers as _tf
@@ -660,6 +661,8 @@ class SteeringEngine:
                             "offline.[/]"
                         )
 
+                validate_quantization_state(self.model, stage="after loading")
+
                 # Smoke-test: a single forward pass catches dtype-related
                 # runtime errors (inf/nan probability tensors, etc.).
                 self._generate(
@@ -959,6 +962,7 @@ class SteeringEngine:
     def _init_adapters(self):
         """Wrap the base model in PEFT LoRA adapters targeting steerable modules."""
         assert isinstance(self.model, PreTrainedModel)
+        validate_quantization_state(self.model, stage="before adapter initialization")
 
         # Build a map from module id to its full path in the model tree.
         # We use full paths (not leaf names) to avoid collisions with identically
@@ -991,6 +995,9 @@ class SteeringEngine:
         )
 
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
+        # Adapter insertion can redispatch offloaded weights after the load
+        # smoke test, so validate the resulting metadata as well.
+        validate_quantization_state(self.model, stage="after adapter initialization")
 
         # PEFT inherits the base layer's dtype for LoRA A/B weights.  For FP8
         # models this produces Float8_e4m3fn parameters that crash F.linear
