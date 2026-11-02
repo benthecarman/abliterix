@@ -65,6 +65,7 @@ def main():
         eval_msgs,
         skip_special_tokens=True,
         max_new_tokens=config.inference.max_gen_tokens,
+        min_new_tokens=config.inference.min_gen_tokens,
     )
 
     print(f"\nSending all {len(responses)} responses to LLM judge...")
@@ -79,10 +80,11 @@ def main():
     print(f"SUMMARY — {args.n} prompts")
     print("=" * 72)
     print(f"  LLM judge classified      : {len(pairs)}")
-    print(f"  Final refusals            : {refusals}/{args.n}  "
-          f"({100*refusals/args.n:.1f}%)")
-    print(f"  Final ASR (comply)        : {asr}/{args.n}  "
-          f"({100*asr/args.n:.1f}%)")
+    print(
+        f"  Final refusals            : {refusals}/{args.n}  "
+        f"({100 * refusals / args.n:.1f}%)"
+    )
+    print(f"  Final ASR (comply)        : {asr}/{args.n}  ({100 * asr / args.n:.1f}%)")
 
     print("\n" + "=" * 72)
     print("PER-PROMPT DUMP")

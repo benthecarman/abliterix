@@ -54,6 +54,7 @@ Desktop.ini
 /datasets/
 
 # Model cards (for HF uploads, not part of the project)
+/model_cards/
 /configs/*_modelcard.md
 
 # Study checkpoints (generated at runtime)
@@ -61,6 +62,8 @@ checkpoints*/
 
 # Experiment outputs (generated at runtime)
 experiments*/
+/artifacts/
+/results/
 
 # HonestAbliterationBench: track the spec, the contributing guide, the
 # result JSONs that build the leaderboard, and the auto-generated
@@ -72,6 +75,7 @@ experiments*/
 
 # One-off scratch scripts
 /scratch/
+/.scratch/
 
 # Residual analysis plots
 /plots/
@@ -103,3 +107,8 @@ experiments*/
 # Paper (private working dir — drafts, raw experiment data, GPU logs)
 # ========================
 /paper/
+
+# Model cards belong on HuggingFace, not in-repo
+/MODEL_CARD_*.md
+# Ephemeral planning drafts
+/VLLM_*DRAFT*.md

@@ -3,7 +3,11 @@
 import torch
 import torch.nn.functional as F
 
-from abliterix.sra import _build_concept_atoms, _spectral_residualize, compute_sra_vectors
+from abliterix.sra import (
+    _build_concept_atoms,
+    _spectral_residualize,
+    compute_sra_vectors,
+)
 from abliterix.types import VectorMethod
 
 
@@ -29,7 +33,8 @@ class TestBuildConceptAtoms:
         torch.testing.assert_close(
             norms[valid],
             torch.ones_like(norms[valid]),
-            atol=1e-5, rtol=1e-5,
+            atol=1e-5,
+            rtol=1e-5,
         )
 
     def test_atoms_are_orthogonal(self, synthetic_states):
@@ -87,7 +92,9 @@ class TestSpectralResidualize:
         cleaned = _spectral_residualize(refusal_vec, atoms, ridge_alpha=0.01)
         norms = cleaned.norm(dim=-1)
 
-        assert norms.mean() > 0.1, f"Cleaned vector should not be zero: mean norm={norms.mean():.4f}"
+        assert norms.mean() > 0.1, (
+            f"Cleaned vector should not be zero: mean norm={norms.mean():.4f}"
+        )
 
     def test_ridge_alpha_effect(self, synthetic_states):
         """Large alpha should preserve the original vector more."""
@@ -126,7 +133,9 @@ class TestComputeSRAVectors:
         from abliterix.vectors import compute_steering_vectors
 
         benign, target = synthetic_states
-        base = compute_steering_vectors(benign, target, VectorMethod.MEAN, orthogonal_projection=False)
+        base = compute_steering_vectors(
+            benign, target, VectorMethod.MEAN, orthogonal_projection=False
+        )
         sra = compute_sra_vectors(benign, target, base_method=VectorMethod.MEAN)
 
         diff = (sra - base).abs().max().item()

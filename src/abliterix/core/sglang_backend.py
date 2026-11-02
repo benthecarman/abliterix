@@ -77,6 +77,7 @@ class SGLangGenerator:
 
         kwargs: dict[str, Any] = dict(
             model_path=model_id,
+            revision=config.model.revision,
             tp_size=tp,
             mem_fraction_static=config.model.gpu_memory_utilization,
             trust_remote_code=trust,
@@ -109,7 +110,9 @@ class SGLangGenerator:
                 from transformers import AutoConfig
 
                 _auto_cfg = AutoConfig.from_pretrained(
-                    model_id, trust_remote_code=trust
+                    model_id,
+                    trust_remote_code=trust,
+                    revision=config.model.revision,
                 )
                 _qcfg = getattr(_auto_cfg, "quantization_config", None)
                 if _qcfg is None:
@@ -246,12 +249,23 @@ class SGLangGenerator:
         messages: list[ChatMessage],
         skip_special_tokens: bool = False,
         max_new_tokens: int | None = None,
+        min_new_tokens: int | None = None,
         adapter_path: str | None = None,
     ) -> list[str]:
         prompts = self._format_prompts(messages)
         max_tok = max_new_tokens or self.config.inference.max_gen_tokens
+        min_tok = min_new_tokens
+        if min_tok is None and max_new_tokens is None:
+            min_tok = self.config.inference.min_gen_tokens
+
+        if min_tok is not None and min_tok > max_tok:
+            raise ValueError(
+                f"min_gen_tokens ({min_tok}) cannot exceed max_gen_tokens ({max_tok})"
+            )
 
         sampling_params = {"temperature": 0, "max_new_tokens": max_tok}
+        if min_tok is not None:
+            sampling_params["min_new_tokens"] = min_tok
 
         # SGLang: lora_path is a separate kwarg to generate(), not part of
         # sampling_params.  It takes adapter NAMEs (not filesystem paths),
@@ -269,12 +283,14 @@ class SGLangGenerator:
         messages: list[ChatMessage],
         skip_special_tokens: bool = False,
         max_new_tokens: int | None = None,
+        min_new_tokens: int | None = None,
         adapter_path: str | None = None,
     ) -> list[str]:
         return self.generate_text(
             messages,
             skip_special_tokens=skip_special_tokens,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             adapter_path=adapter_path,
         )
 
@@ -284,8 +300,24 @@ class SGLangGenerator:
         max_new_tokens: int,
         kl_token_count: int,
         skip_special_tokens: bool = False,
+        min_new_tokens: int | None = None,
         adapter_path: str | None = None,
     ) -> tuple[list[str], Tensor]:
+        """Generate responses and retain every requested sampler distribution.
+
+        The sampler distributions are useful for inspecting a single run.  For
+        multi-token KL between two model states, use
+        :meth:`score_continuation_logprobs_batched` so both states are scored on
+        identical teacher-forced prefixes.
+        """
+        if kl_token_count < 1:
+            raise ValueError("kl_token_count must be at least 1")
+        if kl_token_count > max_new_tokens:
+            raise ValueError(
+                f"kl_token_count ({kl_token_count}) cannot exceed "
+                f"max_new_tokens ({max_new_tokens})"
+            )
+
         prompts = self._format_prompts(messages)
 
         k_logprobs = 100
@@ -294,6 +326,13 @@ class SGLangGenerator:
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         }
+        requested_min_tokens = max(min_new_tokens or 0, kl_token_count)
+        if requested_min_tokens > max_new_tokens:
+            raise ValueError(
+                f"min_gen_tokens ({requested_min_tokens}) cannot exceed "
+                f"max_gen_tokens ({max_new_tokens})"
+            )
+        sampling_params["min_new_tokens"] = requested_min_tokens
 
         # SGLang: return_logprob, top_logprobs_num, lora_path are separate
         # keyword arguments to generate(), NOT part of sampling_params.
@@ -305,13 +344,26 @@ class SGLangGenerator:
             gen_kwargs["lora_path"] = [adapter_path] * len(prompts)
 
         outputs = self.engine.generate(prompts, sampling_params, **gen_kwargs)
+        if len(outputs) != len(messages):
+            raise RuntimeError(
+                "SGLang returned an unexpected number of generation results "
+                f"({len(outputs)} != {len(messages)})"
+            )
 
         responses: list[str] = []
-        all_logprobs: list[Tensor] = []
-
         vocab_size = len(self.tokenizer)
+        uniform_lp = math.log(1.0 / vocab_size)
+        dense_logprobs = torch.full(
+            (len(outputs), kl_token_count, vocab_size),
+            -30.0,
+            dtype=torch.float32,
+        )
+        has_finite = torch.zeros(
+            (len(outputs), kl_token_count),
+            dtype=torch.bool,
+        )
 
-        for out in outputs:
+        for batch_idx, out in enumerate(outputs):
             responses.append(out["text"])
 
             # SGLang meta_info.output_top_logprobs:
@@ -320,30 +372,30 @@ class SGLangGenerator:
             # Inner list = top-K candidates at that position.
             meta = out.get("meta_info", {})
             top_lps = meta.get("output_top_logprobs", [])
-            n_tokens = min(kl_token_count, len(top_lps))
-
-            if n_tokens == 0:
-                all_logprobs.append(
-                    torch.full((vocab_size,), math.log(1.0 / vocab_size))
-                )
+            if not isinstance(top_lps, (list, tuple)):
                 continue
 
-            per_step: list[Tensor] = []
-            for step_lps in top_lps[:n_tokens]:
-                step_vec = torch.full((vocab_size,), -30.0)
+            for step_idx, step_lps in enumerate(top_lps[:kl_token_count]):
                 # Each item is (logprob, token_id, decoded_text_or_None).
                 if isinstance(step_lps, (list, tuple)):
                     for item in step_lps:
                         if isinstance(item, (list, tuple)) and len(item) >= 2:
                             logprob_val = float(item[0])
                             token_id = int(item[1])
-                            if 0 <= token_id < vocab_size:
-                                step_vec[token_id] = logprob_val
-                per_step.append(F.log_softmax(step_vec, dim=0))
+                            if (
+                                math.isfinite(logprob_val)
+                                and 0 <= token_id < vocab_size
+                            ):
+                                dense_logprobs[batch_idx, step_idx, token_id] = (
+                                    logprob_val
+                                )
+                                has_finite[batch_idx, step_idx] = True
 
-            all_logprobs.append(torch.stack(per_step).mean(dim=0))
-
-        return responses, torch.stack(all_logprobs)
+        dense_logprobs = F.log_softmax(dense_logprobs, dim=-1)
+        dense_logprobs[~has_finite] = uniform_lp
+        if kl_token_count == 1:
+            dense_logprobs = dense_logprobs[:, 0, :]
+        return responses, dense_logprobs
 
     def generate_and_score_batched(
         self,
@@ -351,14 +403,16 @@ class SGLangGenerator:
         max_new_tokens: int,
         kl_token_count: int,
         skip_special_tokens: bool = False,
+        min_new_tokens: int | None = None,
         adapter_path: str | None = None,
     ) -> tuple[list[str], Tensor]:
         return self.generate_and_score(
             messages,
-            max_new_tokens,
-            kl_token_count,
-            skip_special_tokens,
-            adapter_path,
+            max_new_tokens=max_new_tokens,
+            kl_token_count=kl_token_count,
+            skip_special_tokens=skip_special_tokens,
+            min_new_tokens=min_new_tokens,
+            adapter_path=adapter_path,
         )
 
     def compute_logprobs_batched(
@@ -373,6 +427,158 @@ class SGLangGenerator:
             adapter_path=adapter_path,
         )
         return logprobs
+
+    def score_continuation_logprobs_batched(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+        token_count: int,
+        adapter_path: str | None = None,
+    ) -> Tensor:
+        """Capture distributions on shared teacher-forced continuations.
+
+        SGLang input logprobs are aligned to input token positions.  Requesting
+        from the final prompt token produces one leading ``None`` alignment
+        entry followed by distributions predicting continuation tokens 1..N.
+        Requiring that marker prevents an API/version mismatch from silently
+        falling back to incomparable free-running trajectories.
+
+        Returns ``(batch, vocab)`` for one token and
+        ``(batch, token_count, vocab)`` for multiple tokens.
+        """
+        if len(messages) != len(continuations):
+            raise ValueError(
+                "messages and continuations must have the same length "
+                f"({len(messages)} != {len(continuations)})"
+            )
+        if token_count < 1:
+            raise ValueError("token_count must be at least 1")
+
+        prompts = self._format_prompts(messages)
+        input_ids: list[list[int]] = []
+        logprob_start_lens: list[int] = []
+
+        for item_idx, (prompt, continuation) in enumerate(
+            zip(prompts, continuations, strict=True)
+        ):
+            try:
+                prompt_ids = list(
+                    self.tokenizer.encode(prompt, add_special_tokens=False)
+                )
+                full_ids = list(
+                    self.tokenizer.encode(
+                        prompt + continuation,
+                        add_special_tokens=False,
+                    )
+                )
+            except TypeError:
+                prompt_ids = list(self.tokenizer.encode(prompt))
+                full_ids = list(self.tokenizer.encode(prompt + continuation))
+
+            if not prompt_ids:
+                raise ValueError(
+                    f"Prompt item {item_idx} has no tokens; SGLang cannot align "
+                    "the first continuation distribution"
+                )
+            if full_ids[: len(prompt_ids)] != prompt_ids:
+                raise ValueError(
+                    f"Continuation item {item_idx} changes the prompt token boundary; "
+                    "teacher-forced continuation positions are ambiguous"
+                )
+
+            stop = len(prompt_ids) + token_count
+            if stop > len(full_ids):
+                available = max(len(full_ids) - len(prompt_ids), 0)
+                raise ValueError(
+                    f"Continuation item {item_idx} has only {available} token(s); "
+                    f"token_count={token_count} requires at least {token_count}"
+                )
+
+            # Only prefill the requested continuation prefix.  Starting one
+            # token before it is required by SGLang's input-logprob alignment:
+            # [None, P(c_0 | prompt), P(c_1 | prompt+c_0), ...].
+            input_ids.append(full_ids[:stop])
+            logprob_start_lens.append(len(prompt_ids) - 1)
+
+        sampling_params: dict[str, Any] = {
+            "temperature": 0,
+            "max_new_tokens": 1,
+        }
+        gen_kwargs: dict[str, Any] = {
+            "return_logprob": True,
+            "logprob_start_len": logprob_start_lens,
+            "top_logprobs_num": 100,
+        }
+        if adapter_path:
+            gen_kwargs["lora_path"] = [adapter_path] * len(input_ids)
+
+        outputs = self.engine.generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            **gen_kwargs,
+        )
+        if len(outputs) != len(messages):
+            raise RuntimeError(
+                "SGLang returned an unexpected number of continuation scores "
+                f"({len(outputs)} != {len(messages)})"
+            )
+
+        vocab_size = len(self.tokenizer)
+        dense_logprobs = torch.full(
+            (len(outputs), token_count, vocab_size),
+            -30.0,
+            dtype=torch.float32,
+        )
+
+        for batch_idx, out in enumerate(outputs):
+            meta = out.get("meta_info", {})
+            top_lps = meta.get("input_top_logprobs")
+            if not isinstance(top_lps, (list, tuple)):
+                raise RuntimeError(
+                    "SGLang did not return input_top_logprobs required for "
+                    f"teacher-forced continuation item {batch_idx}; refusing to "
+                    "substitute free-running generated trajectories"
+                )
+            if len(top_lps) < token_count + 1:
+                raise RuntimeError(
+                    "SGLang returned too few input_top_logprobs positions for "
+                    f"teacher-forced continuation item {batch_idx}: need "
+                    f"{token_count + 1}, got {len(top_lps)}"
+                )
+            if top_lps[0] is not None:
+                raise RuntimeError(
+                    "SGLang input_top_logprobs did not contain the expected "
+                    f"teacher-forced alignment marker for item {batch_idx}"
+                )
+
+            for step_idx, step_lps in enumerate(top_lps[1 : token_count + 1]):
+                if not isinstance(step_lps, (list, tuple)) or not step_lps:
+                    raise RuntimeError(
+                        "SGLang returned no input_top_logprobs distribution for "
+                        f"teacher-forced continuation item {batch_idx}, step {step_idx}"
+                    )
+
+                found_finite = False
+                for item in step_lps:
+                    if not isinstance(item, (list, tuple)) or len(item) < 2:
+                        continue
+                    logprob_val = float(item[0])
+                    token_id = int(item[1])
+                    if not math.isfinite(logprob_val) or not 0 <= token_id < vocab_size:
+                        continue
+                    dense_logprobs[batch_idx, step_idx, token_id] = logprob_val
+                    found_finite = True
+
+                if not found_finite:
+                    raise RuntimeError(
+                        "SGLang returned no finite input_top_logprobs for "
+                        f"teacher-forced continuation item {batch_idx}, step {step_idx}"
+                    )
+
+        dense_logprobs = F.log_softmax(dense_logprobs, dim=-1)
+        if token_count == 1:
+            return dense_logprobs[:, 0, :]
+        return dense_logprobs
 
     def shutdown(self):
         """Shut down the SGLang engine and free GPU memory."""

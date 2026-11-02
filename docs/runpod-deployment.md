@@ -101,19 +101,27 @@ split = "train[400:420]"
 
 | Optimization | Effect | Config |
 |---|---|---|
-| Expert Parallelism (EP) | Better MoE throughput vs TP-only | `enable_expert_parallel=True` in vllm_backend.py |
+| Expert Parallelism (EP) | Better MoE throughput vs TP-only | `enable_expert_parallel = None` auto-enables only for MoE topology |
 | FP8 KV cache | 2x KV cache capacity | `kv_cache_dtype="fp8_e4m3"` |
 | CUTLASS grouped GEMM for MoE | +57% expert throughput on H100 | `VLLM_MOE_USE_DEEP_GEMM=0` |
 | Projection cache OOM fix | No more dequant cache accumulation | `del W` after each projection |
 | speculators fast path | 10x faster hidden state extraction | Auto-enabled when `speculators` installed |
 | Skip MoE profiling (vLLM) | Save ~12 min Phase 1 time | Auto for `backend="vllm"` |
 
-## Architecture: Phase 1 (HF) → Phase 2 (vLLM)
+## Architecture: vLLM-first
 
-- **Phase 1** uses HuggingFace with `device_map="auto"` (pipeline parallelism).
-  Only one GPU is active at a time → slow (~4 tok/s). This phase extracts
-  hidden states and computes steering vectors. Cannot use vLLM because vLLM
-  doesn't expose intermediate hidden states.
+- **Default**: run generation, scoring, refusal counting, and trial replay on
+  vLLM. HF generation is too slow for large-model optimization and should not
+  be used for the trial loop.
 
-- **Phase 2** uses vLLM with tensor parallelism (TP=4). All 4 GPUs compute
-  simultaneously → fast (70+ tok/s). Runs the 50-trial optimization loop.
+- **Hidden states**: use the speculators/vLLM fast path when available. If a
+  model architecture does not expose usable hidden states through the fast path
+  (Gemma 4 31B currently falls here), HF may be loaded once to compute steering
+  vectors. That fallback must not spill into evaluation or optimization
+  generation.
+
+- **vLLM in-place editing**: for Gemma 4 31B, use `disable_lora = true` and
+  `use_in_place_editing = true`. The vLLM LoRA route was ineffective for this
+  architecture; in-place attention editing produced the selected 7/100 trial.
+
+See the full operational notes in [vllm.md](vllm.md).

@@ -1,0 +1,93 @@
+# Gemma 4 31B — vLLM in-place direct editing, low-KL search
+#
+# Goal:
+#   - Keep refusal rate in single digits on the 100-prompt eval slice.
+#   - Prefer very low behavioral drift measured by vLLM continuation-NLL KL.
+#
+# Differences from gemma4_31b.toml:
+#   - Uses the fixed vLLM continuation-NLL KL path instead of sparse top-k KL.
+#   - Searches weaker steering strengths as well as the previous aggressive band.
+#   - Caps min_weight_frac so warmup explores localized peak profiles more often.
+#   - Runs more trials/warmup samples for a better low-KL Pareto frontier.
+
+[model]
+model_id = "google/gemma-4-31B-it"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "80GiB"}
+backend = "vllm"
+tensor_parallel_size = 1
+gpu_memory_utilization = 0.92
+enable_expert_parallel = false
+enable_chunked_prefill = true
+enforce_eager = true
+max_model_len = 4096
+disable_lora = true
+use_in_place_editing = true
+
+[inference]
+batch_size = 0
+max_batch_size = 8
+max_gen_tokens = 150
+min_gen_tokens = 100
+
+[steering]
+steering_mode = "direct"
+vector_method = "mean"
+orthogonal_projection = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+decay_kernel = "gaussian"
+weight_normalization = "pre"
+disabled_components = ["mlp.down_proj"]
+
+# Lower floor finds gentler edits; upper bound still covers the previous
+# single-digit refusal winner's regime.
+strength_range = [0.25, 5.0]
+
+# Bias random warmup away from nearly-flat layer profiles. This keeps steering
+# more localized and usually lowers continuation-NLL drift for the same refusal
+# improvement.
+min_weight_frac_max = 0.45
+
+[optimization]
+num_trials = 100
+num_warmup_trials = 30
+checkpoint_dir = "checkpoints_gemma4_31b_vllm_continuation_lowkl"
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.001
+prune_threshold = 50.0
+
+[detection]
+llm_judge = true
+llm_judge_model = "google/gemini-3-flash-preview"
+llm_judge_batch_size = 10
+llm_judge_concurrency = 35
+
+[benign_prompts]
+dataset = "datasets/good_1000"
+split = "train[:400]"
+column = "prompt"
+
+[target_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[:400]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "datasets/good_1000"
+split = "train[400:500]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[400:500]"
+column = "prompt"
+
+[display]
+print_responses = false

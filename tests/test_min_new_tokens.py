@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import torch
 
 from abliterix.core.engine import SteeringEngine
+from abliterix.core.vllm_backend import VLLMGenerator
 from abliterix.types import ChatMessage
 
 
@@ -48,7 +49,9 @@ def _make_mock_engine() -> SteeringEngine:
     engine.model = model  # ty:ignore[invalid-assignment]
     engine.response_prefix = ""
     engine.config = SimpleNamespace(
-        inference=SimpleNamespace(max_gen_tokens=999, batch_size=2),
+        inference=SimpleNamespace(
+            max_gen_tokens=999, min_gen_tokens=None, batch_size=2
+        ),
     )
     # _reset_position_cache is called from _generate; stub it out.
     engine._reset_position_cache = lambda: None  # type: ignore[method-assign]
@@ -86,6 +89,30 @@ def test_generate_text_omits_min_new_tokens_when_not_set():
     assert "min_new_tokens" not in captured
 
 
+def test_generate_text_uses_configured_min_gen_tokens_by_default():
+    engine = _make_mock_engine()
+    engine.config.inference.min_gen_tokens = 100  # type: ignore[attr-defined]
+    msgs = [ChatMessage(system="", user="hi"), ChatMessage(system="", user="hi")]
+
+    engine.generate_text(msgs)
+
+    captured = engine._captured_generate_kwargs  # type: ignore[attr-defined]
+    assert captured.get("max_new_tokens") == 999
+    assert captured.get("min_new_tokens") == 100
+
+
+def test_generate_text_explicit_short_max_omits_configured_min_gen_tokens():
+    engine = _make_mock_engine()
+    engine.config.inference.min_gen_tokens = 100  # type: ignore[attr-defined]
+    msgs = [ChatMessage(system="", user="hi"), ChatMessage(system="", user="hi")]
+
+    engine.generate_text(msgs, max_new_tokens=20)
+
+    captured = engine._captured_generate_kwargs  # type: ignore[attr-defined]
+    assert captured.get("max_new_tokens") == 20
+    assert "min_new_tokens" not in captured
+
+
 def test_generate_text_batched_passes_min_new_tokens():
     engine = _make_mock_engine()
     msgs = [ChatMessage(system="", user="hi"), ChatMessage(system="", user="hi")]
@@ -95,3 +122,58 @@ def test_generate_text_batched_passes_min_new_tokens():
     captured = engine._captured_generate_kwargs  # type: ignore[attr-defined]
     assert captured.get("max_new_tokens") == 150
     assert captured.get("min_new_tokens") == 100
+
+
+class _TokenizerWithoutTemplate:
+    chat_template = None
+
+
+class _TokenizerThatDropsTemplate:
+    chat_template = "{{ messages }}"
+
+    def apply_chat_template(self, *_args, **_kwargs):
+        raise ValueError(
+            "Cannot use chat template functions because tokenizer.chat_template is not set"
+        )
+
+
+class _TokenizerWithoutEnableThinking:
+    chat_template = "{{ messages }}"
+
+    def apply_chat_template(self, _messages, **kwargs):
+        if "enable_thinking" in kwargs:
+            raise TypeError("unexpected keyword argument 'enable_thinking'")
+        return "templated prompt"
+
+
+def _make_mock_vllm_generator(tokenizer) -> VLLMGenerator:
+    gen = object.__new__(VLLMGenerator)
+    gen.tokenizer = tokenizer
+    return gen
+
+
+def test_vllm_format_prompt_falls_back_when_chat_template_missing():
+    gen = _make_mock_vllm_generator(_TokenizerWithoutTemplate())
+    msg = ChatMessage(system="System line.", user="Hello")
+
+    prompt = gen._format_prompt(msg)
+
+    assert prompt == "System line.\n\nUser: Hello\nAssistant:"
+
+
+def test_vllm_format_prompt_falls_back_when_wrapper_drops_template():
+    gen = _make_mock_vllm_generator(_TokenizerThatDropsTemplate())
+    msg = ChatMessage(system="", user="Hello")
+
+    prompt = gen._format_prompt(msg)
+
+    assert prompt == "User: Hello\nAssistant:"
+
+
+def test_vllm_format_prompt_retries_without_enable_thinking():
+    gen = _make_mock_vllm_generator(_TokenizerWithoutEnableThinking())
+    msg = ChatMessage(system="", user="Hello")
+
+    prompt = gen._format_prompt(msg)
+
+    assert prompt == "templated prompt"

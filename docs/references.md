@@ -16,6 +16,7 @@ Abliterix builds on the following research:
 - **Steering Vector Fields**: (2026). [Steering Vector Fields for Context-Aware Inference-Time Control in Large Language Models](https://arxiv.org/abs/2602.01654).
 - **Optimal Transport**: (2026). [Efficient Refusal Ablation in LLM through Optimal Transport](https://arxiv.org/abs/2603.04355).
 - **Multi-Direction Refusal**: (2026). [There Is More to Refusal in Large Language Models than a Single Direction](https://arxiv.org/abs/2602.02132).
+- **RDO / Geometry of Refusal**: Wollschläger, T., Elstner, J., Geisler, S., Cohen-Addad, V., Günnemann, S., & Gasteiger, J. (2025). [The Geometry of Refusal in Large Language Models: Concept Cones and Representational Independence](https://arxiv.org/abs/2502.17420). *ICML 2025*. Gradient-based refusal-direction optimization (`vector_method = "rdo"`).
 
 <details>
 <summary>Classic references</summary>
@@ -73,6 +74,14 @@ Abliterix builds on the following research:
   pages     = {2546--2554},
   year      = {2011},
   url       = {https://papers.nips.cc/paper/4443-algorithms-for-hyper-parameter-optimization}
+}
+
+@inproceedings{wollschlager2025geometry,
+  title     = {The Geometry of Refusal in Large Language Models: Concept Cones and Representational Independence},
+  author    = {Wollschl{\"a}ger, Tom and Elstner, Jannes and Geisler, Simon and Cohen-Addad, Vincent and G{\"u}nnemann, Stephan and Gasteiger, Johannes},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2025},
+  url       = {https://arxiv.org/abs/2502.17420}
 }
 
 @article{cristofano2026sra,

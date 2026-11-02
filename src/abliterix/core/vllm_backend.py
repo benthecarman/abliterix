@@ -31,6 +31,7 @@ The abliteration pipeline splits into two phases:
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -44,10 +45,426 @@ from torch import Tensor
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
 from ..util import print
+from .bnb_utils import dequantize_bnb_int8_weight, is_bnb_int8_weight
 
 
-# Minimum LoRA rank supported by vLLM.
-_VLLM_MIN_RANK = 8
+# Abliterix's ProjectionCache emits rank-1 adapters. Declaring vLLM rank 1
+# avoids padding every tensor and kernel invocation to vLLM's generic rank-16
+# default. External or future rank-k adapters must set ``vllm_max_lora_rank``
+# explicitly.
+_DEFAULT_VLLM_MAX_LORA_RANK = 1
+
+
+def _require_single_direction_vectors(
+    steering_vectors: Tensor, *, operation: str
+) -> None:
+    """Reject stacked rank-k vectors before ProjectionCache can mis-index them."""
+    if steering_vectors.ndim != 2:
+        raise ValueError(
+            f"{operation} requires a 2-D single-direction steering tensor "
+            f"with shape (layers + 1, hidden_dim), got "
+            f"shape {tuple(steering_vectors.shape)}. The vLLM ProjectionCache "
+            "path is rank-1 only; use backend='hf' for multi-direction, SOM, "
+            "SAE, harmfulness-pair, or iterative recipes."
+        )
+
+
+# MLA-bearing model architecture name fragments. When the model's HF
+# ``config.architectures`` contains any of these substrings, we pick an
+# MLA-aware attention backend (``FLASH_ATTN_MLA``) instead of the
+# non-MLA defaults — vLLM 0.20.x rejects ``TRITON_ATTN`` on MLA models.
+_MLA_ARCH_FRAGMENTS: tuple[str, ...] = (
+    "DeepseekV2",
+    "DeepseekV3",
+    "DeepseekV4",
+    "MiniMaxM2",  # MiniMax-M2.5, M2.7
+    "MiniMaxText",
+)
+
+# Architecture name fragments for sink-attention models (gpt-oss family).
+# vLLM rejects ``FLASH_ATTN`` on these ("attention sinks not supported")
+# but ``TRITON_ATTN`` works.
+_SINK_ATTENTION_ARCH_FRAGMENTS: tuple[str, ...] = (
+    "GptOss",  # gpt-oss-20b / 120b
+)
+
+# Common Hugging Face architecture fragments for mixture-of-experts models.
+# This is only the fallback when config-field detection is unavailable; the
+# engine-init path passes the result of inspecting the actual HF config.
+_MOE_ARCH_FRAGMENTS: tuple[str, ...] = (
+    "Dbrx",
+    "DeepseekV2",
+    "DeepseekV3",
+    "DeepseekV4",
+    "GptOss",
+    "MiniMaxM2",
+    "MiniMaxText",
+    "Mixtral",
+    "Moe",
+    "MoE",
+    "Olmoe",
+)
+
+_MOE_CONFIG_FIELDS: tuple[str, ...] = (
+    "num_experts",
+    "num_local_experts",
+    "num_routed_experts",
+    "n_routed_experts",
+    "moe_num_experts",
+    "num_experts_per_tok",
+)
+
+_MOE_CONFIG_CHILDREN: tuple[str, ...] = (
+    "text_config",
+    "decoder_config",
+    "ffn_config",
+)
+
+
+def _architecture_looks_moe(model_arch: str) -> bool:
+    """Return whether an architecture name is recognisably MoE."""
+    return any(fragment in model_arch for fragment in _MOE_ARCH_FRAGMENTS)
+
+
+def _config_looks_moe(hf_config: Any, model_arch: str) -> bool:
+    """Inspect common HF MoE topology fields, including nested configs."""
+    pending = [hf_config]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+
+        for field in _MOE_CONFIG_FIELDS:
+            value = (
+                candidate.get(field)
+                if isinstance(candidate, dict)
+                else getattr(candidate, field, None)
+            )
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if value > 0:
+                    return True
+
+        for child_name in _MOE_CONFIG_CHILDREN:
+            child = (
+                candidate.get(child_name)
+                if isinstance(candidate, dict)
+                else getattr(candidate, child_name, None)
+            )
+            if child is not None:
+                pending.append(child)
+
+    return _architecture_looks_moe(model_arch)
+
+
+def _resolve_return_routed_experts(
+    configured: bool | None,
+    *,
+    model_arch: str,
+    is_moe: bool | None,
+) -> bool:
+    """Resolve routed-expert capture while preserving explicit overrides.
+
+    ``None`` is the safe auto mode: use inspected HF topology when available,
+    then fall back to the architecture name. Dense/unknown models stay off.
+    """
+    if configured is not None:
+        return configured
+    if is_moe is not None:
+        return is_moe
+    return _architecture_looks_moe(model_arch)
+
+
+def _resolve_expert_parallel(
+    configured: bool | None,
+    *,
+    model_arch: str,
+    is_moe: bool | None,
+) -> bool:
+    """Enable EP only for MoE topology and reject impossible overrides."""
+    topology_is_moe = (
+        is_moe if is_moe is not None else _architecture_looks_moe(model_arch)
+    )
+    if configured is None:
+        return topology_is_moe
+    if configured and not topology_is_moe:
+        raise ValueError(
+            "vLLM expert parallelism was explicitly enabled for a dense model; "
+            "set model.enable_expert_parallel=false (or leave it unset for auto)."
+        )
+    return configured
+
+
+def _detect_model_metadata(
+    model_id: str,
+    trust_remote_code: bool,
+    revision: str | None = None,
+) -> tuple[str, bool]:
+    """Return ``(architecture, is_moe)`` from the model's HF config.
+
+    A failure here means MLA-aware backend selection silently degrades to
+    "let vLLM pick", which on an MLA model can crash the engine init the
+    PRD #20 dispatcher was meant to prevent. Logged at WARNING so it's
+    visible in deploy logs without being an exception.
+    """
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+        )
+    except Exception as exc:
+        print(
+            "  [yellow]Warning: could not load HF config for arch detection "
+            f"({type(exc).__name__}: {exc}); vLLM will pick attention "
+            "backend on its own. If this model is MLA (DeepSeek-V2/V3, "
+            "MiniMax-M2.x), set ``attention_backend`` explicitly in the "
+            "[model] config to avoid an engine-init crash.[/]"
+        )
+        return "", False
+    archs = getattr(cfg, "architectures", None) or []
+    model_arch = archs[0] if archs else ""
+    return model_arch, _config_looks_moe(cfg, model_arch)
+
+
+def _detect_arch_family(
+    model_id: str,
+    trust_remote_code: bool,
+    revision: str | None = None,
+) -> str:
+    """Backward-compatible architecture-only view of model metadata."""
+    model_arch, _ = _detect_model_metadata(model_id, trust_remote_code, revision)
+    return model_arch
+
+
+def _resolve_compile_mode(enforce_eager_legacy: bool, vllm_compile_mode: str) -> str:
+    """Reconcile the legacy ``enforce_eager`` field with the new
+    ``vllm_compile_mode`` field.
+
+    The legacy field still exists for recipes that pre-date PRD #20.
+    When ``enforce_eager=True`` is set, we honour it by forcing the
+    "eager" mode regardless of ``vllm_compile_mode`` — that's the only
+    way the two fields can stay consistent without rejecting
+    historical recipes at config load.
+    """
+    if enforce_eager_legacy:
+        return "eager"
+    return vllm_compile_mode
+
+
+def _detect_fp8_and_kv_dtype(
+    config: AbliterixConfig, *, model_id: str, trust_remote_code: bool
+) -> tuple[bool, str | None]:
+    """Decide whether vLLM should treat this model as FP8 and which KV
+    cache dtype to use.
+
+    Two passes:
+
+    1. Recipe wins: ``quant_method = "fp8"`` always sets ``is_fp8=True``.
+    2. HF config sniff: native FP8 models (MiniMax-M2.5, Qwen3.5-*-FP8)
+       ship ``quantization_config.quant_method = "fp8"`` in their
+       config.json. vLLM auto-detects; we still need the bool to seed
+       the KV-cache-dtype default below.
+
+    Then ``kv_cache_dtype``:
+
+    - Recipe override wins.
+    - On FP8 + H100+ (sm_90+) auto-default to ``fp8_e4m3`` for 2x KV
+      capacity. Older cards have no FP8 KV path.
+    """
+    is_fp8 = bool(
+        config.model.quant_method and config.model.quant_method.value == "fp8"
+    )
+    if not is_fp8:
+        try:
+            from transformers import AutoConfig
+
+            _auto_cfg = AutoConfig.from_pretrained(
+                model_id,
+                trust_remote_code=trust_remote_code,
+                revision=config.model.revision,
+            )
+            _qcfg = getattr(_auto_cfg, "quantization_config", None)
+            if _qcfg is None:
+                _text_cfg = getattr(_auto_cfg, "text_config", None)
+                if _text_cfg is not None:
+                    _qcfg = getattr(_text_cfg, "quantization_config", None)
+            if _qcfg is not None:
+                _qm = (
+                    _qcfg if isinstance(_qcfg, dict) else getattr(_qcfg, "__dict__", {})
+                )
+                if _qm.get("quant_method") == "fp8":
+                    is_fp8 = True
+        except Exception:
+            pass
+
+    kv_dtype = config.model.kv_cache_dtype
+    if kv_dtype is None and is_fp8 and torch.cuda.is_available():
+        try:
+            cc = torch.cuda.get_device_capability(0)
+            if cc[0] >= 9:
+                kv_dtype = "fp8_e4m3"
+        except Exception:
+            pass
+    return is_fp8, kv_dtype
+
+
+def _build_llm_kwargs(
+    config: AbliterixConfig,
+    *,
+    model_arch: str,
+    is_fp8: bool,
+    kv_cache_dtype: str | None,
+    lora_max_rank: int,
+    is_moe: bool | None = None,
+) -> dict[str, Any]:
+    """Pure function that assembles the dict passed to ``vllm.LLM(...)``.
+
+    Lifted out of ``VLLMGenerator.__init__`` so the kwargs assembly is
+    unit-testable without importing vLLM (PR #21 review item 7). Keep
+    every conditional kwarg branch in this function so tests can lock
+    them.
+    """
+    from . import vllm_compilation_config
+
+    tp = config.model.tensor_parallel_size
+    if tp is None:
+        tp = torch.cuda.device_count()
+
+    compile_mode = _resolve_compile_mode(
+        config.model.enforce_eager, config.model.vllm_compile_mode
+    )
+    compilation_config = vllm_compilation_config.build(compile_mode)
+
+    kwargs: dict[str, Any] = dict(
+        model=config.model.model_id,
+        revision=config.model.revision,
+        tensor_parallel_size=tp,
+        gpu_memory_utilization=config.model.gpu_memory_utilization,
+        trust_remote_code=config.model.trust_remote_code or False,
+        enable_expert_parallel=_resolve_expert_parallel(
+            config.model.enable_expert_parallel,
+            model_arch=model_arch,
+            is_moe=is_moe,
+        ),
+        # MoE compute backend. Default 'triton' avoids the FlashInfer
+        # cutlass per-expert-group JIT compile that costs ~30 minutes
+        # on first sm_90 cold start.
+        moe_backend=config.model.moe_backend,
+        # generate_and_score requests logprobs=100 to build a sparse KL
+        # distribution that covers >99.9% of the probability mass.  vLLM
+        # V1 caps sampler logprobs at 20 by default; lift it explicitly
+        # so the KL computation keeps its top-100 tail.
+        max_logprobs=100,
+        # Issue #22: read per-token routed expert IDs from RequestOutput
+        # instead of installing forward hooks via collective_rpc. The
+        # profile_safety_experts_vllm function reads
+        # ``output.outputs[0].routed_experts`` (numpy ndarray of shape
+        # ``(tokens, layers, top_k)``) when this is on. Cost is small
+        # (~140 KB per typical request); the win is dropping ~150 LoC of
+        # worker rpc plumbing + one of the two reasons we needed
+        # VLLM_ALLOW_INSECURE_SERIALIZATION.
+        # Auto-enable only for MoE topology. vLLM 0.20.x tries to read MoE-only
+        # config fields during startup when this is True, which crashes dense
+        # models. An explicit recipe True/False remains authoritative.
+        enable_return_routed_experts=_resolve_return_routed_experts(
+            config.model.vllm_return_routed_experts,
+            model_arch=model_arch,
+            is_moe=is_moe,
+        ),
+        # vLLM 0.20.x compilation_config encodes the eager/non-eager
+        # intent. ``enforce_eager`` is intentionally NOT passed here —
+        # _resolve_compile_mode folds it into ``compile_mode`` above so
+        # the two fields cannot disagree.
+        compilation_config=compilation_config,
+        # Disable vLLM custom all-reduce only on Blackwell PCIe sm_120
+        # (deadlock); NVLink Hopper / SXM Blackwell keep the perf win.
+        disable_custom_all_reduce=_should_disable_custom_all_reduce(
+            config.model.disable_custom_all_reduce
+        ),
+        enable_prefix_caching=not bool(config.model.use_in_place_editing),
+    )
+
+    attention_backend = _resolve_attention_backend(
+        config.model.attention_backend, model_arch
+    )
+    if attention_backend is not None:
+        kwargs["attention_config"] = {"backend": attention_backend}
+
+    kwargs["limit_mm_per_prompt"] = config.model.limit_mm_per_prompt or {
+        "image": 0,
+        "video": 0,
+        "audio": 0,
+    }
+
+    if not config.model.disable_lora:
+        kwargs.update(
+            enable_lora=True,
+            max_lora_rank=lora_max_rank,
+            max_loras=config.model.vllm_max_loras,
+            max_cpu_loras=max(config.model.vllm_max_loras + 1, 2),
+        )
+        if config.model.lora_target_modules:
+            kwargs["lora_target_modules"] = list(config.model.lora_target_modules)
+
+    if config.model.max_model_len is not None:
+        kwargs["max_model_len"] = config.model.max_model_len
+    if config.model.max_num_seqs is not None:
+        kwargs["max_num_seqs"] = config.model.max_num_seqs
+    if config.model.hf_overrides:
+        kwargs["hf_overrides"] = config.model.hf_overrides
+    if is_fp8:
+        kwargs["quantization"] = "fp8"
+    if kv_cache_dtype is not None:
+        kwargs["kv_cache_dtype"] = kv_cache_dtype
+
+    return kwargs
+
+
+def _resolve_attention_backend(
+    config_override: str | None, model_arch: str
+) -> str | None:
+    """Pick the vLLM attention_config backend.
+
+    - User-set ``attention_backend`` in the recipe always wins.
+    - MLA models (DeepSeek-V2/V3, MiniMax-M2.x) get ``FLASH_ATTN_MLA``
+      because the non-MLA names are rejected at engine init.
+    - Sink-attention models (gpt-oss) keep ``TRITON_ATTN`` — ``FLASH_ATTN``
+      explicitly errors with "attention sinks not supported".
+    - Everything else returns None so vLLM applies its own default
+      (``FLASH_ATTN`` on Hopper, etc.).
+    """
+    if config_override is not None:
+        return config_override
+    for frag in _MLA_ARCH_FRAGMENTS:
+        if frag in model_arch:
+            return "FLASH_ATTN_MLA"
+    for frag in _SINK_ATTENTION_ARCH_FRAGMENTS:
+        if frag in model_arch:
+            return "TRITON_ATTN"
+    return None
+
+
+def _should_disable_custom_all_reduce(config_override: bool | None) -> bool:
+    """Auto-detect when vLLM's custom all-reduce path needs to be disabled.
+
+    Returns True only on Blackwell PCIe (sm_120) where the path is known to
+    deadlock during worker init without NVLink.  User-set value always wins.
+    """
+    if config_override is not None:
+        return config_override
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, minor = torch.cuda.get_device_capability(0)
+    except Exception:
+        return False
+    # sm_120 is Blackwell PCIe (RTX PRO 6000). sm_100 is Blackwell SXM
+    # (B100/B200) which has NVLink and does not need the workaround.
+    return (major, minor) == (12, 0)
 
 
 class VLLMGenerator:
@@ -59,6 +476,31 @@ class VLLMGenerator:
     """
 
     def __init__(self, config: AbliterixConfig):
+        from .vllm_compat import (
+            check_vllm_version,
+            ensure_vllm_env,
+            install_gemma4_transformers_compat,
+        )
+
+        # Refuse to start against an unsupported vLLM version. abliterix's
+        # current floor is 0.18 because `VLLM_ALLOW_INSECURE_SERIALIZATION`
+        # (PR #35928) is required for the collective_rpc path.
+        check_vllm_version()
+
+        # Auto-set the small set of vLLM env vars needed for in-place
+        # editing / collective_rpc. Idempotent and never overwrites a
+        # user-set value.
+        needs_rpc = bool(config.model.use_in_place_editing)
+        written_env = ensure_vllm_env(needs_collective_rpc=needs_rpc)
+        if written_env:
+            print(
+                "  [dim]vLLM env (auto-set): "
+                + ", ".join(f"{k}={v}" for k, v in written_env.items())
+                + "[/]"
+            )
+
+        install_gemma4_transformers_compat()
+
         from vllm import LLM, SamplingParams  # noqa: F811
 
         self.config = config
@@ -71,80 +513,43 @@ class VLLMGenerator:
         model_id = config.model.model_id
         trust = config.model.trust_remote_code or False
 
+        # Architecture sniff drives the MLA-aware attention backend choice
+        # below. Cached so we only hit the HF config once.
+        model_arch, is_moe = _detect_model_metadata(
+            model_id, trust, config.model.revision
+        )
+
         print(f"* Loading model in vLLM with TP={tp}...")
 
-        kwargs: dict[str, Any] = dict(
-            model=model_id,
-            tensor_parallel_size=tp,
-            gpu_memory_utilization=config.model.gpu_memory_utilization,
-            trust_remote_code=trust,
-            enable_lora=True,
-            max_lora_rank=_VLLM_MIN_RANK,
-            max_loras=1,
-            max_cpu_loras=2,
-            enforce_eager=config.model.enforce_eager,
-            enable_expert_parallel=config.model.enable_expert_parallel,
-            # NOTE: chunked_prefill is always ON in vLLM V1 (>= 0.8) and
-            # cannot be disabled.  We don't pass enable_chunked_prefill.
+        self._lora_disabled = bool(config.model.disable_lora)
+        # vLLM's max_lora_rank governs every adapter loaded by this engine;
+        # adapters with rank < this value get zero-padded inside
+        # _serialize_adapter. Fall back to vLLM's own default (16) when the
+        # user has not pinned a value.
+        self._lora_max_rank = (
+            config.model.vllm_max_lora_rank or _DEFAULT_VLLM_MAX_LORA_RANK
         )
-        if config.model.max_model_len is not None:
-            kwargs["max_model_len"] = config.model.max_model_len
-        if config.model.max_num_seqs is not None:
-            kwargs["max_num_seqs"] = config.model.max_num_seqs
 
-        # Model config overrides (e.g. MTP-3 → MTP-1 for Step-3.5-Flash).
-        if config.model.hf_overrides:
-            kwargs["hf_overrides"] = config.model.hf_overrides
+        # FP8 detection (recipe flag, then HF config sniff) + KV cache
+        # dtype auto-default. Extracted so __init__ stays readable.
+        is_fp8, kv_cache_dtype = _detect_fp8_and_kv_dtype(
+            config, model_id=model_id, trust_remote_code=trust
+        )
 
-        # FP8 models: let vLLM handle quantisation natively.
-        # For native FP8 models (quantization_config in config.json), vLLM
-        # auto-detects — we only need to set quantization="fp8" explicitly
-        # when the user requests on-the-fly FP8 quantization of a BF16 model.
-        is_fp8 = config.model.quant_method and config.model.quant_method.value == "fp8"
-        if is_fp8:
-            kwargs["quantization"] = "fp8"
-        # Note: native FP8 models (MiniMax-M2.5, Qwen3.5-*-FP8) ship with
-        # quantization_config in their config.json, so vLLM detects FP8
-        # automatically.  We still set is_fp8=True for KV cache dtype logic.
-
-        # Also detect native FP8 models (quantization_config.quant_method="fp8"
-        # in the model's config.json) for KV cache logic.
-        if not is_fp8:
-            try:
-                from transformers import AutoConfig
-
-                _auto_cfg = AutoConfig.from_pretrained(
-                    model_id, trust_remote_code=trust
-                )
-                _qcfg = getattr(_auto_cfg, "quantization_config", None)
-                if _qcfg is None:
-                    _text_cfg = getattr(_auto_cfg, "text_config", None)
-                    if _text_cfg is not None:
-                        _qcfg = getattr(_text_cfg, "quantization_config", None)
-                if _qcfg is not None:
-                    _qm = (
-                        _qcfg
-                        if isinstance(_qcfg, dict)
-                        else getattr(_qcfg, "__dict__", {})
-                    )
-                    if _qm.get("quant_method") == "fp8":
-                        is_fp8 = True
-            except Exception:
-                pass
-
-        # KV cache dtype: auto-detect for FP8 on H100+, or use explicit config.
-        kv_dtype = config.model.kv_cache_dtype
-        if kv_dtype is None and is_fp8:
-            # Auto: use fp8_e4m3 KV cache on H100+ (SM >= 90) for 2x KV capacity.
-            if torch.cuda.is_available():
-                cc = torch.cuda.get_device_capability(0)
-                if cc[0] >= 9:
-                    kv_dtype = "fp8_e4m3"
-        if kv_dtype is not None:
-            kwargs["kv_cache_dtype"] = kv_dtype
+        # Hand kwargs assembly off to the pure helper so it stays
+        # unit-testable without importing vLLM (PR #21 review item 7).
+        kwargs = _build_llm_kwargs(
+            config,
+            model_arch=model_arch,
+            is_fp8=is_fp8,
+            kv_cache_dtype=kv_cache_dtype,
+            lora_max_rank=self._lora_max_rank,
+            is_moe=is_moe,
+        )
 
         self.llm = LLM(**kwargs)
         self.tokenizer = self.llm.get_tokenizer()
+        self._ensure_chat_template(model_id, trust, config.model.revision)
 
         # Adapter management — use tmpfs (/dev/shm) to avoid disk I/O overhead
         # during per-trial LoRA hot-swap.  Falls back to /tmp if /dev/shm is
@@ -157,14 +562,239 @@ class VLLMGenerator:
         self._adapter_id = 1
         self._lora_target_modules: list[str] = []  # set during projection cache
 
+        # MoE router suppression is attached lazily by cli.py once the HF
+        # phase has identified safety experts.  See set_moe_editor().
+        self.moe_editor: Any | None = None
+        self.expert_editor: Any | None = None
+
         print(f"  [green]Ok[/] (vLLM TP={tp})")
+
+    # ------------------------------------------------------------------
+    # MoE router suppression (attached after HF safety-expert profiling)
+    # ------------------------------------------------------------------
+
+    def set_moe_editor(
+        self,
+        safety_experts: dict[int, list[tuple[int, float]]],
+    ) -> None:
+        """Attach a :class:`VLLMMoEEditor` so the optimizer trial loop can
+        apply router suppression between generations."""
+        from .vllm_moe_editor import VLLMMoEEditor
+
+        self.moe_editor = VLLMMoEEditor(self.llm, safety_experts)
+        # Probe routers once up front so we log the router layout and seed
+        # self._router_layers for apply().
+        self.moe_editor.probe()
+        # Pre-install persistent suppression hooks BEFORE any trial forward
+        # pass. register_forward_hook calls made AFTER a ``@support_torch_compile``
+        # model has already compiled are silently skipped by Dynamo
+        # (pytorch/pytorch#117758). With ``enforce_eager=True`` there is no
+        # compile, but we still install up-front to avoid that foot-gun.
+        try:
+            self.moe_editor._ensure_installed()
+        except Exception as exc:  # pragma: no cover — defensive
+            print(f"  [yellow]Warning: persistent suppression install failed: {exc}[/]")
+
+    def apply_router_suppression(self, n_suppress: int, bias_value: float) -> int:
+        """Scale down the router weight rows of the top-N safety experts
+        on every TP worker.  No-op if :meth:`set_moe_editor` has not been
+        called or ``n_suppress <= 0``.
+
+        Also invalidates the prefix cache so the next generation with the
+        modified weights actually re-runs the forward pass.  Without this,
+        vLLM replays KV entries captured before the edit and the router
+        changes are silently skipped — KL divergence stays exactly 0.0000
+        across every trial.
+        """
+        if self.moe_editor is None:
+            return 0
+        touched = self.moe_editor.apply(n_suppress=n_suppress, bias_value=bias_value)
+        if touched > 0:
+            try:
+                self.llm.reset_prefix_cache()
+            except Exception:
+                pass
+        return touched
+
+    def restore_router_suppression(self) -> int:
+        """Reverse any router row edits applied by the last
+        :meth:`apply_router_suppression` call.  Also flushes the prefix
+        cache so the next baseline/trial sees the restored weights."""
+        if self.moe_editor is None:
+            return 0
+        touched = self.moe_editor.restore()
+        if touched > 0:
+            try:
+                self.llm.reset_prefix_cache()
+            except Exception:
+                pass
+        return touched
+
+    # ------------------------------------------------------------------
+    # Expert-Granular Abliteration (EGA) — in-place expert weight editing
+    # ------------------------------------------------------------------
+
+    def set_expert_editor(
+        self,
+        hidden_dim: int,
+        transposed: bool = False,
+    ) -> None:
+        """Attach a :class:`VLLMExpertEditor` so the optimizer can apply EGA
+        projection on fused expert weights between generations.
+
+        Parameters
+        ----------
+        hidden_dim:
+            Size of the residual / hidden dimension the steering vector
+            lives in. Required to disambiguate transposed-vs-standard
+            ``w2_weight`` layout when ``hidden == intermediate`` (gpt-oss).
+        transposed:
+            ``True`` for gpt-oss's fused ``down_proj`` layout
+            ``(experts, intermediate, hidden)``. ``False`` for the
+            standard MoE convention ``(experts, hidden, intermediate)``.
+        """
+        from .vllm_moe_editor import VLLMExpertEditor
+
+        self.expert_editor = VLLMExpertEditor(
+            self.llm, hidden_dim=hidden_dim, transposed=transposed
+        )
+        self.expert_editor.probe()
+
+    def apply_ega_projection(
+        self,
+        plan: list[dict[str, Any]],
+        norm_preserve: bool = True,
+    ) -> dict[str, Any]:
+        """Project the refusal direction out of every expert's down_proj
+        for the layers listed in ``plan``.
+
+        ``plan`` format — one dict per layer:
+            ``{"layer_idx": int, "v": bytes, "strength": float}``
+        where ``v`` is ``torch.save``'d 1-D float tensor in hidden dim.
+
+        Caller computes ``v`` + ``strength`` per layer from the decay kernel
+        (same math as HF ``_apply_ega_steering``).
+
+        Invalidates the prefix cache so the next generation sees the edited
+        weights.
+        """
+        if getattr(self, "expert_editor", None) is None:
+            return {"applied": 0, "errors": ["no expert editor"], "per_layer": []}
+        result = self.expert_editor.apply_ega(plan, norm_preserve=norm_preserve)
+        if result.get("applied", 0) > 0:
+            try:
+                self.llm.reset_prefix_cache()
+            except Exception:
+                pass
+        return result
+
+    def restore_expert_weights(self) -> int:
+        """Reset every edited ``w2_weight`` to its pristine BF16 backup
+        (copied from CPU pinned RAM on each worker). Also flushes the
+        prefix cache."""
+        if getattr(self, "expert_editor", None) is None:
+            return 0
+        touched = self.expert_editor.restore()
+        if touched > 0:
+            try:
+                self.llm.reset_prefix_cache()
+            except Exception:
+                pass
+        return touched
+
+    # ------------------------------------------------------------------
+    # Direct attention projection (q/k/v/o_proj) under vLLM TP
+    # ------------------------------------------------------------------
+
+    def set_attention_editor(self) -> None:
+        """Attach a :class:`VLLMAttentionEditor` for in-place attention weight
+        edits (orthogonal projection on q/k/v/o_proj under TP). Slices the
+        fused ``qkv_proj.weight`` into Q/K/V segments using the model's
+        ``q_size``/``kv_size`` attributes."""
+        from .vllm_moe_editor import VLLMAttentionEditor
+
+        self.attention_editor = VLLMAttentionEditor(self.llm)
+        self.attention_editor.probe()
+
+    def apply_attention_projection(
+        self,
+        plan: list[dict[str, Any]],
+        norm_preserve: bool = True,
+    ) -> dict[str, Any]:
+        """Project the refusal direction out of attention projections for the
+        layers/components listed in ``plan``.
+
+        Each dict: ``{"layer_idx": int, "component": "q_proj"|"k_proj"|"v_proj"
+        |"o_proj", "v": bytes, "strength": float}``. Caller handles decay
+        kernel + per-component strength.
+
+        Flushes the prefix cache when any layer actually got edited.
+        """
+        if getattr(self, "attention_editor", None) is None:
+            return {"applied": 0, "errors": ["no attention editor"], "per_layer": []}
+        result = self.attention_editor.apply(plan, norm_preserve=norm_preserve)
+        if result.get("applied", 0) > 0:
+            try:
+                self.llm.reset_prefix_cache()
+            except Exception:
+                pass
+        return result
+
+    def restore_attention_weights(self) -> int:
+        """Reset edited attention weights to pristine from the CPU backup."""
+        if getattr(self, "attention_editor", None) is None:
+            return 0
+        touched = self.attention_editor.restore()
+        if touched > 0:
+            try:
+                self.llm.reset_prefix_cache()
+            except Exception:
+                pass
+        return touched
 
     # ------------------------------------------------------------------
     # Chat template formatting
     # ------------------------------------------------------------------
 
+    def _ensure_chat_template(
+        self,
+        model_id: str,
+        trust_remote_code: bool,
+        revision: str | None = None,
+    ) -> None:
+        """Copy the HF chat template when vLLM's tokenizer wrapper omits it."""
+        if getattr(self.tokenizer, "chat_template", None):
+            return
+        try:
+            from transformers import AutoTokenizer
+
+            hf_tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+            )
+        except Exception:
+            return
+
+        chat_template = getattr(hf_tokenizer, "chat_template", None)
+        if chat_template:
+            try:
+                self.tokenizer.chat_template = chat_template
+            except Exception:
+                pass
+
+    @staticmethod
+    def _format_prompt_without_template(msg: ChatMessage) -> str:
+        """Plain text fallback for tokenizers that do not expose chat_template."""
+        if msg.system:
+            return f"{msg.system.strip()}\n\nUser: {msg.user}\nAssistant:"
+        return f"User: {msg.user}\nAssistant:"
+
     def _format_prompt(self, msg: ChatMessage) -> str:
         """Format a ChatMessage into a prompt string using the tokenizer's chat template."""
+        if not getattr(self.tokenizer, "chat_template", None):
+            return self._format_prompt_without_template(msg)
+
         messages: list[dict[str, str]] = []
         if msg.system:
             messages.append({"role": "system", "content": msg.system})
@@ -181,7 +811,15 @@ class VLLMGenerator:
                 **kwargs,
             )
         except TypeError:
-            return self.tokenizer.apply_chat_template(messages, **kwargs)
+            try:
+                return self.tokenizer.apply_chat_template(messages, **kwargs)
+            except ValueError as exc:
+                if "chat_template" not in str(exc) and "chat template" not in str(exc):
+                    raise
+        except ValueError as exc:
+            if "chat_template" not in str(exc) and "chat template" not in str(exc):
+                raise
+        return self._format_prompt_without_template(msg)
 
     def _format_prompts(self, messages: list[ChatMessage]) -> list[str]:
         return [self._format_prompt(m) for m in messages]
@@ -213,6 +851,12 @@ class VLLMGenerator:
         str
             Path to the adapter directory.
         """
+        if self._lora_disabled:
+            # LoRA disabled (e.g. MXFP4 + driver < 575): router suppression
+            # is the only steering mechanism.  Return empty string so
+            # downstream ``if adapter_path`` checks evaluate False and vLLM
+            # generates without a lora_request.
+            return ""
         adapter_dir = self._adapter_dir
         # Clear previous adapter files and recreate.
         if os.path.exists(adapter_dir):
@@ -221,25 +865,49 @@ class VLLMGenerator:
 
         # Build state dict with PEFT naming convention.
         state_dict: dict[str, Tensor] = {}
+        target_rank = self._lora_max_rank
         for module_path, (lora_a, lora_b) in lora_weights.items():
-            # Pad rank-1 to rank-8 for vLLM compatibility.
+            # vLLM pins every adapter to the engine's max_lora_rank; pad
+            # smaller adapters with zeros so they fit. Recipes that want
+            # the rank passed through honestly should set
+            # ``vllm_max_lora_rank = <actual_rank>`` in the model config.
             rank = lora_a.shape[0]
-            if rank < _VLLM_MIN_RANK:
-                pad = _VLLM_MIN_RANK - rank
-                lora_a = F.pad(lora_a, (0, 0, 0, pad))  # (8, d_in)
-                lora_b = F.pad(lora_b, (0, pad, 0, 0))  # (d_out, 8)
+            if lora_b.shape[1] != rank:
+                raise ValueError(
+                    f"LoRA rank mismatch for {module_path}: lora_A has rank "
+                    f"{rank}, lora_B has rank {lora_b.shape[1]}."
+                )
+            if rank > target_rank:
+                raise ValueError(
+                    f"Adapter {module_path} has rank {rank}, which exceeds "
+                    f"the vLLM engine max_lora_rank={target_rank}. Set "
+                    "model.vllm_max_lora_rank to a supported capacity before "
+                    "constructing VLLMGenerator."
+                )
+            if rank < target_rank:
+                pad = target_rank - rank
+                lora_a = F.pad(lora_a, (0, 0, 0, pad))
+                lora_b = F.pad(lora_b, (0, pad, 0, 0))
 
             peft_key = f"base_model.model.{module_path}"
-            state_dict[f"{peft_key}.lora_A.weight"] = lora_a.contiguous().cpu()
-            state_dict[f"{peft_key}.lora_B.weight"] = lora_b.contiguous().cpu()
+            # Cast to bf16: vLLM nightly (0.19.2rc1+) asserts
+            # `inputs.dtype == lora_a_weights[0].dtype` inside
+            # triton_ops/lora_shrink_op.py. Model activations are bf16, so
+            # LoRA weights must match. float32 LoRA → AssertionError at runtime.
+            state_dict[f"{peft_key}.lora_A.weight"] = (
+                lora_a.to(torch.bfloat16).contiguous().cpu()
+            )
+            state_dict[f"{peft_key}.lora_B.weight"] = (
+                lora_b.to(torch.bfloat16).contiguous().cpu()
+            )
 
         save_file(state_dict, os.path.join(adapter_dir, "adapter_model.safetensors"))
 
         adapter_config = {
             "peft_type": "LORA",
             "base_model_name_or_path": base_model_id,
-            "r": _VLLM_MIN_RANK,
-            "lora_alpha": _VLLM_MIN_RANK,  # alpha == r → scaling = 1.0
+            "r": target_rank,
+            "lora_alpha": target_rank,  # alpha == r → scaling = 1.0
             "target_modules": target_modules,
             "lora_dropout": 0.0,
             "bias": "none",
@@ -261,21 +929,34 @@ class VLLMGenerator:
         messages: list[ChatMessage],
         skip_special_tokens: bool = False,
         max_new_tokens: int | None = None,
+        min_new_tokens: int | None = None,
         adapter_path: str | None = None,
     ) -> list[str]:
         """Generate responses using vLLM with optional LoRA adapter."""
-        from vllm.lora.request import LoRARequest
-
         prompts = self._format_prompts(messages)
         max_tok = max_new_tokens or self.config.inference.max_gen_tokens
+        min_tok = min_new_tokens
+        if min_tok is None and max_new_tokens is None:
+            min_tok = self.config.inference.min_gen_tokens
 
-        params = self._SamplingParams(
-            temperature=0.0,
-            max_tokens=max_tok,
-        )
+        if min_tok is not None and min_tok > max_tok:
+            raise ValueError(
+                f"min_gen_tokens ({min_tok}) cannot exceed max_gen_tokens ({max_tok})"
+            )
+
+        sampling_kwargs: dict[str, Any] = {
+            "temperature": 0.0,
+            "max_tokens": max_tok,
+        }
+        if min_tok is not None:
+            sampling_kwargs["min_tokens"] = min_tok
+
+        params = self._SamplingParams(**sampling_kwargs)
 
         lora_req = None
-        if adapter_path:
+        if adapter_path and not self._lora_disabled:
+            from vllm.lora.request import LoRARequest
+
             lora_req = LoRARequest(
                 f"steering_{self._adapter_id}",
                 self._adapter_id,
@@ -299,6 +980,7 @@ class VLLMGenerator:
         messages: list[ChatMessage],
         skip_special_tokens: bool = False,
         max_new_tokens: int | None = None,
+        min_new_tokens: int | None = None,
         adapter_path: str | None = None,
     ) -> list[str]:
         """Batch generation — vLLM handles batching internally via continuous batching."""
@@ -308,6 +990,7 @@ class VLLMGenerator:
             messages,
             skip_special_tokens=skip_special_tokens,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             adapter_path=adapter_path,
         )
 
@@ -317,30 +1000,54 @@ class VLLMGenerator:
         max_new_tokens: int,
         kl_token_count: int,
         skip_special_tokens: bool = False,
+        min_new_tokens: int | None = None,
         adapter_path: str | None = None,
     ) -> tuple[list[str], Tensor]:
         """Generate responses AND capture logprobs for KL divergence.
 
-        Uses vLLM's ``logprobs`` parameter to capture top-K token log
-        probabilities, then builds a sparse approximation of the full
-        log-probability distribution for KL computation.
-        """
-        from vllm.lora.request import LoRARequest
+        Ordinary LoRA/model runs use sampler logprobs for the generated
+        tokens. ``prompt_logprobs[-1]`` predicts the final *prompt* token and
+        is therefore not a next-token KL signal.
 
+        vLLM V1 sampler logprobs may be stale after ``collective_rpc``
+        in-place edits. That mode is scored separately through
+        :meth:`score_continuations_nll`; it must not silently substitute a
+        prompt-token distribution and call it the same KL metric.
+        """
         prompts = self._format_prompts(messages)
 
-        # Request logprobs for KL approximation.
-        # Top-100 covers >99.9% of probability mass for typical LLM distributions.
+        if kl_token_count < 1:
+            raise ValueError("kl_token_count must be at least 1")
+        if kl_token_count > max_new_tokens:
+            raise ValueError(
+                f"kl_token_count ({kl_token_count}) cannot exceed "
+                f"max_new_tokens ({max_new_tokens})"
+            )
+
         k_logprobs = 100
 
-        params = self._SamplingParams(
-            temperature=0.0,
-            max_tokens=max_new_tokens,
-            logprobs=k_logprobs,
-        )
+        sampling_kwargs: dict[str, Any] = {
+            "temperature": 0.0,
+            "max_tokens": max_new_tokens,
+            "logprobs": k_logprobs,
+        }
+        requested_min_tokens = max(min_new_tokens or 0, kl_token_count)
+        if requested_min_tokens > max_new_tokens:
+            raise ValueError(
+                f"min_gen_tokens ({requested_min_tokens}) cannot exceed "
+                f"max_gen_tokens ({max_new_tokens})"
+            )
+        # vLLM should return a sampler distribution for every KL step even if
+        # it samples EOS immediately. The padding below remains a defensive
+        # contract for malformed/older RequestOutput implementations.
+        sampling_kwargs["min_tokens"] = requested_min_tokens
+
+        params = self._SamplingParams(**sampling_kwargs)
 
         lora_req = None
-        if adapter_path:
+        if adapter_path and not self._lora_disabled:
+            from vllm.lora.request import LoRARequest
+
             lora_req = LoRARequest(
                 f"steering_{self._adapter_id}",
                 self._adapter_id,
@@ -349,42 +1056,45 @@ class VLLMGenerator:
 
         outputs = self.llm.generate(prompts, params, lora_request=lora_req)
 
-        # Extract responses and build logprob tensors.
         responses: list[str] = []
-        all_logprobs: list[Tensor] = []
 
         vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
+        import math
 
-        for out in outputs:
+        uniform_lp = math.log(1.0 / vocab_size)
+        # Allocate and normalize once for the entire request. The previous
+        # implementation created a full-vocabulary tensor and ran log_softmax
+        # separately for every batch item and KL step. At 150k vocabulary and
+        # batch 64 that Python/allocation overhead dominated vLLM inference.
+        dense_logprobs = torch.full(
+            (len(outputs), kl_token_count, vocab_size),
+            -30.0,
+            dtype=torch.float32,
+        )
+        has_finite = torch.zeros(
+            (len(outputs), kl_token_count),
+            dtype=torch.bool,
+        )
+
+        for batch_idx, out in enumerate(outputs):
             responses.append(out.outputs[0].text)
 
-            # Aggregate logprobs from the first kl_token_count generated tokens.
             token_lps = out.outputs[0].logprobs or []
             n_tokens = min(kl_token_count, len(token_lps))
+            for step_idx, sparse_lps in enumerate(token_lps[:n_tokens]):
+                for token_id, logprob_obj in (sparse_lps or {}).items():
+                    lp = float(logprob_obj.logprob)
+                    token_idx = int(token_id)
+                    if not math.isfinite(lp) or not 0 <= token_idx < vocab_size:
+                        continue
+                    dense_logprobs[batch_idx, step_idx, token_idx] = lp
+                    has_finite[batch_idx, step_idx] = True
 
-            if n_tokens == 0:
-                # Fallback: uniform log-probability distribution.
-                # Use log(1/V) instead of -inf to avoid NaN in KL computation.
-                import math
-
-                all_logprobs.append(
-                    torch.full((vocab_size,), math.log(1.0 / vocab_size))
-                )
-                continue
-
-            # Build per-position sparse log-softmax vectors, then take the
-            # arithmetic mean — matching HF's mean(log_softmax(scores_i)).
-            per_step: list[Tensor] = []
-            for step_lps in token_lps[:n_tokens]:
-                step_vec = torch.full((vocab_size,), -30.0)
-                for token_id, logprob_obj in step_lps.items():
-                    step_vec[token_id] = logprob_obj.logprob
-                # Renormalise each position independently.
-                per_step.append(F.log_softmax(step_vec, dim=0))
-
-            all_logprobs.append(torch.stack(per_step).mean(dim=0))
-
-        return responses, torch.stack(all_logprobs)
+        dense_logprobs = F.log_softmax(dense_logprobs, dim=-1)
+        dense_logprobs[~has_finite] = uniform_lp
+        if kl_token_count == 1:
+            dense_logprobs = dense_logprobs[:, 0, :]
+        return responses, dense_logprobs
 
     def generate_and_score_batched(
         self,
@@ -392,15 +1102,17 @@ class VLLMGenerator:
         max_new_tokens: int,
         kl_token_count: int,
         skip_special_tokens: bool = False,
+        min_new_tokens: int | None = None,
         adapter_path: str | None = None,
     ) -> tuple[list[str], Tensor]:
         """Batched wrapper — vLLM handles batching natively."""
         return self.generate_and_score(
             messages,
-            max_new_tokens,
-            kl_token_count,
-            skip_special_tokens,
-            adapter_path,
+            max_new_tokens=max_new_tokens,
+            kl_token_count=kl_token_count,
+            skip_special_tokens=skip_special_tokens,
+            min_new_tokens=min_new_tokens,
+            adapter_path=adapter_path,
         )
 
     def compute_logprobs_batched(
@@ -419,6 +1131,259 @@ class VLLMGenerator:
             adapter_path=adapter_path,
         )
         return logprobs
+
+    def _prepare_continuation_prompts(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+    ) -> tuple[list[str], list[list[int]]]:
+        """Format fixed continuations and locate their first token."""
+        if len(messages) != len(continuations):
+            raise ValueError(
+                "messages and continuations must have the same length "
+                f"({len(messages)} != {len(continuations)})"
+            )
+
+        prompts = self._format_prompts(messages)
+        full_prompts = [p + c for p, c in zip(prompts, continuations)]
+        prompt_token_ids: list[list[int]] = []
+        for prompt in prompts:
+            try:
+                token_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            except TypeError:
+                token_ids = self.tokenizer.encode(prompt)
+            prompt_token_ids.append(list(token_ids))
+        return full_prompts, prompt_token_ids
+
+    @staticmethod
+    def _continuation_start(
+        item_idx: int,
+        expected_prompt_ids: list[int],
+        full_prompt_token_ids: list[int],
+    ) -> int:
+        """Validate and return the first unambiguous continuation position."""
+        if not expected_prompt_ids:
+            raise ValueError(
+                f"Prompt item {item_idx} has no tokens; vLLM cannot align "
+                "the first continuation distribution"
+            )
+        if full_prompt_token_ids[: len(expected_prompt_ids)] != expected_prompt_ids:
+            raise ValueError(
+                f"Continuation item {item_idx} changes the prompt token boundary; "
+                "teacher-forced continuation positions are ambiguous"
+            )
+        return len(expected_prompt_ids)
+
+    def score_continuation_logprobs_batched(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+        token_count: int,
+        adapter_path: str | None = None,
+    ) -> Tensor:
+        """Capture distributions on shared teacher-forced continuations.
+
+        The returned distributions predict the first ``token_count`` tokens
+        of each fixed continuation.  Baseline and edited model calls therefore
+        see identical prefixes at every KL step, unlike free-running sampler
+        logprobs whose prefixes can diverge after the first generated token.
+
+        Returns ``(batch, vocab)`` for one token and
+        ``(batch, token_count, vocab)`` for multiple tokens.
+        """
+        if token_count < 1:
+            raise ValueError("token_count must be at least 1")
+
+        full_prompts, expected_prompt_ids = self._prepare_continuation_prompts(
+            messages, continuations
+        )
+
+        params = self._SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            prompt_logprobs=100,
+        )
+
+        lora_req = None
+        if adapter_path and not self._lora_disabled:
+            from vllm.lora.request import LoRARequest
+
+            lora_req = LoRARequest(
+                f"steering_{self._adapter_id}",
+                self._adapter_id,
+                adapter_path,
+            )
+
+        outputs = self.llm.generate(full_prompts, params, lora_request=lora_req)
+        if len(outputs) != len(messages):
+            raise RuntimeError(
+                "vLLM returned an unexpected number of continuation scores "
+                f"({len(outputs)} != {len(messages)})"
+            )
+
+        vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
+        dense_logprobs = torch.full(
+            (len(outputs), token_count, vocab_size),
+            -30.0,
+            dtype=torch.float32,
+        )
+
+        for batch_idx, (out, expected_ids) in enumerate(
+            zip(outputs, expected_prompt_ids)
+        ):
+            prompt_token_ids = list(getattr(out, "prompt_token_ids", None) or [])
+            prompt_logprobs = list(getattr(out, "prompt_logprobs", None) or [])
+            if not prompt_token_ids or not prompt_logprobs:
+                raise RuntimeError(
+                    "vLLM did not return prompt token IDs and prompt logprobs "
+                    f"for continuation item {batch_idx}"
+                )
+
+            # Match score_continuations_nll: the prompt's separately-tokenized
+            # length marks the first continuation token in the full prompt.
+            start = self._continuation_start(
+                batch_idx,
+                expected_ids,
+                prompt_token_ids,
+            )
+            stop = start + token_count
+            if stop > len(prompt_token_ids):
+                available = max(len(prompt_token_ids) - start, 0)
+                raise ValueError(
+                    f"Continuation item {batch_idx} has only {available} token(s); "
+                    f"token_count={token_count} requires at least {token_count}"
+                )
+            if stop > len(prompt_logprobs):
+                raise RuntimeError(
+                    "vLLM returned too few prompt-logprob positions for "
+                    f"continuation item {batch_idx}: need {stop}, got "
+                    f"{len(prompt_logprobs)}"
+                )
+
+            for step_idx, position in enumerate(range(start, stop)):
+                sparse_lps = prompt_logprobs[position]
+                if not sparse_lps:
+                    raise RuntimeError(
+                        "vLLM returned no prompt-logprob distribution for "
+                        f"continuation item {batch_idx}, step {step_idx}"
+                    )
+                found_finite = False
+                for token_id, logprob_obj in sparse_lps.items():
+                    lp = float(logprob_obj.logprob)
+                    token_idx = int(token_id)
+                    if not math.isfinite(lp) or not 0 <= token_idx < vocab_size:
+                        continue
+                    dense_logprobs[batch_idx, step_idx, token_idx] = lp
+                    found_finite = True
+                if not found_finite:
+                    raise RuntimeError(
+                        "vLLM returned no finite prompt logprobs for "
+                        f"continuation item {batch_idx}, step {step_idx}"
+                    )
+
+        dense_logprobs = F.log_softmax(dense_logprobs, dim=-1)
+        if token_count == 1:
+            return dense_logprobs[:, 0, :]
+        return dense_logprobs
+
+    def score_continuations_nll(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+        adapter_path: str | None = None,
+    ) -> Tensor:
+        """Score fixed continuations with a fresh prefill pass.
+
+        vLLM V1 sampler logprobs can stay effectively unchanged after
+        ``collective_rpc`` in-place edits, which made Gemma 4 31B report
+        KL=0.0000 even when generations changed.  Prompt logprobs are computed
+        during prefill, so scoring a fixed baseline continuation gives a
+        reliable damage signal for in-place runs.
+
+        Returns mean negative log-likelihood per continuation token, shape
+        ``(batch,)``.  Missing token logprobs are floored at 30 nats, which is
+        conservative and finite for heavily damaged trials.
+        """
+        full_prompts, expected_prompt_ids = self._prepare_continuation_prompts(
+            messages, continuations
+        )
+
+        params = self._SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            prompt_logprobs=100,
+        )
+
+        lora_req = None
+        if adapter_path and not self._lora_disabled:
+            from vllm.lora.request import LoRARequest
+
+            lora_req = LoRARequest(
+                f"steering_{self._adapter_id}",
+                self._adapter_id,
+                adapter_path,
+            )
+
+        outputs = self.llm.generate(full_prompts, params, lora_request=lora_req)
+
+        nlls: list[Tensor] = []
+        for batch_idx, (out, expected_ids) in enumerate(
+            zip(outputs, expected_prompt_ids)
+        ):
+            prompt_token_ids = list(getattr(out, "prompt_token_ids", None) or [])
+            prompt_logprobs = list(getattr(out, "prompt_logprobs", None) or [])
+            if not prompt_token_ids or not prompt_logprobs:
+                nlls.append(torch.tensor(30.0))
+                continue
+
+            start = self._continuation_start(
+                batch_idx,
+                expected_ids,
+                prompt_token_ids,
+            )
+            losses: list[float] = []
+            for idx in range(start, len(prompt_token_ids)):
+                if idx >= len(prompt_logprobs):
+                    break
+                entry = prompt_logprobs[idx]
+                if not entry:
+                    continue
+                token_id = int(prompt_token_ids[idx])
+                lp_obj = entry.get(token_id)
+                if lp_obj is None:
+                    losses.append(30.0)
+                    continue
+                lp = float(lp_obj.logprob)
+                if not math.isfinite(lp):
+                    losses.append(30.0)
+                    continue
+                losses.append(max(-lp, 0.0))
+
+            if losses:
+                nlls.append(torch.tensor(sum(losses) / len(losses)))
+            else:
+                nlls.append(torch.tensor(30.0))
+
+        return torch.stack(nlls)
+
+
+def _cache_entry_count(info: dict[str, Any]) -> int:
+    """Number of individual module entries represented by one cache record."""
+    if "experts" in info:
+        return len(info["experts"])
+    if "companions" in info:
+        return len(info["companions"])
+    return 1
+
+
+def _cache_entry_nbytes(info: dict[str, Any]) -> int:
+    """Bytes held by one cache record, including any per-expert entries."""
+    if "vW_all" in info:
+        return info["vW_all"].nbytes
+    if "experts" in info:
+        return sum(e["vW_all"].nbytes for e in info["experts"])
+    # Zero-LoRA companions store shape metadata only.
+    return 0
 
 
 class ProjectionCache:
@@ -453,6 +1418,10 @@ class ProjectionCache:
         For MiniMax-M2.5 (256 experts × 62 layers), this reads ~15,872 weight
         tensors but only keeps one in memory at a time.
         """
+        _require_single_direction_vectors(
+            steering_vectors, operation="ProjectionCache.build_from_safetensors"
+        )
+
         import json as _json
         import re
         from pathlib import Path
@@ -462,7 +1431,7 @@ class ProjectionCache:
 
         cache = ProjectionCache()
         cache.steering_vectors = steering_vectors.cpu()
-        sv = steering_vectors
+        sv = cache.steering_vectors
 
         model_id = config.model.model_id
         trust = config.model.trust_remote_code or False
@@ -505,34 +1474,74 @@ class ProjectionCache:
 
         # Discover steerable weight keys using naming patterns.
         # These match the patterns in engine.steerable_modules():
+        #
+        # MoE expert LoRA (2026-04-19 rewrite): previously MoE expert paths
+        # were skipped because vLLM's ``PackedLoRALayerWeights.pack_moe``
+        # asserts that LoRAs exist for all three expert projections
+        # (``w1/w2/w3 = gate/up/down_proj``) and crashes Phase 2 init when
+        # only down_proj is present.
+        #
+        # Fix: collect all three projections per expert; build a real refusal
+        # projection only for the down/w2 path (that's the residual-write
+        # path), and emit *zero* LoRA companions for gate/up and w1/w3 so
+        # pack_moe is satisfied. Zero lora_B means the companion has no
+        # effect on forward, but its presence in the state_dict prevents the
+        # assert. See :meth:`build_lora_weights` for the zero-companion logic.
+        #
+        # Naming covered:
+        #   MiniMax-M2 / Phi-3.5-MoE: ``experts.<e>.w1 / w2 / w3``
+        #   Qwen / DeepSeek / Llama:  ``experts.<e>.gate_proj / up_proj / down_proj``
         _STEERABLE_PATTERNS = [
-            # attn.o_proj: standard self-attention output
+            # attn.o_proj: standard self-attention output (residual-output)
             (r"model\.layers\.(\d+)\.self_attn\.o_proj\.weight$", "attn.o_proj"),
-            # attn.o_proj: GatedDeltaNet linear attention
+            # attn.o_proj: GatedDeltaNet linear attention (residual-output)
             (r"model\.layers\.(\d+)\.linear_attn\.out_proj\.weight$", "attn.o_proj"),
-            # mlp.down_proj: dense MLP
+            # attn.{q,k,v}_proj: standard self-attention inputs (residual-input).
+            # Shape is (d_out, hidden_dim) where d_out = n_heads*head_dim (q)
+            # or n_kv_heads*head_dim (k/v). Safetensors path handles the NON-fused
+            # on-disk layout; vLLM may internally fuse to qkv_proj at TP load, and
+            # vLLM's Punica wrapper packs per-component LoRAs into the fused
+            # adapter automatically — we emit one LoRA per HF module path.
+            (r"model\.layers\.(\d+)\.self_attn\.q_proj\.weight$", "attn.q_proj"),
+            (r"model\.layers\.(\d+)\.self_attn\.k_proj\.weight$", "attn.k_proj"),
+            (r"model\.layers\.(\d+)\.self_attn\.v_proj\.weight$", "attn.v_proj"),
+            # mlp.down_proj: dense MLP (non-MoE layers)
             (r"model\.layers\.(\d+)\.mlp\.down_proj\.weight$", "mlp.down_proj"),
-            # mlp.down_proj: per-expert (Qwen3 MoE)
+            # MoE expert down projection (w2 / down_proj) — real steering here.
             (
-                r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight$",
+                r"model\.layers\.(\d+)\.(?:block_sparse_moe|mlp)\.experts\.\d+\.w2\.weight$",
                 "mlp.down_proj",
             ),
-            # mlp.down_proj: shared expert (Qwen3)
             (
-                r"model\.layers\.(\d+)\.mlp\.shared_expert\.down_proj\.weight$",
+                r"model\.layers\.(\d+)\.(?:block_sparse_moe|mlp)\.experts\.\d+\.down_proj\.weight$",
                 "mlp.down_proj",
             ),
-            # mlp.down_proj: shared experts (GLM-4)
+            # MoE expert gate + up projections — zero-LoRA companions (no
+            # real steering; required only to satisfy vLLM pack_moe).
             (
-                r"model\.layers\.(\d+)\.mlp\.shared_experts\.down_proj\.weight$",
-                "mlp.down_proj",
+                r"model\.layers\.(\d+)\.(?:block_sparse_moe|mlp)\.experts\.\d+\.w1\.weight$",
+                "moe.expert_gate",
             ),
-            # mlp.down_proj: Phi-3.5-MoE block_sparse_moe.experts.*.w2
             (
-                r"model\.layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w2\.weight$",
-                "mlp.down_proj",
+                r"model\.layers\.(\d+)\.(?:block_sparse_moe|mlp)\.experts\.\d+\.w3\.weight$",
+                "moe.expert_up",
+            ),
+            (
+                r"model\.layers\.(\d+)\.(?:block_sparse_moe|mlp)\.experts\.\d+\.gate_proj\.weight$",
+                "moe.expert_gate",
+            ),
+            (
+                r"model\.layers\.(\d+)\.(?:block_sparse_moe|mlp)\.experts\.\d+\.up_proj\.weight$",
+                "moe.expert_up",
             ),
         ]
+
+        disabled_components = set(config.steering.disabled_components)
+        # Zero-LoRA companions are only needed when mlp.down_proj is active.
+        # If a profile disables expert/down steering, skip w1/w3 entirely so
+        # attention-only configs do not build a huge MoE adapter shell.
+        _ZERO_COMPANION_COMPONENTS = {"moe.expert_gate", "moe.expert_up"}
+        include_zero_companions = "mlp.down_proj" not in disabled_components
 
         # Group steerable keys by (layer_idx, component).
         steerable_keys: dict[int, dict[str, list[str]]] = {}
@@ -542,6 +1551,13 @@ class ProjectionCache:
             for regex, component in compiled:
                 m = regex.match(key)
                 if m:
+                    if component in disabled_components:
+                        break
+                    if (
+                        component in _ZERO_COMPANION_COMPONENTS
+                        and not include_zero_companions
+                    ):
+                        break
                     layer_idx = int(m.group(1))
                     if layer_idx < n_layers:
                         steerable_keys.setdefault(layer_idx, {}).setdefault(
@@ -564,6 +1580,43 @@ class ProjectionCache:
         for layer_idx in sorted(steerable_keys):
             cache.projections[layer_idx] = {}
             for component, keys in steerable_keys[layer_idx].items():
+                # Companion paths: record shape per-module only, no projection.
+                # We aggregate ALL expert paths for this component into a list
+                # so build_lora_weights can emit zero-LoRAs for every one.
+                if component in _ZERO_COMPANION_COMPONENTS:
+                    companions: list[dict] = []
+                    for wkey in keys:
+                        # Read only the weight shape from safetensors; no data.
+                        with safe_open(
+                            str(model_dir / weight_map[wkey]),
+                            framework="pt",
+                            device="cpu",
+                        ) as f:
+                            slc = f.get_slice(wkey)
+                            shape = slc.get_shape()
+                        d_out, d_in = shape[0], shape[1] if len(shape) > 1 else shape[0]
+                        module_path = wkey.rsplit(".weight", 1)[0]
+                        leaf = module_path.split(".")[-1]
+                        target_module_names.add(leaf)
+                        companions.append(
+                            {
+                                "module_path": module_path,
+                                "d_out": d_out,
+                                "d_in": d_in,
+                            }
+                        )
+                    cache.projections[layer_idx][component] = {
+                        "companions": companions,
+                    }
+                    continue
+
+                # Real steering components: compute sv @ W as before.
+                # For MoE mlp.down_proj the component holds ONE entry per
+                # expert — stored as a list under "experts" rather than as
+                # a single module, so build_lora_weights can iterate all.
+                is_moe_expert_down = component == "mlp.down_proj" and len(keys) > 1
+                entries: list[dict] = []
+
                 for wkey in keys:
                     # Read weight tensor.
                     w_raw = _get_tensor(wkey)
@@ -607,6 +1660,7 @@ class ProjectionCache:
 
                     W = W.view(W.shape[0], -1)
                     d_out, d_in = W.shape
+                    hidden_dim = sv.shape[1]
 
                     # Derive the module path for PEFT state dict.
                     # Strip ".weight" suffix → "model.layers.X.self_attn.o_proj"
@@ -614,16 +1668,40 @@ class ProjectionCache:
                     leaf = module_path.split(".")[-1]
                     target_module_names.add(leaf)
 
-                    # sv @ W — all steering vectors at once.
-                    vW_all = (sv @ W).cpu()
+                    # Dispatch on which axis matches hidden_dim — see the
+                    # corresponding comment in ``ProjectionCache.build`` for
+                    # the math.
+                    if d_out == hidden_dim:
+                        direction = "output"
+                        # (n_vec, d_out) @ (d_out, d_in) = (n_vec, d_in)
+                        vW_all = (sv @ W).cpu()
+                    elif d_in == hidden_dim:
+                        direction = "input"
+                        # (n_vec, d_in) @ (d_in, d_out) = (n_vec, d_out)
+                        vW_all = (sv @ W.t()).cpu()
+                    else:
+                        del W
+                        continue
                     del W
 
+                    entries.append(
+                        {
+                            "vW_all": vW_all,
+                            "module_path": module_path,
+                            "d_out": d_out,
+                            "d_in": d_in,
+                            "direction": direction,
+                        }
+                    )
+
+                if is_moe_expert_down:
+                    # Store as list of per-expert entries.
                     cache.projections[layer_idx][component] = {
-                        "vW_all": vW_all,
-                        "module_path": module_path,
-                        "d_out": d_out,
-                        "d_in": d_in,
+                        "experts": entries,
                     }
+                else:
+                    # Single entry (backward-compat with non-MoE path).
+                    cache.projections[layer_idx][component] = entries[0]
 
         # Close file handles.
         _open_files.clear()
@@ -637,10 +1715,15 @@ class ProjectionCache:
             )
 
         cache.target_modules = sorted(target_module_names)
-        n_cached = sum(len(v) for v in cache.projections.values())
+
+        n_cached = sum(
+            _cache_entry_count(info)
+            for layer in cache.projections.values()
+            for info in layer.values()
+        )
         cache_mb = (
             sum(
-                info["vW_all"].nbytes
+                _cache_entry_nbytes(info)
                 for layer in cache.projections.values()
                 for info in layer.values()
             )
@@ -668,12 +1751,19 @@ class ProjectionCache:
            = \\frac{(1-f)\\,(\\text{sv}[a] @ W) + f\\,(\\text{sv}[a+1] @ W)}
                   {\\|(1-f)\\,\\text{sv}[a] + f\\,\\text{sv}[a+1]\\|}
         """
+        _require_single_direction_vectors(
+            steering_vectors, operation="ProjectionCache.build"
+        )
+
         from .steering import _dequantize_fp8_blockwise, _FP8_DTYPES
 
         cache = ProjectionCache()
         cache.steering_vectors = steering_vectors.cpu()
 
-        import bitsandbytes as bnb
+        try:
+            import bitsandbytes as bnb
+        except ImportError:  # pragma: no cover - exercised on macOS arm64 dev envs.
+            bnb = None
         from peft.tuners.lora.layer import Linear
         from typing import cast
 
@@ -689,6 +1779,12 @@ class ProjectionCache:
             cache.projections[layer_idx] = {}
 
             for component, modules in engine.steerable_modules(layer_idx).items():
+                # One entry per module. For MoE layers ``steerable_modules``
+                # returns a list (e.g. every per-expert ``down_proj``), so the
+                # entries are collected and stored as a list under "experts";
+                # assigning per-module would keep only the last expert.
+                entries: list[dict[str, Any]] = []
+
                 for mod in modules:
                     mod = cast(Linear, mod)
 
@@ -710,11 +1806,17 @@ class ProjectionCache:
                     # NOTE: we do NOT cache dequantised weights — for MoE models
                     # with 256 experts × 62 layers, caching all float32 weights
                     # on GPU causes OOM.  Instead, dequant → project → free.
-                    base_weight = cast(Tensor, mod.base_layer.weight)
+                    base_layer = getattr(mod, "base_layer", mod)
+                    base_weight = cast(Tensor, base_layer.weight)
                     qs = getattr(base_weight, "quant_state", None)
-                    CB = getattr(base_weight, "CB", None)
 
                     if qs is not None:
+                        if bnb is None:
+                            raise RuntimeError(
+                                "bitsandbytes is required to dequantize 4-bit weights. "
+                                "Use a supported CUDA environment or load an unquantized "
+                                "model for projection-cache builds."
+                            )
                         W = cast(
                             Tensor,
                             bnb.functional.dequantize_4bit(
@@ -722,11 +1824,10 @@ class ProjectionCache:
                                 qs,
                             ).to(torch.float32),
                         )
-                    elif CB is not None:
-                        SCB = base_weight.SCB
-                        W = CB.float() * SCB.float().unsqueeze(1) / 127.0
+                    elif is_bnb_int8_weight(base_layer):
+                        W = dequantize_bnb_int8_weight(base_layer)
                     elif _FP8_DTYPES and base_weight.dtype in _FP8_DTYPES:
-                        weight_scale = getattr(mod.base_layer, "weight_scale", None)
+                        weight_scale = getattr(base_layer, "weight_scale", None)
                         if weight_scale is not None:
                             W = _dequantize_fp8_blockwise(
                                 base_weight.data, weight_scale
@@ -738,28 +1839,68 @@ class ProjectionCache:
 
                     W = W.view(W.shape[0], -1)
                     d_out, d_in = W.shape[0], W.shape[1]
+                    hidden_dim = steering_vectors.shape[1]
 
-                    # Compute sv[k] @ W for ALL steering vectors at once.
-                    # sv_all shape: (n_vectors, d_out), W shape: (d_out, d_in)
-                    # Result shape: (n_vectors, d_in)
+                    # Determine projection direction based on which axis of W
+                    # matches hidden_dim:
+                    #   - "output" (o_proj, down_proj): d_out == hidden_dim.
+                    #     ``W_new = (I - v v^T) W = W - v (v^T W)``.
+                    #     Cache ``vW = sv @ W`` → shape ``(n_vec, d_in)``.
+                    #     Later: ``lora_A = vW (1, d_in)``, ``lora_B = -s*v (d_out, 1)``.
+                    #   - "input"  (q/k/v_proj, gate/up_proj): d_in == hidden_dim.
+                    #     ``W_new = W (I - v v^T) = W - (W v) v^T``.
+                    #     Cache ``Wv = sv @ W.T`` → shape ``(n_vec, d_out)``.
+                    #     Later: ``lora_A = v (1, d_in)``, ``lora_B = -s*Wv (d_out, 1)``.
+                    if d_out == hidden_dim:
+                        direction = "output"
+                    elif d_in == hidden_dim:
+                        direction = "input"
+                    else:
+                        # Neither axis matches — not steerable with this refusal
+                        # direction. Skip (shouldn't happen for standard archs).
+                        del W
+                        continue
+
                     device = W.device
                     if device not in _sv_by_device:
                         _sv_by_device[device] = steering_vectors.to(device)
-                    vW_all = (_sv_by_device[device] @ W).cpu()
+                    sv_dev = _sv_by_device[device]
+                    if direction == "output":
+                        # (n_vec, d_out) @ (d_out, d_in) = (n_vec, d_in)
+                        vW_all = (sv_dev @ W).cpu()
+                    else:
+                        # (n_vec, d_in=hidden_dim) @ (d_in, d_out) = (n_vec, d_out)
+                        vW_all = (sv_dev @ W.t()).cpu()
                     del W  # free immediately to avoid OOM on large MoE models
 
-                    cache.projections[layer_idx][component] = {
-                        "vW_all": vW_all,
-                        "module_path": module_path,
-                        "d_out": d_out,
-                        "d_in": d_in,
-                    }
+                    entries.append(
+                        {
+                            "vW_all": vW_all,
+                            "module_path": module_path,
+                            "d_out": d_out,
+                            "d_in": d_in,
+                            "direction": direction,
+                        }
+                    )
+
+                if not entries:
+                    continue
+                if len(entries) > 1:
+                    # Matches build_from_safetensors: build_lora_weights
+                    # iterates every per-expert entry.
+                    cache.projections[layer_idx][component] = {"experts": entries}
+                else:
+                    cache.projections[layer_idx][component] = entries[0]
 
         cache.target_modules = sorted(target_module_names)
-        n_cached = sum(len(v) for v in cache.projections.values())
+        n_cached = sum(
+            _cache_entry_count(info)
+            for layer in cache.projections.values()
+            for info in layer.values()
+        )
         cache_mb = (
             sum(
-                info["vW_all"].nbytes
+                _cache_entry_nbytes(info)
                 for layer in cache.projections.values()
                 for info in layer.values()
             )
@@ -790,6 +1931,9 @@ class ProjectionCache:
         kernel = config.steering.decay_kernel
         sv = self.steering_vectors
         assert sv is not None
+        _require_single_direction_vectors(
+            sv, operation="ProjectionCache.build_lora_weights"
+        )
 
         # Resolve global vector indices if applicable.
         # For global mode we reconstruct v_global @ W exactly using linearity:
@@ -812,11 +1956,55 @@ class ProjectionCache:
         lora_weights: dict[str, tuple[Tensor, Tensor]] = {}
         n_layers = len(self.projections)
 
+        _ZERO_COMPANIONS = {"moe.expert_gate", "moe.expert_up"}
+
+        def _one_projection(info: dict, strength: float) -> tuple[Tensor, Tensor]:
+            """Compute (lora_A, lora_B) for a single real-steering module.
+
+            Dispatches on ``info["direction"]`` to produce the correct rank-1
+            update for either residual-output (o_proj, down_proj) or
+            residual-input (q/k/v_proj, gate/up_proj) modules. See
+            :meth:`ProjectionCache.build` for the math.
+            """
+            vW_all = info["vW_all"]
+            # Legacy caches (pre-residual-input support) have no "direction"
+            # field — assume output-side, matching the old behaviour.
+            direction = info.get("direction", "output")
+
+            if global_vector is not None:
+                v = global_vector
+                vW = (
+                    (1 - global_frac) * vW_all[global_idx_a]
+                    + global_frac * vW_all[global_idx_a + 1]
+                ) / global_norm
+            else:
+                v = F.normalize(sv[layer_idx + 1], p=2, dim=0)
+                vW = vW_all[layer_idx + 1]
+
+            if direction == "output":
+                # W_new = W - v (v^T W) · s  → B=-s*v (d_out,1), A=vW (1,d_in)
+                lora_A = vW.view(1, -1)
+                lora_B = (-strength * v[: info["d_out"]]).view(-1, 1)
+            else:  # direction == "input"
+                # W_new = W - (W v) v^T · s  → B=-s*Wv (d_out,1), A=v (1,d_in)
+                lora_A = v[: info["d_in"]].view(1, -1)
+                lora_B = (-strength * vW).view(-1, 1)
+            return lora_A, lora_B
+
         for layer_idx in range(n_layers):
             if layer_idx not in self.projections:
                 continue
 
+            # Compute strength per real component once per layer; zero
+            # companions inherit the *same* strength decision so that when
+            # down_proj is steered, w1/w3 zero-LoRAs also exist for this
+            # layer (required for vLLM pack_moe to find all three).
+            mlp_active = False
             for component, info in self.projections[layer_idx].items():
+                # Companions are emitted after the main loop (zero-LoRA
+                # pack_moe placeholders — no real projection).
+                if component in _ZERO_COMPANIONS:
+                    continue
                 if component not in profiles:
                     continue
 
@@ -825,7 +2013,6 @@ class ProjectionCache:
                 if distance > sp.min_weight_distance:
                     continue
 
-                # Compute decay weight.
                 t = distance / sp.min_weight_distance
                 if kernel == DecayKernel.GAUSSIAN:
                     strength = sp.min_weight + (
@@ -838,22 +2025,32 @@ class ProjectionCache:
                 else:
                     strength = sp.max_weight + t * (sp.min_weight - sp.max_weight)
 
-                vW_all = info["vW_all"]  # (n_vectors, d_in)
-
-                if global_vector is not None:
-                    v = global_vector
-                    # Exact reconstruction via linearity of matmul:
-                    vW = (
-                        (1 - global_frac) * vW_all[global_idx_a]
-                        + global_frac * vW_all[global_idx_a + 1]
-                    ) / global_norm
+                # MoE case: info has "experts" list of per-expert entries.
+                # Dense case: info is itself the single entry.
+                if "experts" in info:
+                    for expert_info in info["experts"]:
+                        lora_A, lora_B = _one_projection(expert_info, strength)
+                        lora_weights[expert_info["module_path"]] = (lora_A, lora_B)
+                    if component == "mlp.down_proj":
+                        mlp_active = True
                 else:
-                    v = F.normalize(sv[layer_idx + 1], p=2, dim=0)
-                    vW = vW_all[layer_idx + 1]
+                    lora_A, lora_B = _one_projection(info, strength)
+                    lora_weights[info["module_path"]] = (lora_A, lora_B)
+                    if component == "mlp.down_proj":
+                        mlp_active = True
 
-                lora_A = vW.view(1, -1)  # (1, d_in)
-                lora_B = (-strength * v[: info["d_out"]]).view(-1, 1)  # (d_out, 1)
-
-                lora_weights[info["module_path"]] = (lora_A, lora_B)
+            # Zero-LoRA companions for gate/up (w1/w3): emit only when the
+            # layer's mlp.down_proj (w2) is actually being steered. This
+            # keeps the adapter size bounded to layers that do real work.
+            if not mlp_active:
+                continue
+            for comp in _ZERO_COMPANIONS:
+                companion_info = self.projections[layer_idx].get(comp)
+                if companion_info is None:
+                    continue
+                for c in companion_info["companions"]:
+                    lora_A_zero = torch.zeros(1, c["d_in"], dtype=torch.float32)
+                    lora_B_zero = torch.zeros(c["d_out"], 1, dtype=torch.float32)
+                    lora_weights[c["module_path"]] = (lora_A_zero, lora_B_zero)
 
         return lora_weights

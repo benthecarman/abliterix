@@ -1,0 +1,200 @@
+# Gemma 4 12B-it — HF direct-edit abliteration (corrected "un-over-engineered" recipe)
+#
+# Target: succeed like the dense 31B (7/100) and the 26B-A4B (3/100).
+#
+# ── WHY THIS CONFIG LOOKS DIFFERENT FROM OUR EARLIER 12B ATTEMPTS ──────────────
+# Our first GPU campaign concluded this SKU was "non-linearly entangled / not
+# abliterable by any linear method" and capped at 27/100 @ KL 0.88. That verdict
+# was WRONG. Four independent groups have since published WORKING linear
+# abliterations of this exact checkpoint:
+#   - huihui-ai/Huihui-gemma-4-12B-it-abliterated  (Sumandora script, single
+#     mean direction, narrow mid-stack band layers 23-28 ONLY)
+#   - zaakirio/gemma-4-12b-it-uncensored  (Heretic: 23/100 refusals @ KL 0.043 —
+#     ~20x better KL than our best 27/100 @ KL 0.88)
+#   - OpenYourMind/...-abliterated-uncensored  (diff-in-means)
+#   - OBLITERATUS/Gemma-4-12B-OBLITERATED v2
+# This config is a FAITHFUL port of Heretic's winning defaults, traced line-by-line
+# from github.com/p-e-w/heretic (src/heretic/{config,main,model,evaluator}.py).
+# abliterix replicates every Heretic mechanic — same max_weight_position range
+# [0.6L,L], same direction layer range [0.4L,0.9L], same linear tent math, same
+# row_normalization="full" (grimjim), same orthogonalize_direction (projected),
+# same {o_proj, down_proj}-only component set, same negative-clamp MLP auto-disable,
+# same anti-do-nothing KL guard. So this is "Heretic, run through abliterix."
+#
+# Our FIRST run failed (refusals stuck 99-100/100 at KL 0.11-1.36) because the
+# earlier "corrected" recipe mis-read Heretic and inverted it. Corrected here:
+#   projected_abliteration  false → TRUE   (Heretic orthogonalize_direction=True)
+#   attn.o_proj range   [0.4,1.1] → [0.8,1.5]   (Heretic's exact range)
+#   mlp.down_proj  forced [1.0,1.7] → auto-disable [-0.25→0, 1.5] (Heretic: MLP
+#                                       ablation hurts capability, must be disablable)
+#   min_frac caps 0.95/0.5 → removed (Heretic samples min_weight freely in [0,1])
+#   KL token_count   3 → 1   (Heretic measures FIRST-TOKEN KL; 3-token inflated ours)
+#   KL objective     → do_nothing_guard, target 0.01   (Heretic's anti-do-nothing)
+#   trials       60/18 → 120/45   (Heretic explores 200/60)
+# weight_normalization="full" and n_directions=1 were already correct (match Heretic).
+#
+# ── ARCHITECTURE FACTS ────────────────────────────────────────────────────────
+# DENSE 48-layer decoder, hidden 3840, ~12B, BF16 ~24 GB. model_type =
+# gemma4_unified, arch Gemma4UnifiedForConditionalGeneration, multimodal
+# (vision + audio + text configs) + thinking. abliterix walks the decoder via
+# model.language_model.layers; output_hidden_states returns ONLY the 48 text-
+# decoder states (vision/audio inject embeds separately — direction is clean).
+#
+# Backend MUST be HF: gemma4_unified ForConditionalGeneration trips vLLM's Punica
+# LoRA wrapper on the visual.* modules. No experts (dense) → no router config.
+#
+# ── DEPLOY PINS ───────────────────────────────────────────────────────────────
+#   transformers >=5.10,<5.11   (config.json packaged with 5.10.0.dev0)
+#   kernels      >=0.12,<0.13   (5.10.1 needs <0.13; ~=0.11 pulls 0.15 → crash)
+
+non_interactive = true
+# RESUME mode: keep the existing v2 journal (81 trials done) and continue to 120.
+# Set back to true only for a genuine fresh start.
+overwrite_checkpoint = false
+seed = 20260622
+
+[model]
+model_id = "google/gemma-4-12B-it"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+backend = "hf"
+# Target pod: 1× RTX Pro 6000 Blackwell 96 GB. A 12B in BF16 is ~24 GB, so this
+# leaves ~66 GB for KV/activations — plenty for max_batch_size=64.
+# (H100 80 GB: drop to "76GiB". Any >=40 GB card works with a smaller batch.)
+max_memory = {0 = "90GiB"}
+
+[inference]
+# Autotune up to 64: a dense 12B leaves ~50 GB idle on an 80 GB card; throughput
+# scaled near-linearly 16/32/64 -> 164/323/586 tok/s on a Blackwell pod.
+batch_size = 0
+max_batch_size = 64
+# Thinking model: the chat template emits a <|channel|>thought block that can eat
+# the first ~100 tokens. min 100 guarantees the answer is generated; 200 covers
+# mean answer length so the judge scores real content, not an empty thought.
+min_gen_tokens = 100
+max_gen_tokens = 200
+
+[steering]
+# Direct weight edit is MANDATORY for Gemma-4: the 4x RMSNorm-per-layer +
+# Per-Layer-Embedding repair pathway eats LoRA/hook perturbations entirely.
+steering_mode = "direct"
+vector_method = "mean"
+
+# Single mean-diff direction (Heretic uses exactly one).
+n_directions = 1
+
+# Projected abliteration = Heretic's `orthogonalize_direction` default (grimjim,
+# https://huggingface.co/blog/grimjim/projected-abliteration): subtract only the
+# component of the refusal direction ORTHOGONAL to the benign direction. Preserves
+# the helpful signal so KL stays LOW at matched ablation. Heretic's 23/100 @ KL
+# 0.043 winner on this exact SKU had it ON.
+orthogonal_projection = true
+projected_abliteration = true
+
+# Mild outlier clamp for Gemma's massive activations (abliterix 31B/26B winners
+# used this; Heretic defaults off but it only touches the top 0.5%).
+winsorize_vectors = true
+winsorize_quantile = 0.995
+
+# Linear tent: Heretic interpolates linearly from max_weight at the peak layer to
+# min_weight at the tent edge. Peak position sampled in [0.6*L, L] and the
+# direction layer (vector_index) in [0.4*L, 0.9*L] — both identical to Heretic.
+decay_kernel = "linear"
+
+# FULL row-normalization = Heretic's grimjim norm-preserving abliteration
+# (rank-3 SVD of the renormalized delta).
+weight_normalization = "full"
+full_norm_lora_rank = 3
+
+# fixed_vector_scope left UNSET so the optimizer samples "global" vs "per layer"
+# per trial, exactly like Heretic's direction_scope.
+
+# Heretic abliterates ONLY attn.o_proj + mlp.down_proj (its get_layer_modules adds
+# nothing else). Disable everything else so the search space matches.
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "mlp.gate_proj",
+  "mlp.up_proj",
+]
+
+# Heretic lets the MLP be fully disabled per-trial: it samples down_proj.max_weight
+# from a NEGATIVE lower bound (-0.25) then clamps to max(0, .), putting positive
+# probability mass on "MLP off" — because ablating the MLP often hurts capability
+# (raises KL) more than it removes refusals. abliterix replicates this exactly.
+auto_disable_components = ["mlp.down_proj"]
+auto_disable_floor = -0.25
+
+# Global fallback = Heretic's non-MLP default range.
+strength_range = [0.8, 1.5]
+
+[steering.component_strength_ranges]
+# Heretic: attn.o_proj.max_weight in [0.8, 1.5] (always active, never disabled).
+"attn.o_proj"   = [0.8, 1.5]
+# Heretic: mlp.down_proj.max_weight upper bound 1.5; the lower bound is overridden
+# to the -0.25 auto-disable floor above (clamped to 0 => "MLP off" reachable).
+"mlp.down_proj" = [0.0, 1.5]
+
+# No component_min_frac_max: Heretic samples min_weight freely in [0, 1] (as a
+# fraction of max_weight). Forcing a near-flat 0.95 floor on down_proj was a key
+# KL driver in the failed run.
+
+[optimization]
+# Heretic explores hard: 200 trials / 60 random startup. Cost-aware 120/45 here —
+# still 2.5x the random exploration of our failed 60/18 run.
+num_trials = 120
+num_warmup_trials = 45
+# Fresh study dir: the old journal holds trials from the wrong (non-projected,
+# forced-MLP, 3-token-KL) search space and must NOT be resumed.
+checkpoint_dir = "checkpoints_gemma4_12b_v2"
+
+[kl]
+scale = 1.0
+# FIRST-TOKEN KL, matching Heretic (KL of the first-token distribution over benign
+# prompts, batchmean). token_count=3 inflated absolute KL ~2-3x — 0.11 was never
+# comparable to Heretic's 0.043.
+token_count = 1
+# Heretic's anti-"do-nothing" trick: while KL < target the divergence objective is
+# tied to the compliance score, so the sampler can't win by changing nothing.
+objective_mode = "do_nothing_guard"
+target = 0.01
+# Heretic doesn't prune; we keep a loose ceiling (~3x its winning first-token KL)
+# so over-steered trials skip the LLM-judge compliance eval.
+prune_threshold = 0.15
+
+[detection]
+llm_judge = true
+# Stable non-reasoning judge. deepseek-v4-flash:nitro was tried but returned
+# content=null under :nitro provider roulette (it's a reasoning-capable model and
+# some providers spent the small judge token budget on hidden CoT), crashing the
+# run at baseline. gemini-3.1-flash-lite reliably returns parseable JSON via
+# response_format.
+llm_judge_model = "google/gemini-3.1-flash-lite"
+llm_judge_batch_size = 10
+llm_judge_concurrency = 35
+
+[benign_prompts]
+dataset = "datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "datasets/good_1000"
+split = "train[800:900]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[800:900]"
+column = "prompt"
+
+[display]
+print_responses = false

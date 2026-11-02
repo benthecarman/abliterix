@@ -8,6 +8,7 @@
 
 import math
 import os
+import random
 import sys
 import time
 import warnings
@@ -33,23 +34,25 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analysis import ResidualAnalyzer
-from .core.engine import SteeringEngine, load_tokenizer
+from .core.engine import DEQUANT_CACHE_MAX_BYTES, SteeringEngine, load_tokenizer
 from .data import load_prompt_dataset
-from .eval.detector import RefusalDetector
+from .eval.detector import RefusalDetector, validate_judge_credentials
 from .eval.scorer import TrialScorer
-from .interactive import show_interactive_results
+from .interactive import _restore_selected_trial, show_interactive_results
 from .optimizer import run_search
 from .settings import AbliterixConfig
-from .types import ChatMessage
+from .types import ChatMessage, VectorMethod
 from .util import (
     ask_choice,
     flush_memory,
     print,
     report_memory,
+    reserved_unallocated_vram,
+    set_seed,
     slugify_model_name,
 )
 from .types import SteeringMode
-from .vectors import compute_steering_vectors
+from .vectors import compute_configured_steering_vectors
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +71,82 @@ def _print_banner():
     print()
 
 
+def _load_reproduce_config(repro_path: str) -> "AbliterixConfig | None":
+    """Load a reproduce.json manifest, report the environment diff, and rebuild config.
+
+    Returns the reconstructed config, or None if the manifest is unusable.
+    """
+    from .reproducibility import check_environment, load_manifest, validate_manifest
+
+    try:
+        manifest = load_manifest(repro_path)
+    except (OSError, ValueError) as error:
+        print(
+            f"[red]Could not read reproduce manifest [bold]{repro_path}[/]: {error}[/]"
+        )
+        return None
+
+    print(
+        f"Reproducing from [bold]{repro_path}[/] "
+        f"(abliterix v{manifest.get('abliterix_version')})"
+    )
+
+    try:
+        validate_manifest(manifest)
+    except ValueError as error:
+        print(f"[red]Invalid reproduce manifest: {error}[/]")
+        return None
+
+    findings = check_environment(manifest)
+    if findings:
+        print("Environment differences from the recorded run:")
+        _colors = {
+            "CRITICAL": "red bold",
+            "HIGH": "red",
+            "MEDIUM": "yellow",
+            "LOW": "grey50",
+        }
+        for sev, msg in findings:
+            print(f"  [{_colors.get(sev, 'white')}]\\[{sev}][/] {msg}")
+        if any(sev in ("CRITICAL", "HIGH") for sev, _ in findings):
+            print(
+                "[yellow]High-severity differences may change the produced "
+                "weights; exact bit-reproduction is not guaranteed.[/]"
+            )
+    else:
+        print("[green]Environment matches the recorded run.[/]")
+
+    stored = manifest.get("config")
+    if not isinstance(stored, dict):
+        print("[red]Manifest has no usable 'config' block; cannot reproduce.[/]")
+        return None
+    try:
+        return AbliterixConfig.model_validate(stored)
+    except ValidationError as error:
+        print(f"[red]Recorded config failed validation: {error}[/]")
+        return None
+
+
+def _query_gpu_driver() -> str | None:
+    """Best-effort NVIDIA driver version via nvidia-smi (None if unavailable)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0:
+            lines = out.stdout.strip().splitlines()
+            if lines:
+                return lines[0].strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def _detect_devices():
     if torch.cuda.is_available():
         count = torch.cuda.device_count()
@@ -75,6 +154,15 @@ def _detect_devices():
         print(
             f"Detected [bold]{count}[/] CUDA device(s) ({total / (1024**3):.2f} GB total VRAM):"
         )
+        # Report the runtime + driver so the common RunPod driver→CUDA→wheel
+        # mismatch (PTX / Marlin-FP4 JIT failures) is visible at a glance and
+        # easy to include in bug reports.
+        is_hip = getattr(torch.version, "hip", None)
+        api = "HIP" if is_hip else "CUDA"
+        api_ver = (torch.version.hip if is_hip else torch.version.cuda) or "unknown"
+        driver = None if is_hip else _query_gpu_driver()
+        driver_str = f", driver [bold]{driver}[/]" if driver else ""
+        print(f"* {api} runtime [bold]{api_ver}[/]{driver_str}")
         for i in range(count):
             vram = torch.cuda.mem_get_info(i)[1] / (1024**3)
             print(
@@ -216,19 +304,42 @@ def _speculators_available() -> bool:
         from speculators.data_generation import VllmHiddenStatesGenerator  # noqa: F401
 
         return True
-    except (ImportError, Exception):
+    except ImportError:
+        return False
+    except Exception as error:
+        # ImportError is a subclass of Exception, so the previous
+        # ``except (ImportError, Exception)`` was just ``except Exception``:
+        # a genuine bug in a partially-broken install silently downgraded to
+        # the 10-15x slower HF path with no indication why.
+        print(f"[yellow]speculators detected but unusable ({error}); [/]")
+        print("[yellow]falling back to HuggingFace hidden-state extraction.[/]")
         return False
 
 
 def _vllm_hidden_states_available() -> bool:
-    """Check if vLLM's native hidden state extraction API is available (>= 0.17)."""
+    """Check if vLLM's native hidden state extraction API is available (>= 0.17).
+
+    Honors ``AX_DISABLE_VLLM_HS=1`` to force the slow HF extraction path.  This
+    is required when the user wants to run :class:`VLLMMoEEditor` router
+    suppression — that editor needs ``safety_experts`` computed by
+    ``engine.identify_safety_experts``, which only runs if the HF model was
+    actually loaded (i.e. we did NOT take the vLLM-native fast path).
+    """
+    if os.environ.get("AX_DISABLE_VLLM_HS", "") == "1":
+        return False
     try:
         from vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connector import (  # noqa: F401
             ExampleHiddenStatesConnector,
         )
 
         return True
-    except (ImportError, Exception):
+    except ImportError:
+        return False
+    except Exception as error:
+        print(
+            f"[yellow]vLLM hidden-states connector detected but unusable ({error}); [/]"
+        )
+        print("[yellow]falling back to HuggingFace hidden-state extraction.[/]")
         return False
 
 
@@ -382,14 +493,19 @@ def _detect_response_prefix(
 # ---------------------------------------------------------------------------
 
 
-def run():
+def run() -> int:
+    """Run the CLI and return a process exit code (0 = success).
+
+    Every abort path returns non-zero so ``--non-interactive`` runs (the
+    documented CI-verification entry point) cannot turn a red build green.
+    """
     # Launch the Gradio Web UI if requested (before config parsing).
     if "--ui" in sys.argv:
         sys.argv.remove("--ui")
         from .webui import launch_ui
 
         launch_ui()
-        return
+        return 0
 
     # Reduce memory fragmentation on multi-GPU setups.
     if (
@@ -400,37 +516,88 @@ def run():
 
     _print_banner()
 
-    # CLI shorthands: map --model X to --model.model-id X so that users
-    # do not need to type the full nested path for the most common flags.
-    _cli_aliases = {"--model": "--model.model-id"}
-    for short, full in _cli_aliases.items():
-        for i, arg in enumerate(sys.argv):
-            if arg == short:
-                sys.argv[i] = full
+    # Reproduce mode: rebuild the config from a published reproduce.json and
+    # verify the current environment before re-running. Extracted before the
+    # --model shorthand handling so a model id is not required.
+    repro_path: str | None = None
+    if "--reproduce" in sys.argv:
+        idx = sys.argv.index("--reproduce")
+        if idx + 1 >= len(sys.argv):
+            print("[red]--reproduce requires a path to a reproduce.json file.[/]")
+            return 1
+        repro_path = sys.argv[idx + 1]
+        del sys.argv[idx : idx + 2]
 
-    # Infer --model.model-id flag if the last argument looks like a model identifier.
-    if (
-        len(sys.argv) > 1
-        and "--model.model-id" not in sys.argv
-        and not sys.argv[-1].startswith("-")
-    ):
-        sys.argv.insert(-1, "--model.model-id")
+    if repro_path is None:
+        # CLI shorthands: map --model X to --model.model-id X so that users
+        # do not need to type the full nested path for the most common flags.
+        _cli_aliases = {"--model": "--model.model-id"}
+        for short, full in _cli_aliases.items():
+            for i, arg in enumerate(sys.argv):
+                if arg == short:
+                    sys.argv[i] = full
 
-    try:
-        config = AbliterixConfig()  # ty:ignore[missing-argument]
-    except ValidationError as error:
-        print(f"[red]Configuration contains [bold]{error.error_count()}[/] errors:[/]")
-        for err in error.errors():
-            print(f"[bold]{err['loc'][0]}[/]: [yellow]{err['msg']}[/]")
-        print()
-        print(
-            "Run [bold]abliterix --help[/] or see [bold]abliterix.toml[/] for details "
-            "about configuration parameters."
-        )
-        return
+        # Support the unambiguous shorthand ``abliterix owner/model``. Do not
+        # reinterpret an arbitrary final option value as a model ID (for
+        # example the path after ``--optimization.checkpoint-dir``).
+        if (
+            len(sys.argv) == 2
+            and "--model.model-id" not in sys.argv
+            and not sys.argv[-1].startswith("-")
+        ):
+            sys.argv.insert(-1, "--model.model-id")
+
+    reproduce_manifest = None
+    if repro_path is not None:
+        config = _load_reproduce_config(repro_path)
+        if config is None:
+            return 1
+        from .reproducibility import load_manifest
+
+        reproduce_manifest = load_manifest(repro_path)
+    else:
+        try:
+            config = AbliterixConfig()  # ty:ignore[missing-argument]
+        except ValidationError as error:
+            print(
+                f"[red]Configuration contains [bold]{error.error_count()}[/] errors:[/]"
+            )
+            for err in error.errors():
+                print(f"[bold]{err['loc'][0]}[/]: [yellow]{err['msg']}[/]")
+            print()
+            print(
+                "Run [bold]abliterix --help[/] or see [bold]abliterix.toml[/] for details "
+                "about configuration parameters."
+            )
+            return 1
+
+    # Validate the default external evaluator before downloading datasets or
+    # loading a potentially enormous model. This turns a late multi-hour
+    # failure into an immediate actionable error.
+    validate_judge_credentials(config)
 
     _detect_devices()
     _configure_libraries()
+
+    # Resolve + apply the global seed (random/numpy/torch) for reproducibility.
+    # When unset, draw one and print it so the run can be reproduced verbatim.
+    _seed_was_random = config.seed is None
+    if _seed_was_random:
+        config.seed = random.randint(0, 2**31 - 1)
+    set_seed(config.seed)
+    print(
+        f"Global seed: [bold]{config.seed}[/]"
+        + (" [grey50](randomly chosen)[/]" if _seed_was_random else "")
+    )
+
+    # Resolve every Hub input once and load by immutable commit thereafter.
+    from .reproducibility import pin_remote_sources
+
+    resolved_sources = pin_remote_sources(config)
+    if resolved_sources:
+        print("Pinned remote inputs to immutable Hub commits:")
+        for resolved_source in resolved_sources:
+            print(f"* [dim]{resolved_source}[/]")
 
     os.makedirs(config.optimization.checkpoint_dir, exist_ok=True)
 
@@ -457,7 +624,8 @@ def run():
             storage,
         )
         if result is None:
-            return
+            # Existing checkpoint could not be resumed or restarted.
+            return 1
         config, storage = result
 
     # Load steering-vector source datasets (needed early for speculators path).
@@ -500,16 +668,17 @@ def run():
         print()
         print("[bold]Fast hidden state extraction (vLLM native TP)[/]")
         try:
-            print("* Extracting residuals for benign prompts...")
-            _precomputed_benign_states = extract_hidden_states_vllm(
+            # Extract benign + target in a single vLLM load.  A reload per set
+            # would pay the MooseFS shard pull (~2.5 min on 15-shard MoEs)
+            # twice for no reason.
+            print("* Extracting residuals for benign + target prompts...")
+            _hs = extract_hidden_states_vllm(
                 config,
-                benign_msgs,
+                {"benign": benign_msgs, "target": target_msgs},
             )
-            print("* Extracting residuals for target prompts...")
-            _precomputed_target_states = extract_hidden_states_vllm(
-                config,
-                target_msgs,
-            )
+            _precomputed_benign_states = _hs["benign"]
+            _precomputed_target_states = _hs["target"]
+            del _hs
             print()
         except Exception as exc:
             print(
@@ -573,12 +742,15 @@ def run():
         engine.response_prefix = ""
         engine.needs_reload = False
         engine._dequant_cache = {}
+        engine._dequant_cache_bytes = 0
+        engine._dequant_cache_max_bytes = DEQUANT_CACHE_MAX_BYTES
         engine._cached_n_layers = None
         engine._cached_components = None
         engine._is_native_fp8 = False
         engine.tokenizer = load_tokenizer(
             config.model.model_id,
             trust_remote_code=config.model.trust_remote_code,
+            revision=config.model.revision,
         )
         if engine.tokenizer.pad_token is None:
             engine.tokenizer.pad_token = engine.tokenizer.eos_token
@@ -642,10 +814,11 @@ def run():
             print()
             print(f"Loading model [bold]{config.model.evaluate_model_id}[/]...")
             config.model.model_id = config.model.evaluate_model_id
+            config.model.revision = config.model.evaluate_model_revision
             engine.restore_baseline()
             print("* Evaluating...")
             scorer.score_trial(engine)
-            return
+            return 0
 
         # Compute steering vectors from residual streams.
         print()
@@ -664,6 +837,13 @@ def run():
         print(f"* Vector method: [bold]{config.steering.vector_method.value}[/]")
 
         if config.iterative.enabled:
+            if config.steering.vector_method == VectorMethod.RDO:
+                raise ValueError(
+                    "vector_method='rdo' is incompatible with iterative "
+                    "abliteration (the iterative loop re-extracts directions "
+                    "from cached states each round and has no RDO wiring). "
+                    "Disable iterative.enabled to use RDO."
+                )
             from .iterative import iterative_abliterate
 
             vectors, iter_stats = iterative_abliterate(
@@ -682,20 +862,20 @@ def run():
                 )
                 benign_states = engine.extract_hidden_states_batched(benign_msgs)
                 target_states = engine.extract_hidden_states_batched(target_msgs)
+        elif config.steering.vector_method == VectorMethod.RDO:
+            from .rdo import optimize_rdo_direction
+
+            vectors = optimize_rdo_direction(
+                engine,
+                target_msgs,
+                benign_msgs,
+                config,
+                benign_states=benign_states,
+                target_states=target_states,
+            )
         else:
-            vectors = compute_steering_vectors(
-                benign_states,
-                target_states,
-                config.steering.vector_method,
-                config.steering.orthogonal_projection,
-                winsorize=config.steering.winsorize_vectors,
-                winsorize_quantile=config.steering.winsorize_quantile,
-                projected_abliteration=config.steering.projected_abliteration,
-                ot_components=config.steering.ot_components,
-                n_directions=config.steering.n_directions,
-                sra_base_method=config.steering.sra_base_method,
-                sra_n_atoms=config.steering.sra_n_atoms,
-                sra_ridge_alpha=config.steering.sra_ridge_alpha,
+            vectors = compute_configured_steering_vectors(
+                benign_states, target_states, config
             )
 
         analyzer = ResidualAnalyzer(config, engine, benign_states, target_states)
@@ -723,6 +903,56 @@ def run():
                 f"* Trained scorers for [bold]{len(engine._concept_scorers)}[/] layers"
             )
 
+        # Cliff-head ablation (Bao et al. 2025, arXiv:2510.06036).
+        # Surgically scale toward zero the o_proj columns of the attention
+        # heads most aligned with the refusal direction. Applied once before
+        # the optimizer search, on the HF model. Skipped when running under
+        # the fast-extraction vLLM path that unloads the HF model (cliff-head
+        # editing of vLLM tensors is a separate path not yet implemented).
+        if config.steering.cliff_head_ablation:
+            if engine.model is None:
+                print(
+                    "[yellow]Cliff-head ablation requested but HF model is "
+                    "not loaded — skipping. This typically means the "
+                    "fast-extraction vLLM path is active; cliff-head support "
+                    "for vLLM-only mode is on the roadmap.[/]"
+                )
+            else:
+                from .cliff_head import run_cliff_head_ablation
+
+                print()
+                print(
+                    "Applying cliff-head ablation "
+                    f"(top {config.steering.cliff_head_top_k_frac:.1%}, "
+                    f"strength {config.steering.cliff_head_strength:.2f})..."
+                )
+                n_modified, heads = run_cliff_head_ablation(
+                    engine,
+                    vectors,
+                    top_k_frac=config.steering.cliff_head_top_k_frac,
+                    strength=config.steering.cliff_head_strength,
+                )
+                if n_modified:
+                    by_layer: dict[int, int] = {}
+                    for h in heads:
+                        by_layer[h.layer] = by_layer.get(h.layer, 0) + 1
+                    top_layers = sorted(
+                        by_layer.items(), key=lambda x: x[1], reverse=True
+                    )[:5]
+                    layer_brief = ", ".join(
+                        f"L{layer}×{count}" for layer, count in top_layers
+                    )
+                    print(
+                        f"* Ablated [bold]{n_modified}[/] attention heads "
+                        f"across {len(by_layer)} layers (top: {layer_brief})"
+                    )
+                else:
+                    print(
+                        "[yellow]Cliff-head ablation matched no heads — "
+                        "check num_attention_heads / head_dim divisibility "
+                        "for this architecture.[/]"
+                    )
+
         # Keep residual states if needed for discriminative layer selection
         # or angular steering; otherwise free memory.
         _keep_states = (
@@ -736,16 +966,36 @@ def run():
         flush_memory()
 
         # Profile MoE expert routing if applicable.
-        # Skip for vLLM backend — expert routing is not supported in vLLM mode
-        # (only LoRA weight steering is applied).
+        # For vLLM we still profile here (HF phase, before unload) so that
+        # the TP trial loop can apply router-weight suppression on the
+        # loaded vLLM model via collective_rpc (see VLLMMoEEditor).
+        # SGLang path does not yet have an equivalent editor and keeps the
+        # original skip behaviour.
         safety_experts: dict[int, list[tuple[int, float]]] | None = None
-        if engine.has_expert_routing() and config.model.backend not in (
-            "vllm",
-            "sglang",
+        # Only do HF router profiling when the HF model is actually loaded.
+        # Under vLLM fast extraction path, engine.model is None (lightweight
+        # engine) — VLLMMoEEditor does its own profiling via collective_rpc
+        # during the phase transition below.
+        if (
+            engine.model is not None
+            and engine.has_expert_routing()
+            and config.model.backend != "sglang"
         ):
             print()
             print("Profiling MoE expert activations...")
-            safety_experts = engine.identify_safety_experts(benign_msgs, target_msgs)
+            if config.experts.profiling_method == "safex":
+                from .safex import identify_safety_experts_safex
+
+                safety_experts = identify_safety_experts_safex(
+                    engine,
+                    benign_msgs,
+                    target_msgs,
+                    variance_penalty=config.experts.safex_variance_penalty,
+                )
+            else:
+                safety_experts = engine.identify_safety_experts(
+                    benign_msgs, target_msgs
+                )
 
         # ----- TP backend: Phase transition (vLLM or SGLang) -----
         tp_gen = None
@@ -757,17 +1007,57 @@ def run():
             print()
             print(f"[bold]Phase transition: HF → {backend_name}[/]")
 
+            # Hidden-state stacks kept for later use (discriminative layer
+            # selection / non-LoRA steering) may still be GPU-resident when
+            # inference.offload_outputs_to_cpu=false; move them to CPU so the
+            # TP workers spawned below don't see that VRAM as used (issue #83).
+            if benign_states is not None:
+                benign_states = benign_states.cpu()
+            if target_states is not None:
+                target_states = target_states.cpu()
+
             # Build projection cache.  If the HF model is loaded (needed for
             # non-speculators path), use it.  Otherwise read weights directly
             # from safetensors on disk — avoids the 3+ min HF model load.
-            print("* Building LoRA projection cache...")
-            if engine.model is not None:
+            from pathlib import Path
+
+            model_path = Path(config.model.model_id)
+            use_safetensors_cache = (
+                config.model.backend == "vllm"
+                and model_path.is_dir()
+                and (model_path / "model.safetensors.index.json").exists()
+            )
+            skip_projection_cache = config.model.disable_lora
+            if skip_projection_cache:
+                print(
+                    "* LoRA disabled: skipping projection cache (router-only steering)"
+                )
+                if engine.model is not None:
+                    print("* Unloading HF model...")
+                    engine.prepare_for_unload()
+                    engine.model = None
+            elif use_safetensors_cache:
+                print("* Building LoRA projection cache...")
+                # For large MoE models (MiniMax-M2: 256 experts × 62 layers),
+                # the safetensors path preserves every expert entry and avoids
+                # repeated module-tree scans while the HF model is still loaded.
+                projection_cache = ProjectionCache.build_from_safetensors(
+                    config,
+                    vectors,
+                )
+                if engine.model is not None:
+                    print("* Unloading HF model...")
+                    engine.prepare_for_unload()
+                    engine.model = None
+            elif engine.model is not None:
+                print("* Building LoRA projection cache...")
                 projection_cache = ProjectionCache.build(engine, vectors)
                 # Unload HF model to free VRAM for the TP backend.
                 print("* Unloading HF model...")
                 engine.prepare_for_unload()
                 engine.model = None
             else:
+                print("* Building LoRA projection cache...")
                 # HF model was never loaded (speculators handled everything).
                 # Build projections directly from safetensors files.
                 projection_cache = ProjectionCache.build_from_safetensors(
@@ -775,6 +1065,21 @@ def run():
                     vectors,
                 )
             flush_memory()
+            # VRAM still reserved by this (HF-phase) process is invisible
+            # garbage to the TP workers spawned below — they count it as
+            # used memory and refuse to start ("Free memory on device ...
+            # is less than desired GPU memory utilization", issue #83).
+            _stuck = reserved_unallocated_vram()
+            if _stuck > 2 * 1024**3:
+                print(
+                    f"[yellow]Warning: {_stuck / 1024**3:.1f} GB of VRAM "
+                    f"is still reserved after unloading the HF model — "
+                    f"something is pinning the freed weights.  The "
+                    f"{backend_name} workers may fail to start with 'Free "
+                    f"memory on device' errors; if they do, please report "
+                    f"this at "
+                    f"https://github.com/wuwangzhang1216/abliterix/issues.[/]"
+                )
             report_memory()
 
             # Load model with tensor parallelism.
@@ -796,17 +1101,191 @@ def run():
             engine._projection_cache = projection_cache
             engine._current_adapter_path = None  # baseline = no adapter
 
+            # Attach MoE router editor so the optimizer can apply router
+            # suppression per trial via collective_rpc.  Only on vLLM
+            # backend (SGLang has no equivalent editor yet).
+            if config.model.backend == "vllm" and hasattr(tp_gen, "set_moe_editor"):
+                # If HF profiling was skipped (fast vLLM-native extraction
+                # path → no HF model loaded), profile directly on the TP
+                # vLLM instance via collective_rpc-attached router hooks.
+                if safety_experts is None:
+                    from .core.vllm_moe_editor import (
+                        VLLMMoEEditor,
+                        profile_safety_experts_by_weight,
+                        profile_safety_experts_vllm,
+                    )
+
+                    # Cheap probe: construct editor with empty safety_experts
+                    # just to discover whether any layer exposes a router.
+                    _probe_ed = VLLMMoEEditor(tp_gen.llm, {})
+                    _probe_ed.probe()
+                    if _probe_ed._router_layers:
+                        # Derive top_k from the model config (num_experts_per_tok).
+                        try:
+                            from transformers import AutoConfig
+
+                            _auto_cfg = AutoConfig.from_pretrained(
+                                config.model.model_id,
+                                trust_remote_code=config.model.trust_remote_code
+                                or False,
+                            )
+                            _text_cfg = getattr(_auto_cfg, "text_config", _auto_cfg)
+                            _top_k = int(getattr(_text_cfg, "num_experts_per_tok", 4))
+                        except Exception:
+                            _top_k = 4
+
+                        print(
+                            f"* Profiling MoE safety experts via vLLM "
+                            f"(top_k={_top_k}, {len(_probe_ed._router_layers)} "
+                            f"router layers)..."
+                        )
+                        safety_experts = profile_safety_experts_vllm(
+                            tp_gen.llm,
+                            benign_msgs,
+                            target_msgs,
+                            tp_gen.tokenizer,
+                            top_k=_top_k,
+                        )
+
+                    # Fallback: vLLM's fused TRITON MxFP4 MoE kernel bypasses
+                    # the router nn.Module's forward, so hook-based profiling
+                    # returns empty counts.  Rank experts by router-weight
+                    # alignment with the per-layer refusal direction instead.
+                    if (
+                        _probe_ed._router_layers
+                        and not safety_experts
+                        and vectors is not None
+                    ):
+                        print(
+                            "* Hook-based profiling returned empty — falling "
+                            "back to router-weight alignment heuristic..."
+                        )
+                        safety_experts = profile_safety_experts_by_weight(
+                            tp_gen.llm,
+                            vectors,
+                        )
+
+                if safety_experts:
+                    print(
+                        f"* Attaching MoE router editor ({len(safety_experts)} "
+                        f"MoE layers)..."
+                    )
+                    tp_gen.set_moe_editor(safety_experts)  # ty:ignore[call-non-callable]
+
+            # In-place editing path: attach attention and, when requested,
+            # expert editors so the optimizer trial loop edits vLLM weights
+            # directly (no LoRA adapter).
+            # Requires TRITON backend (FLASHINFER_TRTLLM repacks w2_weight
+            # into an opaque block layout) and enforce_eager=True. See
+            # VllmConfig.use_in_place_editing for env-var requirements.
+            if (
+                config.model.backend == "vllm"
+                and config.model.use_in_place_editing
+                and hasattr(tp_gen, "set_expert_editor")
+            ):
+                wants_expert_editor = (
+                    "mlp.down_proj" not in config.steering.disabled_components
+                )
+                _hidden = getattr(engine, "hidden_size", None)
+                _transposed = bool(
+                    getattr(engine, "_fused_down_proj_transposed", False)
+                )
+                if wants_expert_editor and _hidden is None:
+                    try:
+                        from transformers import AutoConfig as _AC
+
+                        _c = _AC.from_pretrained(
+                            config.model.model_id,
+                            trust_remote_code=config.model.trust_remote_code or False,
+                        )
+                        _hidden = int(
+                            getattr(
+                                getattr(_c, "text_config", _c),
+                                "hidden_size",
+                                0,
+                            )
+                        )
+                    except Exception:
+                        _hidden = 0
+                print("* Attaching vLLM in-place attention editor...")
+                tp_gen.set_attention_editor()  # ty:ignore[call-non-callable]
+                if wants_expert_editor:
+                    if _hidden and _hidden > 0:
+                        print(
+                            f"* Attaching vLLM in-place expert editor "
+                            f"(hidden={_hidden}, transposed={_transposed})..."
+                        )
+                        tp_gen.set_expert_editor(  # ty:ignore[call-non-callable]
+                            hidden_dim=_hidden, transposed=_transposed
+                        )
+                    else:
+                        print(
+                            "  [yellow]use_in_place_editing=true but hidden_size "
+                            "could not be resolved — skipping expert editor.[/]"
+                        )
+
             # If engine has no model (lightweight mode), populate cached
             # metadata from the projection cache so optimizer can query it.
             if engine.model is None and engine._cached_n_layers is None:
-                engine._cached_n_layers = max(projection_cache.projections.keys()) + 1
+                if projection_cache is not None:
+                    engine._cached_n_layers = (
+                        max(projection_cache.projections.keys()) + 1
+                    )
+                    engine._cached_components = sorted(
+                        {
+                            comp
+                            for layer in projection_cache.projections.values()
+                            for comp in layer
+                        }
+                    )
+                else:
+                    engine._cached_n_layers = int(vectors.shape[0] - 1)
+                    engine._cached_components = []
+            # If an in-place expert editor was attached, "mlp.down_proj" must
+            # appear in cached_components so the optimizer generates an EGA
+            # steering profile for it.  The fused expert tensor is NOT in the
+            # projection cache (EGA computes projections inline from the
+            # steering vector), so it is absent from the block above.
+            if (
+                engine._cached_components is not None
+                and "mlp.down_proj" not in engine._cached_components
+                and getattr(tp_gen, "expert_editor", None) is not None
+                and len(getattr(tp_gen.expert_editor, "_moe_layers", [])) > 0
+            ):
                 engine._cached_components = sorted(
-                    {
-                        comp
-                        for layer in projection_cache.projections.values()
-                        for comp in layer
-                    }
+                    set(engine._cached_components) | {"mlp.down_proj"}
                 )
+                print("  * Injected 'mlp.down_proj' into steerable components (EGA)")
+
+            # If an in-place attention editor was attached, q/k/v/o_proj must
+            # all appear in cached_components so the optimizer generates
+            # steering profiles for every attention projection. ``_apply_direct_
+            # steering_vllm`` (steering.py) dispatches to VLLMAttentionEditor
+            # which handles fused qkv_proj slicing on TP workers — but only if
+            # the profiles exist. Without this injection, ProjectionCache only
+            # contributes ``attn.o_proj`` (its build loop skips q/k/v because
+            # ``d_out != hidden_dim`` makes ``sv @ W`` dimensionally invalid),
+            # leaving 3/4 of attention unsteered.
+            if (
+                engine._cached_components is not None
+                and getattr(tp_gen, "attention_editor", None) is not None
+                and len(getattr(tp_gen.attention_editor, "_attn_layers", set())) > 0
+            ):
+                _attn_needed = {
+                    "attn.q_proj",
+                    "attn.k_proj",
+                    "attn.v_proj",
+                    "attn.o_proj",
+                }
+                _attn_missing = _attn_needed - set(engine._cached_components)
+                if _attn_missing:
+                    engine._cached_components = sorted(
+                        set(engine._cached_components) | _attn_missing
+                    )
+                    print(
+                        f"  * Injected {sorted(_attn_missing)} into steerable "
+                        f"components (fused qkv_proj slicing on TP workers)"
+                    )
 
             # Detect response prefix via the fast TP backend (if not done earlier).
             if not engine.response_prefix:
@@ -847,6 +1326,71 @@ def run():
                     f"(would be ~100x slower).  Fix the backend installation and retry."
                 )
 
+        # Precompute alternative steering tensors when the optimiser is
+        # asked to search the harmfulness ⊥ refusal flag as a categorical.
+        # The pair-variant uses the existing harmfulness extractor and
+        # plugs into the multi-direction code path downstream.
+        _vector_variants: dict | None = None
+        if (
+            config.steering.search_harmfulness_direction
+            and benign_states is not None
+            and target_states is not None
+        ):
+            from .harmfulness import extract_harm_refusal_pair
+
+            print()
+            print(
+                "Precomputing harmfulness-pair variant for the optimiser "
+                "(search_harmfulness_direction=true)..."
+            )
+            pair_vectors = extract_harm_refusal_pair(
+                benign_states,
+                target_states,
+                layer_band=tuple(config.steering.harmfulness_layer_band),
+                orthogonal_projection=config.steering.orthogonal_projection,
+                projected_abliteration=config.steering.projected_abliteration,
+            )
+            _vector_variants = {
+                "single": vectors,
+                "harmfulness_pair": pair_vectors,
+            }
+
+        if reproduce_manifest is not None:
+            from .reproducibility import (
+                compare_reproduction_metrics,
+                manifest_trial,
+            )
+
+            print()
+            print("[bold]Replaying the published winning trial exactly...[/]")
+            replay_trial = manifest_trial(reproduce_manifest)
+            _restore_selected_trial(
+                replay_trial,
+                config,
+                engine,
+                vectors,
+                safety_experts,
+                benign_states=benign_states,
+                target_states=target_states,
+                steering_vector_variants=_vector_variants,
+            )
+            _, replay_kl, replay_refusals, _ = scorer.score_trial(engine)
+            drift = compare_reproduction_metrics(
+                reproduce_manifest,
+                kl_divergence=replay_kl,
+                refusals=replay_refusals,
+            )
+            if drift:
+                details = "; ".join(drift)
+                raise RuntimeError(
+                    "Independent reproduction verification failed: " + details
+                )
+            print(
+                "[bold green]Independent reproduction verified:[/] "
+                f"KL={replay_kl:.6g}, refusals={replay_refusals}."
+            )
+            return 0
+
         study = run_search(
             config,
             engine,
@@ -856,6 +1400,8 @@ def run():
             storage,
             benign_states=benign_states,
             target_states=target_states,
+            steering_vector_variants=_vector_variants,
+            raise_on_interrupt=config.non_interactive,
         )
 
         if config.non_interactive:
@@ -865,7 +1411,67 @@ def run():
                 f"[bold green]Non-interactive mode: optimization finished with "
                 f"{completed} completed trials.[/]"
             )
-            return
+            if config.non_interactive_output_dir:
+                from pathlib import Path
+
+                from .reproducibility import (
+                    build_manifest,
+                    local_weight_shas,
+                    write_reproduce_artifacts,
+                )
+
+                complete_trials = [
+                    trial
+                    for trial in study.trials
+                    if trial.state == TrialState.COMPLETE
+                ]
+                if not complete_trials:
+                    raise RuntimeError("No completed trial is available for export.")
+                selected = min(
+                    complete_trials,
+                    key=lambda trial: (
+                        trial.user_attrs["refusals"],
+                        trial.user_attrs["kl_divergence"],
+                    ),
+                )
+                output_dir = Path(config.non_interactive_output_dir).expanduser()
+                if output_dir.exists() and any(output_dir.iterdir()):
+                    raise RuntimeError(
+                        f"Non-interactive output directory is not empty: {output_dir}"
+                    )
+                output_dir.mkdir(parents=True, exist_ok=True)
+                trial_config = _restore_selected_trial(
+                    selected,
+                    config,
+                    engine,
+                    vectors,
+                    safety_experts,
+                    benign_states=benign_states,
+                    target_states=target_states,
+                    steering_vector_variants=_vector_variants,
+                )
+                print(f"Exporting verified trial to [bold]{output_dir}[/]...")
+                merged = engine.export_merged()
+                merged.save_pretrained(output_dir)
+                del merged
+                flush_memory()
+                engine.tokenizer.save_pretrained(output_dir)
+                weight_shas = local_weight_shas(output_dir)
+                if not weight_shas:
+                    raise RuntimeError("Export produced no hashable model weights.")
+                manifest = build_manifest(
+                    trial_config,
+                    selected,
+                    weight_shas=weight_shas,
+                    baseline_refusal_count=scorer.baseline_refusal_count,
+                    n_target_prompts=len(scorer.target_msgs),
+                )
+                write_reproduce_artifacts(output_dir / "reproduce", manifest)
+                print(
+                    f"[bold green]Export verified:[/] {len(weight_shas)} weight "
+                    "file(s) hashed with SHA256."
+                )
+            return 0
 
         show_interactive_results(
             study,
@@ -875,16 +1481,21 @@ def run():
             vectors,
             safety_experts,
             storage,
+            benign_states=benign_states,
+            target_states=target_states,
+            steering_vector_variants=_vector_variants,
         )
     finally:
         detector.close()
+
+    return 0
 
 
 def main():
     install()  # Rich traceback handler.
 
     try:
-        run()
+        code = run()
     except BaseException as error:
         if isinstance(error, KeyboardInterrupt) or isinstance(
             error.__context__,
@@ -892,5 +1503,7 @@ def main():
         ):
             print()
             print("[red]Shutting down...[/]")
-        else:
-            raise
+            # 130 is the conventional "terminated by SIGINT" status.
+            sys.exit(130)
+        raise
+    sys.exit(code)

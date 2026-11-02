@@ -53,7 +53,9 @@ def analyze_delta_rank(base_sd: dict, defended_sd: dict, max_layers: int = 5) ->
         delta = (w_def.float() - w_base.float()).to(device)
         if delta.abs().max().item() < 1e-6:
             continue
-        print(f"\nAnalyzing {name} shape={tuple(w_base.shape)} on {device}...", flush=True)
+        print(
+            f"\nAnalyzing {name} shape={tuple(w_base.shape)} on {device}...", flush=True
+        )
         s = torch.linalg.svdvals(delta).cpu()
         top = s[0].item()
         # Effective rank: count singular values above 1% of max
@@ -101,8 +103,10 @@ def main():
     missing_in_defended = [k for k in base_sd if k not in defended_sd]
     missing_in_base = [k for k in defended_sd if k not in base_sd]
     if missing_in_defended or missing_in_base:
-        print(f"WARNING: {len(missing_in_defended)} keys only in base, "
-              f"{len(missing_in_base)} keys only in defended")
+        print(
+            f"WARNING: {len(missing_in_defended)} keys only in base, "
+            f"{len(missing_in_base)} keys only in defended"
+        )
 
     analyze_delta_rank(base_sd, defended_sd)
 

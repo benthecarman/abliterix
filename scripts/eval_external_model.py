@@ -38,18 +38,27 @@ TEST_PROMPTS = [
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--model", required=True, help="HF model ID to evaluate")
     parser.add_argument("--config", default="configs/gemma4_26b_a4b_direct.toml")
     parser.add_argument("--max-tokens", type=int, default=300)
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for generation")
+    parser.add_argument(
+        "--batch-size", type=int, default=8, help="Batch size for generation"
+    )
     args = parser.parse_args()
 
     os.environ["AX_CONFIG"] = args.config
     sys.argv = [sys.argv[0]]
 
     import torch
-    from transformers import AutoModelForImageTextToText, AutoModelForCausalLM, AutoTokenizer, PretrainedConfig
+    from transformers import (
+        AutoModelForImageTextToText,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        PretrainedConfig,
+    )
 
     print(f"Loading model: {args.model}")
 
@@ -70,12 +79,11 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print(f"Model loaded. VRAM: {torch.cuda.memory_allocated()/1024**3:.1f} GiB")
+    print(f"Model loaded. VRAM: {torch.cuda.memory_allocated() / 1024**3:.1f} GiB")
 
     # --- Load our eval datasets ---
     from abliterix.settings import AbliterixConfig
     from abliterix.eval.detector import RefusalDetector
-    from abliterix.types import ChatMessage
     from abliterix.data import load_prompt_dataset
 
     config = AbliterixConfig(config=args.config)
@@ -83,7 +91,9 @@ def main():
 
     # Eval prompts from our datasets
     eval_msgs = load_prompt_dataset(config, config.target_eval_prompts)
-    print(f"\nLoaded {len(eval_msgs)} eval prompts from {config.target_eval_prompts.dataset}")
+    print(
+        f"\nLoaded {len(eval_msgs)} eval prompts from {config.target_eval_prompts.dataset}"
+    )
 
     # --- Generate + detect for eval dataset ---
     print("\n" + "=" * 70)
@@ -97,26 +107,40 @@ def main():
             {"role": "system", "content": msg_system or DEFAULT_SYSTEM},
             {"role": "user", "content": msg_user},
         ]
-        return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        template_kwargs = {"add_generation_prompt": True, "tokenize": False}
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                enable_thinking=False,
+                **template_kwargs,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(messages, **template_kwargs)
 
     def generate_batched(prompts: list[str], max_new_tokens: int) -> list[str]:
         responses: list[str] = []
         for start in range(0, len(prompts), args.batch_size):
             chunk = prompts[start : start + args.batch_size]
-            enc = tokenizer(chunk, return_tensors="pt", padding=True, truncation=False).to(model.device)
+            enc = tokenizer(
+                chunk, return_tensors="pt", padding=True, truncation=False
+            ).to(model.device)
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": False,
+                "pad_token_id": tokenizer.pad_token_id,
+            }
+            if config.inference.min_gen_tokens is not None:
+                gen_kwargs["min_new_tokens"] = config.inference.min_gen_tokens
             with torch.no_grad():
-                out = model.generate(
-                    **enc,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-            gen = out[:, enc["input_ids"].shape[1]:]
+                out = model.generate(**enc, **gen_kwargs)
+            gen = out[:, enc["input_ids"].shape[1] :]
             responses.extend(tokenizer.batch_decode(gen, skip_special_tokens=True))
         return responses
 
     eval_prompts = [render(m.user, m.system) for m in eval_msgs]
-    print(f"Generating {len(eval_prompts)} eval responses (batch_size={args.batch_size})...")
+    print(
+        f"Generating {len(eval_prompts)} eval responses (batch_size={args.batch_size})..."
+    )
     eval_responses = generate_batched(eval_prompts, config.inference.max_gen_tokens)
 
     refusals = 0
@@ -124,7 +148,7 @@ def main():
         if detector.detect_refusal(resp):
             refusals += 1
         if (i + 1) % 10 == 0:
-            print(f"  [{i+1}/{len(eval_responses)}] refusals so far: {refusals}")
+            print(f"  [{i + 1}/{len(eval_responses)}] refusals so far: {refusals}")
 
     print(f"\n>>> EVAL RESULT: {refusals}/{len(eval_msgs)} refusals <<<")
 
@@ -151,7 +175,9 @@ def main():
 
     print("\n" + "=" * 70)
     print(f"EVAL DATASET:  {refusals}/{len(eval_msgs)} refusals")
-    print(f"CLASSIC TESTS: {classic_complied}/{len(TEST_PROMPTS)} complied, {classic_refused}/{len(TEST_PROMPTS)} refused")
+    print(
+        f"CLASSIC TESTS: {classic_complied}/{len(TEST_PROMPTS)} complied, {classic_refused}/{len(TEST_PROMPTS)} refused"
+    )
     print("=" * 70)
 
 

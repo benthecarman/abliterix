@@ -1,13 +1,24 @@
-# Gemma 4 31B — V8: aggressive direct editing with full attack surface
+# Gemma 4 31B — vLLM in-place direct editing
 #
-# V4 improvements applied to 31B dense:
-#   - Q/K/V projections as steerable targets (5 components total)
+# Reference result:
+#   - Trial 40 selected from a completed 60-trial run
+#   - Baseline: 99/100 refusals
+#   - Best: 7/100 refusals (Gemini LLM judge, min 100 / max 150 tokens)
+#
+# Operational rule: do not fall back to HF generation/evaluation for this
+# model. HF may still load once for hidden-state extraction if the vLLM hidden
+# state fast path is unavailable, and HF is used for final safetensors export.
+# The optimization loop itself should stay on vLLM.
+#
+# Lessons applied to 31B dense:
+#   - Q/K/V/O projections as steerable targets
 #   - Norm preservation (weight_normalization = "pre")
 #   - float32 projection precision
 #   - Winsorize vectors
 #   - Much wider strength range to push KL up toward 0.001
-#   - Relaxed KL prune threshold
-#   - 150 token generation for accurate refusal detection
+#   - min 100 / max 150 token generation for delayed-refusal detection
+#   - vLLM LoRA disabled; Gemma 4 vLLM LoRA was ineffective in testing
+#   - vLLM in-place editing enabled; this is the fast path for trials
 
 [model]
 model_id = "google/gemma-4-31B-it"
@@ -16,11 +27,21 @@ quant_method = "none"
 use_torch_compile = false
 device_map = "auto"
 max_memory = {0 = "80GiB"}
+backend = "vllm"
+tensor_parallel_size = 1
+gpu_memory_utilization = 0.92
+enable_expert_parallel = false
+enable_chunked_prefill = true
+enforce_eager = true
+max_model_len = 4096
+disable_lora = true
+use_in_place_editing = true
 
 [inference]
 batch_size = 0
 max_batch_size = 8
-max_gen_tokens = 100
+max_gen_tokens = 150
+min_gen_tokens = 100
 
 [steering]
 steering_mode = "direct"
@@ -30,6 +51,7 @@ winsorize_vectors = true
 winsorize_quantile = 0.995
 decay_kernel = "gaussian"
 weight_normalization = "pre"
+disabled_components = ["mlp.down_proj"]
 
 # Very wide strength range — current KL is ~0.0005, we need to push to ~0.001
 # Higher strength = more aggressive refusal removal = higher KL

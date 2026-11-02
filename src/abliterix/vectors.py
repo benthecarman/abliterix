@@ -60,7 +60,6 @@ def _compute_ot_transform(
         Unit-normalised direction vectors, shape ``(layers+1, hidden_dim)``.
     """
     n_layers = benign_states.shape[1]
-    benign_states.shape[2]
     per_layer = []
 
     for layer_idx in range(n_layers):
@@ -119,29 +118,88 @@ def _extract_multi_directions(
     target_states: Tensor,
     n_directions: int = 3,
 ) -> Tensor:
-    """Extract top-k independent refusal directions via SVD.
+    """Extract a mean refusal direction plus residual SVD directions.
 
-    Instead of a single mean-difference vector, decomposes the refusal
-    subspace into multiple orthogonal components.  The returned tensor has
-    shape ``(n_directions, layers+1, hidden_dim)`` — each slice is a
-    unit-normalised direction.
+    Direction zero is the normalised target-minus-benign mean, matching the
+    single-direction ``MEAN`` contract.  Remaining directions come from the
+    centred per-sample differences and are orthogonalised against the mean
+    and all earlier residual directions.  The returned tensor has shape
+    ``(n_directions, layers+1, hidden_dim)``.  Degenerate directions are zero;
+    every other direction has unit norm per layer.
     """
     n_layers = benign_states.shape[1]
-    all_dirs = []
+    per_layer_directions = []
 
-    for k in range(n_directions):
-        per_layer = []
-        for layer_idx in range(n_layers):
-            diff = (
-                target_states[:, layer_idx, :].float()
-                - benign_states[:, layer_idx, :].float()
+    for layer_idx in range(n_layers):
+        target = target_states[:, layer_idx, :].float()
+        benign = benign_states[:, layer_idx, :].float()
+        diff = target - benign
+        mean_diff = target.mean(dim=0) - benign.mean(dim=0)
+        mean_direction = F.normalize(mean_diff, p=2, dim=0)
+        layer_directions = [mean_direction]
+
+        residual = diff - mean_diff.unsqueeze(0)
+        residual = residual - (
+            (residual @ mean_direction).unsqueeze(1) * mean_direction.unsqueeze(0)
+        )
+        _, singular_values, Vh = torch.linalg.svd(residual, full_matrices=False)
+        if singular_values.numel():
+            tolerance = (
+                torch.finfo(residual.dtype).eps
+                * max(residual.shape)
+                * singular_values[0]
             )
-            diff = diff - diff.mean(dim=0, keepdim=True)
-            _, _, Vh = torch.linalg.svd(diff, full_matrices=False)
-            per_layer.append(Vh[k] if k < Vh.shape[0] else torch.zeros_like(Vh[0]))
-        all_dirs.append(F.normalize(torch.stack(per_layer, dim=0), p=2, dim=1))
+        else:
+            tolerance = torch.tensor(0.0, device=residual.device)
 
-    return torch.stack(all_dirs, dim=0)
+        for residual_idx in range(n_directions - 1):
+            if (
+                residual_idx >= Vh.shape[0]
+                or singular_values[residual_idx] <= tolerance
+            ):
+                direction = torch.zeros_like(mean_diff)
+            else:
+                direction = Vh[residual_idx]
+                for previous in layer_directions:
+                    norm_squared = torch.dot(previous, previous)
+                    if norm_squared > 0:
+                        direction = (
+                            direction
+                            - (torch.dot(direction, previous) / norm_squared) * previous
+                        )
+                direction = F.normalize(direction, p=2, dim=0)
+            layer_directions.append(direction)
+
+        per_layer_directions.append(torch.stack(layer_directions, dim=0))
+
+    return torch.stack(per_layer_directions, dim=1)
+
+
+def _orthonormalize_direction_rows(directions: Tensor) -> Tensor:
+    """Rebuild an orthonormal per-layer basis while preserving zero rows."""
+    result = torch.zeros_like(directions, dtype=torch.float32)
+    tolerance = torch.finfo(result.dtype).eps * max(
+        directions.shape[0], directions.shape[2]
+    )
+
+    for layer_idx in range(directions.shape[1]):
+        for direction_idx in range(directions.shape[0]):
+            direction = directions[direction_idx, layer_idx].float().clone()
+            if torch.linalg.vector_norm(direction) <= tolerance:
+                continue
+
+            # Re-orthogonalised modified Gram-Schmidt is more stable than a
+            # single classical pass and, unlike QR, keeps degenerate row slots.
+            for _ in range(2):
+                for previous_idx in range(direction_idx):
+                    previous = result[previous_idx, layer_idx]
+                    direction = direction - torch.dot(direction, previous) * previous
+
+            norm = torch.linalg.vector_norm(direction)
+            if norm > tolerance:
+                result[direction_idx, layer_idx] = direction / norm
+
+    return result.to(directions.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +222,16 @@ def compute_steering_vectors(
     sra_base_method: VectorMethod | None = None,
     sra_n_atoms: int = 8,
     sra_ridge_alpha: float = 0.01,
+    ablate_harmfulness_direction: bool = False,
+    harmfulness_layer_band: tuple[float, float] = (0.3, 0.7),
+    som_grid_h: int = 3,
+    som_grid_w: int = 3,
+    som_n_iters: int = 500,
+    som_initial_lr: float = 0.5,
+    som_seed: int = 0,
+    sae_path: str | None = None,
+    sae_layer: int = 0,
+    sae_top_k: int = 8,
 ) -> Tensor:
     """Derive per-layer steering vectors from benign and target residuals.
 
@@ -195,19 +263,69 @@ def compute_steering_vectors(
         multi-direction mode, returning shape ``(n_dirs, layers+1, dim)``).
     token_position_split : bool
         Reserved for future harmfulness/refusal token-position separation.
+    ablate_harmfulness_direction : bool
+        If True, decompose the steering signal into a refusal direction
+        (standard mean-diff) and a harmfulness direction (Zhao et al. 2025,
+        arXiv:2507.11878) orthogonal to it, returning the stacked pair with
+        shape ``(2, layers+1, hidden_dim)``.  Incompatible with
+        ``n_directions > 1`` and with SRA/COSMIC/OT (which build their own
+        bases) — validated at config load.
+    harmfulness_layer_band : tuple[float, float]
+        Fractional layer range ``(lo, hi)`` where the harmfulness direction
+        is strongest.  Defaults to ``(0.3, 0.7)``.
 
     Returns
     -------
     Tensor
         Unit-normalised steering vectors.  Shape ``(layers+1, hidden_dim)``
-        when ``n_directions == 1``, otherwise ``(n_dirs, layers+1, dim)``.
+        when ``n_directions == 1`` and no harmfulness flag, otherwise
+        ``(n_dirs, layers+1, dim)``.
     """
+
+    # --- RDO is engine-based, not a pure function of cached states ---
+    # It requires forward+backward through the model, so it is routed
+    # separately (see abliterix.rdo.optimize_rdo_direction, invoked from the
+    # CLI where the engine and prompts are available).  Guard here so a stray
+    # method='rdo' fails loudly instead of silently falling through to MEAN.
+    if method == VectorMethod.RDO:
+        raise ValueError(
+            "vector_method='rdo' cannot be computed from cached residual "
+            "states alone — it learns the direction by back-propagating "
+            "through the model. Use abliterix.rdo.optimize_rdo_direction "
+            "(the CLI routes this automatically)."
+        )
+
+    # --- Joint harmfulness + refusal direction (Zhao et al. 2025) ---
+    # Routed before multi-direction because it reuses the same stacked
+    # output layout (n_dirs=2) but with a semantic decomposition that does
+    # not collapse to SVD top-k.
+    if ablate_harmfulness_direction:
+        from .harmfulness import extract_harm_refusal_pair
+
+        return extract_harm_refusal_pair(
+            benign_states,
+            target_states,
+            layer_band=tuple(harmfulness_layer_band),  # type: ignore[arg-type]
+            orthogonal_projection=orthogonal_projection,
+            projected_abliteration=projected_abliteration,
+        )
 
     # --- Multi-direction mode ---
     if n_directions > 1:
         directions = _extract_multi_directions(
             benign_states, target_states, n_directions
         )
+        if winsorize:
+            original_shape = directions.shape
+            flattened = directions.reshape(-1, original_shape[-1])
+            flattened = torch.stack(
+                [
+                    _winsorize(direction, quantile=winsorize_quantile)
+                    for direction in flattened
+                ],
+                dim=0,
+            )
+            directions = F.normalize(flattened, p=2, dim=1).reshape(original_shape)
         # Apply projection to each direction independently.
         if projected_abliteration or orthogonal_projection:
             benign_mean = benign_states.mean(dim=0)
@@ -222,8 +340,8 @@ def compute_steering_vectors(
                     proj_scalar = torch.sum(v * benign_dir, dim=1, keepdim=True)
                     v = v - proj_scalar * benign_dir
                 projected.append(F.normalize(v, p=2, dim=1))
-            return torch.stack(projected, dim=0)
-        return directions
+            directions = torch.stack(projected, dim=0)
+        return _orthonormalize_direction_rows(directions)
 
     # --- Single-direction methods ---
 
@@ -247,6 +365,41 @@ def compute_steering_vectors(
             vectors = vectors - proj.unsqueeze(1) * benign_dir
             vectors = F.normalize(vectors, p=2, dim=1)
         return vectors
+
+    if method == VectorMethod.SAE:
+        if sae_path is None:
+            raise ValueError(
+                "vector_method='sae' requires sae_path to be set "
+                "(SteeringConfig.sae_path)."
+            )
+        from .sae import compute_sae_steering_directions, load_sae
+
+        sae = load_sae(sae_path, hidden_dim=target_states.shape[-1])
+        directions, _scores = compute_sae_steering_directions(
+            sae,
+            benign_states,
+            target_states,
+            sae_layer=sae_layer,
+            top_k=sae_top_k,
+            orthogonal_projection=orthogonal_projection,
+            projected_abliteration=projected_abliteration,
+        )
+        return directions
+
+    if method == VectorMethod.SOM:
+        from .som import compute_som_directions
+
+        return compute_som_directions(
+            benign_states,
+            target_states,
+            grid_h=som_grid_h,
+            grid_w=som_grid_w,
+            n_iters=som_n_iters,
+            initial_lr=som_initial_lr,
+            seed=som_seed,
+            orthogonal_projection=orthogonal_projection,
+            projected_abliteration=projected_abliteration,
+        )
 
     if method == VectorMethod.SRA:
         from .sra import compute_sra_vectors
@@ -331,6 +484,44 @@ def compute_steering_vectors(
         vectors = F.normalize(vectors, p=2, dim=1)
 
     return vectors
+
+
+def compute_configured_steering_vectors(
+    benign_states: Tensor,
+    target_states: Tensor,
+    config,
+) -> Tensor:
+    """Compute vectors from the complete, replayable steering recipe.
+
+    CLI and export scripts previously maintained separate, incomplete keyword
+    lists.  Keeping the mapping here makes a saved trial use the same vector
+    implementation during optimisation, inspection, and export.
+    """
+    steering = config.steering
+    return compute_steering_vectors(
+        benign_states,
+        target_states,
+        steering.vector_method,
+        steering.orthogonal_projection,
+        winsorize=steering.winsorize_vectors,
+        winsorize_quantile=steering.winsorize_quantile,
+        projected_abliteration=steering.projected_abliteration,
+        ot_components=steering.ot_components,
+        n_directions=steering.n_directions,
+        sra_base_method=steering.sra_base_method,
+        sra_n_atoms=steering.sra_n_atoms,
+        sra_ridge_alpha=steering.sra_ridge_alpha,
+        ablate_harmfulness_direction=steering.ablate_harmfulness_direction,
+        harmfulness_layer_band=tuple(steering.harmfulness_layer_band),
+        som_grid_h=steering.som_grid_h,
+        som_grid_w=steering.som_grid_w,
+        som_n_iters=steering.som_n_iters,
+        som_initial_lr=steering.som_initial_lr,
+        som_seed=steering.som_seed,
+        sae_path=steering.sae_path,
+        sae_layer=steering.sae_layer,
+        sae_top_k=steering.sae_top_k,
+    )
 
 
 # ---------------------------------------------------------------------------

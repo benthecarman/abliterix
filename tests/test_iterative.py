@@ -96,7 +96,9 @@ def test_subspace_basis_orthonormal():
         norms = B.norm(p=2, dim=1)
         for i in range(B.shape[0]):
             if norms[i] > 1e-6:
-                assert abs(norms[i].item() - 1.0) < 1e-4, f"Non-unit norm at layer {layer} dir {i}"
+                assert abs(norms[i].item() - 1.0) < 1e-4, (
+                    f"Non-unit norm at layer {layer} dir {i}"
+                )
 
 
 def test_subspace_basis_deduplicates():

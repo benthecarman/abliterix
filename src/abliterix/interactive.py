@@ -15,6 +15,7 @@ from huggingface_hub import ModelCard, ModelCardData
 from optuna.storages import JournalStorage
 from optuna.trial import TrialState
 from questionary import Choice
+from rich.table import Table
 from torch import Tensor
 
 from .core.engine import SteeringEngine, resolve_model_class
@@ -22,8 +23,20 @@ from .core.steering import apply_steering
 from .data import format_trial_params, generate_model_card
 from .eval.scorer import TrialScorer
 from .optimizer import run_search
+from .reproducibility import (
+    REPRODUCE_TAG,
+    assess_reproducibility,
+    build_manifest,
+    repo_weight_shas,
+    write_reproduce_artifacts,
+)
+from .scriptlib import (
+    apply_trial_artifact,
+    extract_trial_artifact,
+    select_trial_vectors,
+)
 from .settings import AbliterixConfig
-from .types import QuantMode, SteeringProfile
+from .types import QuantMode
 from .util import (
     ask_choice,
     ask_path,
@@ -59,8 +72,13 @@ def ask_merge_strategy(config: AbliterixConfig, engine: SteeringEngine) -> str |
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                meta = resolve_model_class(config.model.model_id).from_pretrained(
+                meta = resolve_model_class(
                     config.model.model_id,
+                    config.model.revision,
+                    text_only=config.model.text_only,
+                ).from_pretrained(
+                    config.model.model_id,
+                    revision=config.model.revision,
                     device_map="meta",
                     torch_dtype=torch.bfloat16,
                     trust_remote_code=True,
@@ -115,6 +133,25 @@ def _save_model_locally(config: AbliterixConfig, engine: SteeringEngine):
     print(f"Model saved to [bold]{save_dir}[/].")
 
 
+def _save_lora_adapter_locally(config: AbliterixConfig, engine: SteeringEngine):
+    """Save only the PEFT LoRA adapter and tokenizer files."""
+    save_dir = ask_path("Path to the adapter folder:")
+    if not save_dir:
+        return
+
+    print("Saving LoRA adapter only...")
+    try:
+        # Use the guarded export path (rejects non-LoRA, router/expert base
+        # edits, and non-PeftModel backends such as bare vLLM HF shells).
+        engine.export_adapter(save_dir)
+    except RuntimeError as error:
+        print(f"[red]{error}[/]")
+        return
+    engine.tokenizer.save_pretrained(save_dir)
+    print(f"LoRA adapter saved to [bold]{save_dir}[/].")
+    print("[green]Base model weights were not merged or exported.[/]")
+
+
 def _upload_model(
     config: AbliterixConfig,
     engine: SteeringEngine,
@@ -160,6 +197,13 @@ def _upload_model(
         card = ModelCard.load(card_path) if card_path.exists() else None
     else:
         card = ModelCard.load(config.model.model_id)
+    weight_shas: dict[str, str] = {}
+    # Hash independently of model-card availability, before deciding its tag.
+    try:
+        weight_shas = repo_weight_shas(repo_id, token)
+    except Exception as error:  # noqa: BLE001 - best-effort Hub I/O
+        print(f"[yellow]Could not hash uploaded weight shards: {error}[/]")
+
     if card is not None:
         if card.data is None:
             card.data = ModelCardData()
@@ -171,6 +215,21 @@ def _upload_model(
             "decensored",
             "abliterated",
         ]
+        reproducible, reasons = assess_reproducibility(config)
+        if trial.user_attrs.get("steering_recipe") is None:
+            reproducible = False
+            reasons.append("the winning trial has no exact steering recipe")
+        if not weight_shas:
+            reproducible = False
+            reasons.append("no weight-shard SHA256 checksums could be computed")
+        if reproducible:
+            card.data.tags.append(REPRODUCE_TAG)
+        else:
+            print(
+                "[yellow]Model is not tagged reproducible: "
+                + "; ".join(reasons)
+                + "[/]"
+            )
         card.text = (
             generate_model_card(
                 config,
@@ -182,7 +241,56 @@ def _upload_model(
         )
         card.push_to_hub(repo_id, token=token)
 
+    _upload_reproduce_artifacts(
+        config, scorer, trial, repo_id, token, weight_shas=weight_shas
+    )
+
     print(f"Model uploaded to [bold]{repo_id}[/].")
+
+
+def _upload_reproduce_artifacts(
+    config: AbliterixConfig,
+    scorer: TrialScorer,
+    trial,
+    repo_id: str,
+    token: str | None,
+    weight_shas: dict[str, str] | None = None,
+):
+    """Publish reproduce.json + SHA256SUMS + README.md to the repo's reproduce/ folder.
+
+    Best-effort: a failure here must not abort an otherwise-successful upload,
+    so any exception is caught and reported.
+    """
+    import tempfile
+
+    try:
+        print("Building reproducibility manifest...")
+        if weight_shas is None:
+            weight_shas = repo_weight_shas(repo_id, token)
+        manifest = build_manifest(
+            config,
+            trial,
+            repo_id=repo_id,
+            weight_shas=weight_shas,
+            baseline_refusal_count=scorer.baseline_refusal_count,
+            n_target_prompts=len(scorer.target_msgs),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            write_reproduce_artifacts(tmp, manifest)
+            huggingface_hub.upload_folder(
+                repo_id=repo_id,
+                folder_path=tmp,
+                path_in_repo="reproduce",
+                token=token,
+                commit_message="Add abliterix reproducibility manifest",
+            )
+        n = len(weight_shas)
+        print(
+            f"* Reproducibility manifest uploaded to [bold]{repo_id}/reproduce/[/] "
+            f"({n} weight shard{'s' if n != 1 else ''} hashed)"
+        )
+    except Exception as error:
+        print(f"[yellow]Could not upload reproducibility manifest: {error}[/]")
 
 
 def _chat_with_model(config: AbliterixConfig, engine: SteeringEngine):
@@ -210,6 +318,200 @@ def _chat_with_model(config: AbliterixConfig, engine: SteeringEngine):
 # ---------------------------------------------------------------------------
 
 
+def _primary_metric(task_result: dict) -> tuple[str, float] | None:
+    """Pick the headline metric from an lm-eval per-task result dict."""
+    preferred = ("exact_match", "acc_norm", "acc", "f1", "mcc")
+    available = {
+        k.split(",")[0]: v
+        for k, v in task_result.items()
+        if isinstance(v, (int, float)) and not k.startswith(("alias", "stderr"))
+    }
+    for name in preferred:
+        if name in available:
+            return name, float(available[name])
+    for k, v in available.items():
+        if "stderr" not in k:
+            return k, float(v)
+    return None
+
+
+def _print_lm_eval_table(results_ab: dict, results_base: dict | None) -> None:
+    """Render an lm-eval results table, optionally comparing base vs abliterated."""
+    ab = results_ab.get("results", {})
+    base = (results_base or {}).get("results", {})
+
+    table = Table(title="lm-eval benchmark results")
+    table.add_column("Task", style="bold")
+    table.add_column("Metric")
+    if base:
+        table.add_column("Original", justify="right")
+        table.add_column("Abliterated", justify="right")
+        table.add_column("Δ", justify="right")
+    else:
+        table.add_column("Abliterated", justify="right")
+
+    for task in sorted(ab.keys()):
+        ab_metric = _primary_metric(ab[task])
+        if ab_metric is None:
+            continue
+        metric_name, ab_val = ab_metric
+        if base and task in base:
+            base_metric = _primary_metric(base[task])
+            base_val = base_metric[1] if base_metric else float("nan")
+            delta = ab_val - base_val
+            colour = "green" if delta >= -0.01 else "red"
+            table.add_row(
+                task,
+                metric_name,
+                f"{base_val:.4f}",
+                f"{ab_val:.4f}",
+                f"[{colour}]{delta:+.4f}[/]",
+            )
+        else:
+            table.add_row(task, metric_name, f"{ab_val:.4f}")
+
+    print()
+    print(table)
+
+
+def _run_benchmarks(
+    config: AbliterixConfig,
+    engine: SteeringEngine,
+    steering_vectors: Tensor,
+    trial,
+    safety_experts,
+    *,
+    benign_states: Tensor | None = None,
+    target_states: Tensor | None = None,
+    steering_vector_variants: dict[str, Tensor] | None = None,
+) -> AbliterixConfig | None:
+    """Run lm-eval-harness benchmarks on the steered model (optionally vs base).
+
+    The decensored model is already applied to ``engine`` by the caller. When
+    the user opts into a comparison, the baseline is restored, benchmarked, and
+    the trial's steering is re-applied so subsequent menu actions still operate
+    on the steered model.
+    """
+    try:
+        from lm_eval import simple_evaluate
+        from lm_eval.models.huggingface import HFLM
+    except ImportError:
+        print("[yellow]lm-eval is not installed.[/] Install the benchmark extra:")
+        print("    [bold]pip install 'abliterix[bench]'[/]")
+        return None
+
+    raw = ask_text(
+        "Comma-separated lm-eval tasks:",
+        default="gsm8k,hellaswag,arc_easy",
+    )
+    tasks = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tasks:
+        return None
+    limit_raw = ask_text("Max examples per task (blank = full):", default="100")
+    limit = int(limit_raw) if limit_raw.strip() else None
+
+    compare = (
+        ask_choice(
+            "Also benchmark the original (un-steered) model for comparison?",
+            ["No", "Yes"],
+        )
+        == "Yes"
+    )
+
+    print(f"Running lm-eval on the decensored model: {', '.join(tasks)} ...")
+    lm_ab = HFLM(pretrained=engine.model, tokenizer=engine.tokenizer, batch_size="auto")
+    results_ab = simple_evaluate(model=lm_ab, tasks=tasks, limit=limit)
+
+    results_base = None
+    if compare:
+        print("Restoring the original model and benchmarking it...")
+        engine.restore_baseline()
+        lm_base = HFLM(
+            pretrained=engine.model, tokenizer=engine.tokenizer, batch_size="auto"
+        )
+        results_base = simple_evaluate(model=lm_base, tasks=tasks, limit=limit)
+        # Replay the complete saved recipe so later menu actions (save, upload,
+        # chat) operate on the exact selected model again.
+        print("Re-applying steering...")
+        restored_config = _restore_selected_trial(
+            trial,
+            config,
+            engine,
+            steering_vectors,
+            safety_experts,
+            benign_states=benign_states,
+            target_states=target_states,
+            steering_vector_variants=steering_vector_variants,
+        )
+    else:
+        restored_config = None
+
+    _print_lm_eval_table(results_ab, results_base)
+    return restored_config
+
+
+def _restore_selected_trial(
+    trial,
+    config: AbliterixConfig,
+    engine: SteeringEngine,
+    steering_vectors: Tensor,
+    safety_experts,
+    *,
+    benign_states: Tensor | None = None,
+    target_states: Tensor | None = None,
+    steering_vector_variants: dict[str, Tensor] | None = None,
+) -> AbliterixConfig:
+    """Replay a selected trial without mutating the search configuration.
+
+    The trial recipe is restored on a deep config copy so selecting a trial
+    cannot change the semantics of a subsequent ``Run additional trials``.
+    Variant reconstruction deliberately happens before touching the model;
+    missing residuals therefore fail loudly while the baseline is intact.
+    """
+    artifact = extract_trial_artifact(trial)
+    trial_config = config.model_copy(deep=True)
+    apply_trial_artifact(trial_config, artifact)
+
+    # Prefer the exact single-vector tensor supplied to the optimiser when a
+    # variant map is available. Multi-direction variants are reconstructed by
+    # select_trial_vectors from the retained residuals, which also validates
+    # that the artifact names a supported method.
+    default_vectors = steering_vectors
+    if steering_vector_variants is not None:
+        default_vectors = steering_vector_variants.get("single", default_vectors)
+    trial_vectors = select_trial_vectors(
+        artifact,
+        default_vectors,
+        benign_states=benign_states,
+        target_states=target_states,
+        config=trial_config,
+    )
+
+    previous_config = engine.config
+    engine.config = trial_config
+    try:
+        engine.restore_baseline()
+        apply_steering(
+            engine,
+            trial_vectors,
+            artifact.vector_index,
+            artifact.profiles,
+            trial_config,
+            safety_experts=safety_experts,
+            routing_config=artifact.routing,
+            benign_states=benign_states,
+            target_states=target_states,
+        )
+    except Exception:
+        try:
+            engine.restore_baseline()
+        finally:
+            engine.config = previous_config
+        raise
+
+    return trial_config
+
+
 def show_interactive_results(
     study,
     config: AbliterixConfig,
@@ -218,6 +520,10 @@ def show_interactive_results(
     steering_vectors: Tensor,
     safety_experts,
     storage: JournalStorage,
+    *,
+    benign_states: Tensor | None = None,
+    target_states: Tensor | None = None,
+    steering_vector_variants: dict[str, Tensor] | None = None,
 ):
     """Post-optimisation interactive menu: trial selection, save, upload, chat."""
     while True:
@@ -323,17 +629,16 @@ def show_interactive_results(
             for name, value in format_trial_params(trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
 
-            print("* Resetting model...")
-            engine.restore_baseline()
-            print("* Applying steering...")
-            apply_steering(
+            print("* Replaying saved steering recipe...")
+            trial_config = _restore_selected_trial(
+                trial,
+                config,
                 engine,
                 steering_vectors,
-                trial.user_attrs["vector_index"],
-                {
-                    k: SteeringProfile(**v)
-                    for k, v in trial.user_attrs["parameters"].items()
-                },
+                safety_experts,
+                benign_states=benign_states,
+                target_states=target_states,
+                steering_vector_variants=steering_vector_variants,
             )
 
             while True:
@@ -342,8 +647,10 @@ def show_interactive_results(
                     "What do you want to do with the decensored model?",
                     [
                         "Save the model to a local folder",
+                        "Save LoRA adapter only",
                         "Upload the model to Hugging Face",
                         "Chat with the model",
+                        "Run standard benchmarks (lm-eval)",
                         "Return to the trial selection menu",
                     ],
                 )
@@ -354,13 +661,34 @@ def show_interactive_results(
                 try:
                     match action:
                         case "Save the model to a local folder":
-                            _save_model_locally(config, engine)
+                            _save_model_locally(trial_config, engine)
+
+                        case "Save LoRA adapter only":
+                            _save_lora_adapter_locally(trial_config, engine)
 
                         case "Upload the model to Hugging Face":
-                            _upload_model(config, engine, scorer, trial)
+                            _upload_model(trial_config, engine, scorer, trial)
 
                         case "Chat with the model":
-                            _chat_with_model(config, engine)
+                            _chat_with_model(trial_config, engine)
+
+                        case "Run standard benchmarks (lm-eval)":
+                            restored_config = _run_benchmarks(
+                                config,
+                                engine,
+                                steering_vectors,
+                                trial,
+                                safety_experts,
+                                benign_states=benign_states,
+                                target_states=target_states,
+                                steering_vector_variants=steering_vector_variants,
+                            )
+                            if restored_config is not None:
+                                trial_config = restored_config
 
                 except Exception as error:  # Catch-all for interactive menu actions
                     print(f"[red]Error: {error}[/]")
+
+            # The optimiser owns the original config object. Never let a
+            # selected trial's sampled recipe leak into additional trials.
+            engine.config = config

@@ -29,6 +29,7 @@ torch.set_grad_enabled(False)
 
 # ── Step 0: Config inspection (no weights) ──────────────────────────
 
+
 def inspect_config(model_id: str):
     from transformers import AutoConfig
 
@@ -39,10 +40,17 @@ def inspect_config(model_id: str):
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
 
     for attr in [
-        "num_hidden_layers", "hidden_size", "intermediate_size",
-        "num_attention_heads", "num_key_value_heads",
-        "num_experts", "num_experts_per_tok", "num_shared_experts",
-        "num_dense_layers", "model_type", "architectures",
+        "num_hidden_layers",
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "num_experts",
+        "num_experts_per_tok",
+        "num_shared_experts",
+        "num_dense_layers",
+        "model_type",
+        "architectures",
         "moe_intermediate_size",
     ]:
         val = getattr(config, attr, "N/A")
@@ -54,8 +62,13 @@ def inspect_config(model_id: str):
 
 # ── Step 1: Load model ──────────────────────────────────────────────
 
+
 def load_model(model_id: str):
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
+    from transformers import (
+        AutoConfig,
+        AutoModelForCausalLM,
+        AutoModelForImageTextToText,
+    )
 
     print("=" * 70)
     print("STEP 1: Loading model (BF16)")
@@ -68,7 +81,9 @@ def load_model(model_id: str):
     print(f"  Model class: {cls.__name__} (VLM={is_vlm})")
 
     model = cls.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16, device_map="auto",
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
         trust_remote_code=True,
     )
 
@@ -84,6 +99,7 @@ def load_model(model_id: str):
 
 # ── Step 2: Full module tree ────────────────────────────────────────
 
+
 def dump_module_tree(model):
     print("=" * 70)
     print("STEP 2: Full module tree")
@@ -97,6 +113,7 @@ def dump_module_tree(model):
 
 
 # ── Step 3: Discover layer structure ────────────────────────────────
+
 
 def discover_layers(model):
     print("=" * 70)
@@ -151,6 +168,7 @@ def discover_layers(model):
 
 # ── Step 4: Discover steerable modules per layer ────────────────────
 
+
 def discover_steerable_modules(layers):
     print("=" * 70)
     print("STEP 4: Steerable module discovery")
@@ -160,10 +178,9 @@ def discover_steerable_modules(layers):
         print("Skipped (no layers found)")
         return
 
-    sample_indices = sorted(set(
-        i for i in [0, 1, len(layers) // 2, len(layers) - 1]
-        if i < len(layers)
-    ))
+    sample_indices = sorted(
+        set(i for i in [0, 1, len(layers) // 2, len(layers) - 1] if i < len(layers))
+    )
 
     for idx in sample_indices:
         layer = layers[idx]
@@ -174,17 +191,23 @@ def discover_steerable_modules(layers):
 
         # Attention output projections
         attn_paths = [
-            "self_attn.o_proj", "self_attn.out_proj",
-            "attn.o_proj", "attn.out_proj",
-            "attention.o_proj", "attention.out_proj",
+            "self_attn.o_proj",
+            "self_attn.out_proj",
+            "attn.o_proj",
+            "attn.out_proj",
+            "attention.o_proj",
+            "attention.out_proj",
             "linear_attn.out_proj",
         ]
 
         # MLA (Multi-head Latent Attention) projections — DeepSeek/Mistral4 style
         mla_paths = [
-            "self_attn.q_a_proj", "self_attn.q_b_proj",
-            "self_attn.kv_a_proj_with_mqa", "self_attn.kv_b_proj",
-            "self_attn.q_a_layernorm", "self_attn.kv_a_layernorm",
+            "self_attn.q_a_proj",
+            "self_attn.q_b_proj",
+            "self_attn.kv_a_proj_with_mqa",
+            "self_attn.kv_b_proj",
+            "self_attn.q_a_layernorm",
+            "self_attn.kv_a_layernorm",
         ]
         for path in mla_paths:
             obj = layer
@@ -211,11 +234,16 @@ def discover_steerable_modules(layers):
 
         # Convolution output projections
         conv_paths = [
-            "conv.out_proj", "conv.o_proj",
-            "conv_block.out_proj", "conv_block.o_proj",
-            "short_conv.out_proj", "short_conv.output_linear",
-            "gated_conv.out_proj", "gated_conv.o_proj",
-            "temporal_block.out_proj", "temporal_block.o_proj",
+            "conv.out_proj",
+            "conv.o_proj",
+            "conv_block.out_proj",
+            "conv_block.o_proj",
+            "short_conv.out_proj",
+            "short_conv.output_linear",
+            "gated_conv.out_proj",
+            "gated_conv.o_proj",
+            "temporal_block.out_proj",
+            "temporal_block.o_proj",
         ]
         for path in conv_paths:
             obj = layer
@@ -231,10 +259,14 @@ def discover_steerable_modules(layers):
 
         # SSM / Mamba output projections
         ssm_paths = [
-            "mixer.out_proj", "mixer.o_proj",
-            "mamba.out_proj", "mamba.o_proj",
-            "mamba2.out_proj", "mamba2.o_proj",
-            "ssm.out_proj", "ssm.o_proj",
+            "mixer.out_proj",
+            "mixer.o_proj",
+            "mamba.out_proj",
+            "mamba.o_proj",
+            "mamba2.out_proj",
+            "mamba2.o_proj",
+            "ssm.out_proj",
+            "ssm.o_proj",
             "temporal_block.out_proj",
         ]
         for path in ssm_paths:
@@ -273,13 +305,20 @@ def discover_steerable_modules(layers):
                     print(f"      weight: {cmod.weight.shape}")
                 if "expert" in cname.lower() or "gate" in cname.lower():
                     for ename, emod in cmod.named_children():
-                        print(f"      {mlp_name}.{cname}.{ename}: {type(emod).__name__}")
+                        print(
+                            f"      {mlp_name}.{cname}.{ename}: {type(emod).__name__}"
+                        )
                         if hasattr(emod, "weight"):
                             print(f"        weight: {emod.weight.shape}")
 
         # Dense MLP down-projections
-        for path in ["mlp.down_proj", "feed_forward.down_proj", "ffn.down_proj",
-                      "mlp.w2", "feed_forward.w2"]:
+        for path in [
+            "mlp.down_proj",
+            "feed_forward.down_proj",
+            "ffn.down_proj",
+            "mlp.w2",
+            "feed_forward.w2",
+        ]:
             obj = layer
             for attr in path.split("."):
                 obj = getattr(obj, attr, None)
@@ -290,8 +329,10 @@ def discover_steerable_modules(layers):
 
         # Shared expert (MoE models with shared experts, e.g. Mistral4, DeepSeek)
         shared_paths = [
-            "mlp.shared_expert", "feed_forward.shared_expert",
-            "mlp.shared_experts", "feed_forward.shared_experts",
+            "mlp.shared_expert",
+            "feed_forward.shared_expert",
+            "mlp.shared_experts",
+            "feed_forward.shared_experts",
         ]
         for path in shared_paths:
             obj = layer
@@ -302,11 +343,14 @@ def discover_steerable_modules(layers):
             if obj is not None:
                 print(f"  [SHARED EXPERT] {path}: {type(obj).__name__}")
                 for cname, cmod in obj.named_children():
-                    w_info = f" shape={cmod.weight.shape}" if hasattr(cmod, "weight") else ""
+                    w_info = (
+                        f" shape={cmod.weight.shape}" if hasattr(cmod, "weight") else ""
+                    )
                     print(f"    {path}.{cname}: {type(cmod).__name__}{w_info}")
 
 
 # ── Step 5: Discover MoE router ────────────────────────────────────
+
 
 def discover_router(layers):
     print("\n" + "=" * 70)
@@ -318,8 +362,12 @@ def discover_router(layers):
         return
 
     router_paths = [
-        "mlp.gate", "moe.gate", "feed_forward.gate",
-        "block_sparse_moe.gate", "mlp.router", "moe.router",
+        "mlp.gate",
+        "moe.gate",
+        "feed_forward.gate",
+        "block_sparse_moe.gate",
+        "mlp.router",
+        "moe.router",
         "feed_forward.router",
     ]
 
@@ -340,7 +388,9 @@ def discover_router(layers):
                     w = obj.weight
                     print(f"    weight: shape={w.shape}, dtype={w.dtype}")
                     if w.dim() == 2:
-                        print(f"    -> num_experts={w.shape[0]}, hidden_dim={w.shape[1]}")
+                        print(
+                            f"    -> num_experts={w.shape[0]}, hidden_dim={w.shape[1]}"
+                        )
                 found_any = True
 
     if not found_any:
@@ -354,6 +404,7 @@ def discover_router(layers):
 
 
 # ── Step 6: Discover fused expert weights ───────────────────────────
+
 
 def discover_fused_weights(layers):
     print("\n" + "=" * 70)
@@ -369,8 +420,10 @@ def discover_fused_weights(layers):
     for name, param in layers[mid].named_parameters():
         if param.dim() == 3:
             print(f"  Layer {mid}, {name}: shape={param.shape}, dtype={param.dtype}")
-            print(f"    -> Likely fused experts: {param.shape[0]} experts, "
-                  f"out={param.shape[1]}, in={param.shape[2]}")
+            print(
+                f"    -> Likely fused experts: {param.shape[0]} experts, "
+                f"out={param.shape[1]}, in={param.shape[2]}"
+            )
             found = True
 
     if not found:
@@ -378,6 +431,7 @@ def discover_fused_weights(layers):
 
 
 # ── Step 7: Test hidden states ──────────────────────────────────────
+
 
 def test_hidden_states(model, model_id: str):
     from transformers import AutoTokenizer
@@ -397,12 +451,15 @@ def test_hidden_states(model, model_id: str):
             out = model(**inputs, output_hidden_states=True)
         hs = out.hidden_states
         print(f"  Count: {len(hs)}, dim={hs[0].shape[-1]}")
-        print(f"  All same hidden dim: {all(h.shape[-1] == hs[0].shape[-1] for h in hs)}")
+        print(
+            f"  All same hidden dim: {all(h.shape[-1] == hs[0].shape[-1] for h in hs)}"
+        )
     except Exception as e:
         print(f"  ERROR: {e}")
 
 
 # ── Step 8: Test chat template ──────────────────────────────────────
+
 
 def test_chat_template(model_id: str):
     from transformers import AutoTokenizer
@@ -415,14 +472,19 @@ def test_chat_template(model_id: str):
     msgs = [{"role": "user", "content": "Hi"}]
 
     try:
-        t = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        t = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
         print(f"  {repr(t[:200])}")
     except Exception as e:
         print(f"  Error: {e}")
 
     try:
         tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+            msgs,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
         )
         print("  enable_thinking=False: OK")
     except TypeError:
@@ -432,6 +494,7 @@ def test_chat_template(model_id: str):
 
 
 # ── Step 9: Quick generation test ───────────────────────────────────
+
 
 def test_generation(model, model_id: str):
     from transformers import AutoTokenizer
@@ -446,7 +509,9 @@ def test_generation(model, model_id: str):
 
     msgs = [{"role": "user", "content": "Hi"}]
     try:
-        text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        text = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
     except Exception:
         text = "Hi"
 
@@ -456,13 +521,16 @@ def test_generation(model, model_id: str):
     try:
         with torch.no_grad():
             out = model.generate(**inputs, max_new_tokens=30, do_sample=False)
-        resp = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        resp = tokenizer.decode(
+            out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
+        )
         print(f"  Response: {resp}")
     except Exception as e:
         print(f"  ERROR: {e}")
 
 
 # ── Step 10: VRAM report ────────────────────────────────────────────
+
 
 def report_vram():
     print("\n" + "=" * 70)
@@ -473,17 +541,26 @@ def report_vram():
         for i in range(torch.cuda.device_count()):
             alloc = torch.cuda.memory_allocated(i) / 1024**3
             total = torch.cuda.get_device_properties(i).total_mem / 1024**3
-            print(f"  GPU {i} ({torch.cuda.get_device_name(i)}): {alloc:.1f}/{total:.1f} GiB")
+            print(
+                f"  GPU {i} ({torch.cuda.get_device_name(i)}): {alloc:.1f}/{total:.1f} GiB"
+            )
     else:
         print("  No CUDA device available")
 
 
 # ── Main ────────────────────────────────────────────────────────────
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Discover model architecture for Abliterix")
+    parser = argparse.ArgumentParser(
+        description="Discover model architecture for Abliterix"
+    )
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
-    parser.add_argument("--skip-load", action="store_true", help="Only inspect config, skip model loading")
+    parser.add_argument(
+        "--skip-load",
+        action="store_true",
+        help="Only inspect config, skip model loading",
+    )
     args = parser.parse_args()
 
     model_id = args.model

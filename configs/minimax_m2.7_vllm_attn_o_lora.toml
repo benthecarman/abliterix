@@ -1,0 +1,182 @@
+# MiniMax-M2.7 (MoE) — vLLM TP=4 + attention LoRA on 4× RTX PRO 6000 96GB
+# 256 experts (8 routed), 62 layers, hidden=3072, expert_dim=1536
+# FP8 ~230GB weights, TP=4 → ~58GB/GPU, ~30GB headroom for KV cache + LoRA.
+#
+# Target hardware: 4× NVIDIA RTX PRO 6000 Blackwell (96GB GDDR7, sm_120,
+# PCIe Gen5 only, NO NVLink). vLLM ≥ 0.19 required.
+#
+# Steering mechanism:
+#   - attn.o_proj LoRA via vLLM hot-swap.
+#   - MoE router suppression via collective_rpc per trial.
+#   - MoE expert LoRA is disabled here. MiniMax-M2.7's full expert adapter
+#     contains ~47k module entries; on RTX PRO 6000 / vLLM 0.19.1 the first
+#     hot-loaded trial can stall in shared-memory broadcast before generation.
+#
+# Why LoRA not direct/EGA on this pod:
+#   - `steering_mode="direct"` on FP8 native clips projected weights to ±448
+#     (FP8 dynamic range) and destroys the signal — see fp8_native_support.md.
+#   - Materializing FP8→BF16 for direct mode would require ~460GB; 4× 96GB=384GB
+#     can't hold it. H200 141GB × 4 can (minimax_m2.7_h200_hf.toml is that path).
+#   - LoRA runs in BF16 on top of FP8 base, no clip issue, fits 4 cards.
+#
+# Phase 1 (Eagle3 hidden-state extraction) falls back to HF pipeline parallel
+# because vLLM 0.19.0's MiniMaxM2ForCausalLM lacks SupportsEagle3 mixin
+# (pitfall 1 in minimax_m27_deploy_lessons.md). Adds ~30 min, not a showstopper.
+#
+# TP must divide num_kv_heads=8. Valid: 1, 2, 4, 8. TP=4 is the sweet spot.
+#
+# Required env vars in deploy script (all FOUR or trials silently KL=0.0000):
+#   VLLM_WORKER_MULTIPROC_METHOD=spawn
+#   VLLM_ALLOW_INSECURE_SERIALIZATION=1
+#   VLLM_USE_FLASHINFER_MOE_FP16=0
+#   FLASHINFER_DISABLE_VERSION_CHECK=1
+# See memory: minimax_m27_env_var_fix.md, vllm_cudagraph_hook_weight_invisible.md.
+
+[model]
+model_id = "MiniMaxAI/MiniMax-M2.7"
+dtype_fallback_order = ["auto"]
+quant_method = "fp8"
+# MiniMax requires transformers 4.57.x. skip_fp8_dequant=true keeps the HF
+# Phase-1 load in native FP8 (forward-dequant kernels, 1× VRAM) — materializing
+# to BF16 would need 460GB which doesn't fit 4× 96GB.
+skip_fp8_dequant = true
+fp8_handling = "auto"                  # LoRA → forward_dequant auto-picked (1× VRAM)
+attn_implementation = "sdpa"
+# Blackwell sm_120: torch._grouped_mm is H100-only, falls back silently to
+# an abort on MoE load without this. See blackwell_grouped_mm_eager.md.
+use_torch_compile = false
+device_map = "auto"
+# trust_remote_code is required by HF AutoTokenizer & AutoConfig (MiniMax ships
+# custom tokenizer/config code). vLLM's model registry maps MiniMaxM2ForCausalLM
+# to its native class, so this flag does NOT cause MiniMax's modeling_*.py to be
+# loaded in vLLM.
+trust_remote_code = true
+# Phase 1 HF fallback uses device_map="auto" pipeline parallel; 90GiB/card caps
+# it at 360GB aggregate. FP8 forward-dequant needs ~230GB — comfortable fit.
+max_memory = {0 = "90GiB", 1 = "90GiB", 2 = "90GiB", 3 = "90GiB"}
+
+# ─── vLLM backend (both phases) ──────────────────────────────────────────────
+backend = "vllm"
+tensor_parallel_size = 4
+# RTX PRO 6000 has 96GB GDDR7. Model weights ~58GB/GPU, KV+LoRA+CUDA graphs need
+# ~12-15GB, leaving ~20GB slack. 0.92 is the safe ceiling — pushing 0.96 risks
+# OOM during the FP8→warmup phase on Blackwell.
+gpu_memory_utilization = 0.92
+disable_lora = false
+# Expert parallel DISABLED on purpose for RTX PRO 6000:
+#   • EP distributes 256 experts across GPUs (64 per rank) but requires an
+#     all-to-all token dispatch on every MoE layer.
+#   • All-to-all over PCIe Gen5 (no NVLink) has ~10× the latency of NVLink
+#     equivalents and serializes poorly.
+#   • With TP only, experts are column/row-sharded by the FusedMoE kernel.
+#     Each rank holds a 1/4 slice of every expert, dispatched via all-reduce
+#     instead of all-to-all. Memory cost is the same; comm pattern is cheaper.
+# On 4× H100 NVLink we'd flip this back to true.
+enable_expert_parallel = false
+# Chunked prefill overlaps prefill/decode for better GPU utilization.
+enable_chunked_prefill = true
+# enforce_eager=true is NON-NEGOTIABLE for abliterix MoE under vLLM:
+#   - CUDA graphs bake router.weight.data into the captured kernel; per-trial
+#     collective_rpc edits become invisible → KL=0.0000 / 100-out-of-100
+#     refusals on every trial (vllm_cudagraph_hook_weight_invisible.md).
+#   - LoRA hot-swap also hits dtype-assert shrink bugs under CUDA graph mode.
+# Cost: ~10-15% throughput vs graph mode. Non-negotiable.
+enforce_eager = true
+# FP8 KV cache: Blackwell has native FP8 tensor cores. Halves KV memory,
+# near-zero quality loss for refusal-detection-length generations.
+kv_cache_dtype = "fp8_e4m3"
+# CRITICAL: cap sequence length. Model supports 196K, but our prompts + gen are
+# < 2K. Default would reserve 196K KV per sequence, killing batch size.
+# 4096 → ~48× more KV cache slots → ~48× larger batches.
+max_model_len = 4096
+# Continuous batching ceiling. 128 is a conservative setting for PCIe TP=4 —
+# higher values amplify all-reduce overhead on each step. 400-prompt trials
+# finish in ≤4 scheduler waves at this cap.
+max_num_seqs = 128
+
+[inference]
+batch_size = 0
+# Abliterix auto-tuner ceiling. Matches max_num_seqs so the vLLM scheduler
+# can absorb the whole benign/target set in few waves.
+max_batch_size = 128
+# Refusal detection only needs ~30-50 tokens; cap at 64 to halve gen cost.
+max_gen_tokens = 64
+
+[steering]
+# Keep a small attention-only LoRA adapter active while the full MoE expert
+# LoRA hot-load stall is debugged separately.
+vector_method = "mean"
+n_directions = 1
+orthogonal_projection = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+discriminative_layer_selection = true
+decay_kernel = "linear"                # Qwen3.5/3.6 MoE winner
+# MiniMax is standard pre-norm — LoRA path, no row-norm preservation needed.
+weight_normalization = "none"
+# Q/K/V steering adds 12 search dimensions for near-zero improvement on MoE
+# (Gemma 4 E4B + Qwen3.6 MoE lesson). Refusal signal lives in expert path.
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "mlp.down_proj",
+]
+# Qwen3.6-35B-A3B 93% ASR winning range. LoRA adapter magnitudes, not weight
+# fractions, so the [0.5, 6.0] range is different from direct/EGA's [1, 10].
+strength_range = [0.5, 6.0]
+
+[steering.component_strength_ranges]
+# MoE expert w2 (= mlp.down_proj) carries per-expert refusal projection via
+# zero-companion LoRA (vllm_moe_expert_lora_zero_companion.md). Slightly
+# wider than attn.o_proj since expert count is 256× denser.
+"mlp.down_proj" = [1.0, 8.0]
+
+[optimization]
+num_trials = 50
+num_warmup_trials = 10
+checkpoint_dir = "checkpoints_minimax_m27_vllm_attn_o_lora"
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01                        # h100x8 LoRA-recipe target
+prune_threshold = 5.0                # looser prune; LoRA trials less cliffy than EGA
+
+[experts]
+ablation_weight_range = [0.0, 0.0]
+
+[detection]
+llm_judge = true
+llm_judge_model = "google/gemini-3.1-flash-lite-preview"
+llm_judge_batch_size = 10
+llm_judge_concurrency = 35
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+
+# Public datasets so the pod doesn't need a scp of `datasets/` (and we avoid
+# the M2.5 sed-patch dance on a fresh pod).
+[benign_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+
+[target_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:400]"
+column = "text"
+
+[benign_eval_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[400:500]"
+column = "text"
+
+[target_eval_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[400:500]"
+column = "text"

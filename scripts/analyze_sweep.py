@@ -292,9 +292,7 @@ def compute_hypervolume(results: dict) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Analyze Abliterix experiment results"
-    )
+    parser = argparse.ArgumentParser(description="Analyze Abliterix experiment results")
     parser.add_argument(
         "--input",
         default="experiments",

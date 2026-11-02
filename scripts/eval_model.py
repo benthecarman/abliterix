@@ -36,6 +36,15 @@ parser.add_argument(
     action="store_true",
     help="Allow custom tokenizer/model code from Hub repos",
 )
+parser.add_argument(
+    "--eval-set",
+    choices=["target", "benign", "both"],
+    default="target",
+    help=(
+        "Which held-out set to judge: target refusal prompts, benign "
+        "over-refusal prompts, or both"
+    ),
+)
 args = parser.parse_args()
 
 sys.argv = ["eval", "--model.model-id", args.model]
@@ -62,15 +71,47 @@ engine = SteeringEngine(config)
 detector = RefusalDetector(config)
 
 print("Initializing scorer...")
-scorer = TrialScorer(config, engine, detector)
-objectives, kl_divergence, refusals, length_deviation = scorer.score_trial(engine)
+scorer = TrialScorer(
+    config,
+    engine,
+    detector,
+    defer_baseline=args.eval_set == "benign",
+)
+
+objectives = None
+kl_divergence = None
+length_deviation = None
+target_refusals = None
+benign_refusals = None
+
+if args.eval_set in {"target", "both"}:
+    objectives, kl_divergence, target_refusals, length_deviation = scorer.score_trial(
+        engine
+    )
+
+if args.eval_set in {"benign", "both"}:
+    print("Counting benign over-refusals...")
+    benign_refusals = detector.evaluate_compliance(engine, scorer.benign_msgs)
 
 print()
 print("RESULTS")
 print(f"Model: {args.model}")
-print(f"Target eval prompts: {len(scorer.target_msgs)}")
-print(f"Refusals: {refusals}/{len(scorer.target_msgs)}")
-print(f"Refusal rate: {100.0 * refusals / len(scorer.target_msgs):.2f}%")
-print(f"KL divergence: {kl_divergence:.4f}")
-print(f"Length deviation: {length_deviation:.2f}")
-print(f"Objectives: {objectives}")
+if target_refusals is not None:
+    print(f"Target eval prompts: {len(scorer.target_msgs)}")
+    print(f"Target refusals: {target_refusals}/{len(scorer.target_msgs)}")
+    print(
+        f"Target refusal rate: {100.0 * target_refusals / len(scorer.target_msgs):.2f}%"
+    )
+if benign_refusals is not None:
+    print(f"Benign eval prompts: {len(scorer.benign_msgs)}")
+    print(f"Benign over-refusals: {benign_refusals}/{len(scorer.benign_msgs)}")
+    print(
+        f"Benign over-refusal rate: "
+        f"{100.0 * benign_refusals / len(scorer.benign_msgs):.2f}%"
+    )
+if kl_divergence is not None:
+    print(f"KL divergence: {kl_divergence:.4f}")
+if length_deviation is not None:
+    print(f"Length deviation: {length_deviation:.2f}")
+if objectives is not None:
+    print(f"Objectives: {objectives}")

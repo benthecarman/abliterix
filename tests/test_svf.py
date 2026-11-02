@@ -43,7 +43,8 @@ class TestTrainConceptScorers:
     def test_returns_dict_of_scorers(self, synthetic_states):
         benign, target = synthetic_states
         scorers = train_concept_scorers(
-            benign, target,
+            benign,
+            target,
             hidden_dim=64,
             n_epochs=20,
             lr=1e-2,
@@ -63,7 +64,8 @@ class TestTrainConceptScorers:
         """Trained scorers should score target (harmful) higher than benign."""
         benign, target = synthetic_states
         scorers = train_concept_scorers(
-            benign, target,
+            benign,
+            target,
             hidden_dim=64,
             n_epochs=30,
             lr=1e-2,
@@ -92,7 +94,8 @@ class TestTrainConceptScorers:
         n_layers = benign.shape[1] - 1  # Exclude embedding.
 
         scorers = train_concept_scorers(
-            benign, target,
+            benign,
+            target,
             hidden_dim=64,
             n_epochs=20,
             lr=1e-2,

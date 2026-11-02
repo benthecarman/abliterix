@@ -10,8 +10,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv sync --group dev --no-extra vllm
       - run: uv run ruff check src/
       - run: uv run ruff format --check src/
@@ -19,25 +19,27 @@ jobs:
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv sync --group dev --no-extra vllm
       - run: uv run ty check src/abliterix/
 
   test:
     runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     name: test (Python ${{ matrix.python-version }})
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv python install ${{ matrix.python-version }}
       - run: uv sync --group dev --no-extra vllm --python ${{ matrix.python-version }}
       - run: uv run pytest tests/ -x --cov=abliterix --cov-report=xml
       - uses: codecov/codecov-action@v5
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.13'
         with:
           files: coverage.xml
           fail_ci_if_error: false
@@ -45,6 +47,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv build
+      - run: test -n "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+      - run: test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+
+  reproducibility-e2e:
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.13
+      - run: uv sync --group dev --no-extra vllm --python 3.13
+      - run: uv run python tests/e2e/verify_tiny_reproduction.py

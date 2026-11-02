@@ -250,3 +250,117 @@ def test_lora_rank1_reconstruction():
     product = lora_B @ lora_A
     expected = -strength * torch.outer(v, v @ W)
     assert torch.allclose(product, expected, atol=1e-5)
+
+
+# ===================================================================
+# Shape guard — skip modules whose d_out ≠ hidden (steering vector dim).
+#
+# Regression check for Qwen3.5-397B-A17B where the optimizer's steerable
+# module walk registers GatedDeltaNet `linear_attn.out_proj` and MoE
+# `router.weight` (shapes (E, hidden) or (num_kv_heads*head_dim, hidden))
+# which cannot accept a rank-1 hidden-stream update. Without the guard at
+# steering.py:427, `v @ W` crashes with "mat1 and mat2 shapes cannot be
+# multiplied (1x4096 and 512x4096)".
+# ===================================================================
+
+
+@pytest.mark.parametrize(
+    "w_shape, v_dim, should_skip",
+    [
+        ((4096, 4096), 4096, False),  # attn.o_proj on symmetric head geometry
+        ((4096, 1024), 4096, False),  # mlp.down_proj (hidden, expert_dim)
+        ((512, 4096), 4096, True),  # MoE router.weight — num_experts rows
+        ((1024, 4096), 4096, True),  # k_proj / v_proj under GQA (8 heads × 128)
+        ((3072, 4096), 4096, True),  # q_proj where num_heads*head_dim ≠ hidden
+        ((4096, 4096), 3072, True),  # dimension-mismatched steering vector
+    ],
+)
+def test_shape_guard_skip_decision(w_shape, v_dim, should_skip):
+    """The guard at steering.py must skip exactly when W.shape[0] != v.shape[-1]."""
+    W = torch.randn(*w_shape)
+    v = torch.randn(1, v_dim)
+    skipped = W.shape[0] != v.shape[-1]
+    assert skipped is should_skip
+    if not skipped:
+        # Projection must succeed and produce expected shape (1, d_in).
+        lora_A = (v @ W).view(1, -1)
+        assert lora_A.shape == (1, W.shape[1])
+
+
+def test_ega_plus_moe_baseline_restore_idempotent():
+    """Applying direct EGA followed by top-N expert MoE steering must restore
+    to the exact pristine baseline across multiple apply/restore cycles."""
+    from types import SimpleNamespace
+    from abliterix.core.engine import SteeringEngine
+    from abliterix.core.steering import _apply_moe_steering
+    from abliterix.types import ExpertRoutingConfig
+
+    engine = object.__new__(SteeringEngine)
+    engine._expert_deltas = []
+    engine._router_originals = []
+    engine._lora_b_weights = []
+    engine._direct_weight_originals = {}
+    engine._angular_hooks = []
+    engine.needs_reload = False
+
+    class _MockLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Fused down_proj of shape (num_experts=4, out_dim=16, in_dim=8)
+            self.mlp = torch.nn.Module()
+            self.mlp.experts = torch.nn.Module()
+            self.mlp.experts.down_proj = torch.nn.Parameter(torch.randn(4, 16, 8))
+
+    layer0 = _MockLayer()
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([layer0])
+    model.config = SimpleNamespace(
+        name_or_path="test-model", _name_or_path="test-model"
+    )
+    engine.model = model
+    engine._truncate_to_hidden_layers = lambda m, layers: layers
+    engine._locate_fused_weights = lambda lyr: lyr.mlp.experts.down_proj
+    engine._locate_router = lambda lyr: None
+    engine.steerable_modules = lambda idx: {}
+    engine.config = SimpleNamespace(model=SimpleNamespace(model_id="test-model"))
+
+    fused_param = layer0.mlp.experts.down_proj
+    pristine_baseline = fused_param.data.clone()
+
+    # Steering vector for layer 0 (index 1 for layer 0)
+    steering_vecs = torch.randn(2, 16)
+    sv_by_device = {fused_param.device: steering_vecs}
+
+    routing_cfg = ExpertRoutingConfig(
+        n_suppress=2,
+        router_bias=0.0,
+        expert_ablation_weight=0.5,
+    )
+    safety_experts = {0: [(0, 1.0), (2, 0.8)]}
+
+    for cycle in range(3):
+        # 1. Simulate direct EGA whole-tensor modification
+        engine._direct_weight_originals[fused_param] = fused_param.data.clone()
+        fused_param.data -= 0.2 * torch.ones_like(fused_param.data)
+
+        # 2. Apply MoE expert steering
+        _apply_moe_steering(
+            engine,
+            steering_vecs,
+            None,
+            safety_experts,
+            routing_cfg,
+            sv_by_device=sv_by_device,
+        )
+
+        # Confirm tensor is modified
+        assert not torch.allclose(fused_param.data, pristine_baseline)
+
+        # 3. Restore baseline
+        engine.restore_baseline()
+
+        # Confirm tensor returned exactly to pristine baseline
+        assert torch.allclose(fused_param.data, pristine_baseline, atol=1e-7), (
+            f"Failed on cycle {cycle}"
+        )

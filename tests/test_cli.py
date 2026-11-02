@@ -41,7 +41,7 @@ def test_positional_model_id():
 
         # Replicate positional-arg inference from cli.run()
         if (
-            len(sys.argv) > 1
+            len(sys.argv) == 2
             and "--model.model-id" not in sys.argv
             and not sys.argv[-1].startswith("-")
         ):
@@ -55,6 +55,17 @@ def test_positional_model_id():
         sys.argv = old_argv
 
 
+def test_final_option_value_is_not_reinterpreted_as_model_id():
+    argv = ["test", "--config", "recipe.toml"]
+    if (
+        len(argv) == 2
+        and "--model.model-id" not in argv
+        and not argv[-1].startswith("-")
+    ):
+        argv.insert(-1, "--model.model-id")
+    assert argv == ["test", "--config", "recipe.toml"]
+
+
 # ---------------------------------------------------------------------------
 # TOML config loading
 # ---------------------------------------------------------------------------
@@ -65,12 +76,12 @@ def test_custom_toml_config():
     old_argv = sys.argv
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
-        f.write('[model]\n')
+        f.write("[model]\n")
         f.write('quant_method = "bnb_4bit"\n')
-        f.write('[optimization]\n')
-        f.write('num_trials = 42\n')
-        f.write('[kl]\n')
-        f.write('scale = 2.5\n')
+        f.write("[optimization]\n")
+        f.write("num_trials = 42\n")
+        f.write("[kl]\n")
+        f.write("scale = 2.5\n")
         toml_path = f.name
 
     try:
@@ -104,8 +115,8 @@ def test_cli_overrides_toml():
     old_argv = sys.argv
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
-        f.write('[optimization]\n')
-        f.write('num_trials = 100\n')
+        f.write("[optimization]\n")
+        f.write("num_trials = 100\n")
         toml_path = f.name
 
     try:
@@ -187,5 +198,9 @@ def test_configure_libraries_disables_grad():
     import torch
     from abliterix.cli import _configure_libraries
 
-    _configure_libraries()
-    assert not torch.is_grad_enabled()
+    was_grad_enabled = torch.is_grad_enabled()
+    try:
+        _configure_libraries()
+        assert not torch.is_grad_enabled()
+    finally:
+        torch.set_grad_enabled(was_grad_enabled)

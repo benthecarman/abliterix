@@ -24,6 +24,9 @@ class VectorMethod(str, Enum):
     OPTIMAL_TRANSPORT = "optimal_transport"
     COSMIC = "cosmic"
     SRA = "sra"
+    SOM = "som"
+    SAE = "sae"
+    RDO = "rdo"
 
 
 class DecayKernel(str, Enum):
@@ -48,9 +51,31 @@ class WeightNorm(str, Enum):
     FULL = "full"
 
 
+class DirectTransform(str, Enum):
+    """Direct-mode weight transformation variants.
+
+    Only consulted when ``steering_mode = "direct"``.  Mirrored from
+    :class:`abliterix.weight_transforms.DirectTransform` so the config
+    surface lives next to every other enum.  See that module for the math.
+    """
+
+    STANDARD = "standard"
+    ORBA = "orba"
+    BIPROJECTED = "biprojected"
+    HOUSEHOLDER = "householder"
+
+
 class PromptSource(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset identifier or local directory path."
+    )
+
+    revision: str | None = Field(
+        default=None,
+        description=(
+            "Hugging Face dataset revision. Reproducible runs resolve this to "
+            "an immutable 40-character commit SHA before loading."
+        ),
     )
 
     split: str = Field(description="Dataset split expression (e.g. 'train[:400]').")

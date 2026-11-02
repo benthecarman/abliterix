@@ -10,13 +10,9 @@
 
 [inference]
 # Generation contract from benchmarks/SPEC.md §2.
-# Both bounds are passed through to engine.generate_text_batched(),
-# which already plumbs min_new_tokens to model.generate().
+# Both bounds are passed through to engine.generate_text_batched().
 max_gen_tokens = 150
-# min_new_tokens has no field on InferenceConfig — the runner reads it
-# from this file directly via tomllib and passes it as a kwarg.
-# Documented here so the spec lives next to the value:
-#   min_gen_tokens = 100
+min_gen_tokens = 100
 batch_size = 0  # auto-tune
 
 [detection]

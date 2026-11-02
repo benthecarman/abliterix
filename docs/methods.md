@@ -4,6 +4,158 @@
 
 The full catalog of steering methods available in Abliterix — what each one does, when to use it, and the TOML knobs that control it.
 
+## SAE-Feature-Basis Steering *(new — interpretable feature basis)*
+
+The biggest methodological shift. Instead of picking a single direction in hidden space (mean-diff), uses a pre-trained Sparse Autoencoder to find the **interpretable features** that fire on harmful prompts but not benign ones, then maps those features back to hidden space via the SAE's decoder columns.
+
+Implements:
+* [Hong et al. (2025)](https://arxiv.org/abs/2509.09708) — *Beyond I'm Sorry, I Can't: Dissecting LLM Refusal*
+* [Soto et al. (2025)](https://arxiv.org/abs/2511.00029) — *Feature-Guided SAE Steering for Refusal-Rate Control*
+* [Templeton et al. (2025)](https://arxiv.org/abs/2505.23556) — *Understanding Refusal in LLMs with Sparse Autoencoders*
+
+```toml
+[steering]
+vector_method = "sae"
+sae_path = "/path/to/gemma-scope-layer-22.safetensors"
+sae_layer = 22       # 0-based transformer layer where the SAE was trained
+sae_top_k = 8        # number of refusal features to extract
+```
+
+**Workflow**: load SAE → encode benign / target residuals at `sae_layer` → score each feature by `|mean(target) − mean(benign)|` → take decoder columns of top-K features as refusal directions in hidden space. At non-SAE layers, falls back to mean-diff so the rest of the model still gets a coherent steering signal.
+
+**Loader**: auto-detects common SAE checkpoint formats (`W_enc` / `W_dec`, `encoder.weight` / `decoder.weight`, etc.) in `.pt` / `.safetensors`. Compatible with Gemma-Scope, Llama-Scope, sae_lens, and most custom checkpoints — see `src/abliterix/sae.py` for the supported key set.
+
+**Caveat**: SAE-mode is **layer-locked**. A single SAE only gives features at the layer it was trained on; non-SAE layers fall back to mean-diff automatically. Multi-layer coverage requires multiple SAEs (orchestration is a follow-up).
+
+## SOM Directions *(new — multi-direction non-orthogonal basis)*
+
+Implements [Piras et al., AAAI 2026 (arXiv:2511.08379)](https://arxiv.org/abs/2511.08379) — *SOM Directions Are Better Than One*. The standard `n_directions` mode forces orthogonality via Gram-Schmidt; SOM trains a small Kohonen grid on harmful representations and uses each node's centroid (minus the benign mean) as a candidate direction. The resulting directions are **correlated**, not orthogonal — capturing the low-dimensional manifold structure the paper identifies, with stronger refusal suppression than top-k SVD on the same n-direction budget.
+
+```toml
+[steering]
+vector_method = "som"
+som_grid_h = 3
+som_grid_w = 3      # 3x3 = 9 directions per layer
+som_n_iters = 500
+som_initial_lr = 0.5
+```
+
+Output shape `(n_dirs, layers+1, hidden_dim)` matches the existing multi-direction conventions, so all downstream LoRA / direct paths work without modification.
+
+## RDO — Gradient-Based Refusal Direction Optimization *(new — learned direction)*
+
+Every other `vector_method` derives the refusal direction from **activation statistics** of cached residuals (a mean difference, an SVD component, an OT map). RDO instead **learns** the direction by back-propagating through the frozen model, implementing [Wollschläger et al. (ICML 2025, arXiv:2502.17420)](https://arxiv.org/abs/2502.17420) — *The Geometry of Refusal in LLMs: Concept Cones and Representational Independence*.
+
+A single unit vector `r` in hidden space is the only trainable parameter, optimised by AdamW to minimise
+
+```
+L = λ_abl · CE( f_ablate(r)(p_harm),  t_answer  )    # answer harmful prompts after removing r
+  + λ_add · CE( f_add(α·r, l_add)(p_safe),  t_refusal )  # adding r induces refusal on benign
+  + λ_ret · KL( f_ablate(r)(p_safe) ‖ f(p_safe) )    # retain benign behaviour
+```
+
+where `f_ablate(r)` projects `r` out of the residual stream at **every** layer (`h ← h − (h·r̂)r̂`, the exact activation-space equivalent of abliterix's rank-1 direct edit) and `f_add` adds `α·r̂` at a single mid-late layer. The affirmative/refusal continuations (`t_answer` / `t_refusal`) are short fixed strings that make the cross-entropy differentiable without per-prompt labels.
+
+**Why it matters**: the paper reports the *same* refusal-removal efficacy as difference-in-means at markedly lower capability/KL cost (~40% less TruthfulQA degradation at matched ASR on Gemma-2-2B) — which is exactly the quantity abliterix's Optuna `(refusal_rate, KL)` Pareto co-minimises. RDO learns only the **direction**; abliterix's existing per-layer strength profile + Optuna search still pick the magnitude, so the two compose. The learned direction is broadcast to `(layers+1, hidden_dim)`, so all downstream LoRA / direct / projection paths work unchanged.
+
+```toml
+[steering]
+vector_method = "rdo"
+rdo_steps = 100            # AdamW steps (dominates RDO cost)
+rdo_lr = 0.01             # paper default
+rdo_init = "mean_diff"    # warm-start from difference-in-means ("random" = paper)
+rdo_lambda_ablation = 1.0
+rdo_lambda_addition = 0.2
+rdo_lambda_retain = 1.0
+rdo_add_layer_frac = 0.6  # depth of the addition-loss / warm-start layer
+rdo_max_prompts = 32      # subset used for training (keeps it fast vs the Optuna loop)
+```
+
+**Requires a loaded HF model with autograd** — the fast-extraction vLLM path cannot back-propagate, so RDO fails fast there. Incompatible with `n_directions > 1` (single direction; the multi-direction *representational-independence* extension is future work), `ablate_harmfulness_direction`, and `iterative.enabled`. The `rdo_*` weights are exposed so the Optuna loop can tune them as extra search dimensions.
+
+## ORBA & Biprojected Direct-Mode Transforms *(new)*
+
+Two direct-mode weight transforms ported from [grimjim](https://huggingface.co/blog/grimjim/orthogonal-reflection-bounded-ablation), which has been topping the UGI / NatInt abliteration leaderboards with these variants.
+
+**ORBA** — *Orthogonal Reflection Bounded Ablation*. Applies double Gram-Schmidt orthogonalisation of the refusal direction against the benign-mean direction (the "twice is enough" numerical stability pass) before the standard rank-1 ablation, optionally with row-Frobenius-norm preservation as a post-step.
+
+**Biprojected** — *Norm-Preserving Biprojected Abliteration*. Decomposes `W = M · Ŵ` into per-row magnitudes and per-row unit directions, ablates only on `Ŵ`, re-normalises each row to unit length, then recombines `W_new = M · Ŵ_new`. Row L2 norm is **exactly** preserved (vs. the historical path's approximate post-step rescale).
+
+**Householder** — Exact isometric reflection `W ← W − 2(W·û)⊗û`. Included for completeness; grimjim reports token-level glitches at full strength, so it's opt-in only and not part of the auto search.
+
+```toml
+[steering]
+steering_mode = "direct"
+direct_transform = "orba"                    # standard / orba / biprojected / householder
+direct_transform_preserve_row_norm = true    # ORBA post-step row-norm clamp
+```
+
+The standard transform remains the default; opt in to ORBA / biprojected only when you want UGI-leaderboard-style row-norm fidelity.
+
+## SAFEx Stability-Based MoE Expert Identification *(new)*
+
+[Yi et al., 2025 (arXiv:2506.17368)](https://arxiv.org/abs/2506.17368) — *SAFEx: Identifying Safety-Critical Experts*. The historical abliterix profiler scores experts by `mean(target_rate) − mean(benign_rate)` which picks up experts that fire *on average* more for harmful prompts but doesn't distinguish *stable* safety experts (fire on ~every harmful prompt) from sporadic ones. SAFEx adds a variance penalty:
+
+```
+score(e) = (μ_target − μ_benign) − λ · σ_target
+```
+
+where `σ_target` is the per-prompt activation-rate standard deviation across harmful prompts. Stable experts (high mean, low variance) win; sporadic experts are demoted. The paper reports ~12 stable experts → 22 % refusal drop.
+
+```toml
+[experts]
+profiling_method = "safex"          # 'standard' (default) or 'safex'
+safex_variance_penalty = 1.0        # λ; higher = harder on noisy experts
+```
+
+Opt-in (default = `standard`). Returns the same `{layer: [(expert, score), ...]}` shape so the downstream EGA / router-suppression code stays unchanged.
+
+## Cliff-Head Ablation *(new — reasoning models)*
+
+Inverts the safety-head finding from [Bao et al. (2025)](https://arxiv.org/abs/2510.06036) — *Refusal Falls Off a Cliff: How Safety Alignment Fails in Reasoning Models*. In reasoning models (R1, o-style, Qwen3-Thinking, Kimi-Thinking) refusal intent stays strong during the `<think>` trace but **collapses** at the final answer tokens — and a sparse ~3 % of attention heads carry this signal. The paper ablates *anti*-refusal heads to recover safety; abliterix ablates the *pro*-refusal heads to remove it.
+
+**Mechanism.** For each `(layer, head)`, score the alignment of the head's `o_proj` output sub-space against the per-layer refusal direction. The top fraction is then ablated by scaling those `o_proj` columns toward zero. Reversible via the engine's `_cliff_head_originals` cache.
+
+```toml
+[steering]
+cliff_head_ablation = true       # default off
+cliff_head_top_k_frac = 0.03     # 3% of all (layer, head) pairs
+cliff_head_strength = 1.0        # 1.0 = full ablation, 0.5 = halve, 0.0 = no-op
+```
+
+**Evidence scope.** This is an experimental weight-alignment heuristic, not a
+validated recommendation for every reasoning model. The current
+[maturity assessment](method_maturity.md) records a non-reasoning Qwen2.5 control
+and still requires reasoning-model evaluation. It is skipped when the HF model
+is not loaded (fast-extraction vLLM path).
+
+**Sparse-gate research ([issue #15](https://github.com/wuwangzhang1216/abliterix/issues/15)).**
+This implementation is distinct from Frank's
+[policy-routing circuit study](https://arxiv.org/abs/2604.04385v6).
+It does not perform activation interchange or causal gate-to-amplifier tests,
+so its head scores do not establish causal gate identity. The paper also
+distinguishes an upstream gate from the distributed circuitry that follows it.
+Neither the paper nor this heuristic establishes lower capability damage for
+Abliterix across model families or quantization levels; that requires independent,
+matched evaluations and reproducible result artifacts.
+
+## Harmfulness ⊥ Refusal Joint Ablation *(new)*
+
+Two-direction decomposition based on [Zhao et al. (2025)](https://arxiv.org/abs/2507.11878) — *LLMs Encode Harmfulness and Refusal Separately*. The standard mean-diff direction conflates **two** circuits: a *refusal* direction (controls whether the model voices a refusal) and a *harmfulness* direction (controls the internal "this is harmful" judgment). Ablating only refusal often leaves hedging behaviour ("I will help you with this even though it is harmful…") because the harmfulness signal is still active.
+
+This flag extracts both directions and ablates them jointly:
+
+* `refusal` = standard mean-diff (`mean(target) - mean(benign)`), per layer.
+* `harmfulness` = PCA-1 of centred target activations in a mid-layer band (where the internal judgment crystallises), then orthogonalised against the refusal direction at each layer.
+
+```toml
+[steering]
+ablate_harmfulness_direction = true
+harmfulness_layer_band = [0.3, 0.7]   # Mid-layer band per Zhao et al.
+```
+
+**Compatibility**: opt-in, default off. Incompatible with `n_directions > 1`, `vector_method = "sra"`, `"cosmic"`, `"optimal_transport"` (those build their own multi-vector bases), and `iterative.enabled = true`. Reuses the existing multi-direction stacking infrastructure — `vectors.shape = (2, layers+1, hidden_dim)`.
+
 ## Surgical Refusal Ablation (SRA) *(new)*
 
 Concept-guided spectral cleaning based on [Cristofano (2026)](https://arxiv.org/abs/2601.08489). The raw refusal vector is **polysemantic** — it entangles the refusal signal with syntax, formatting, and capability circuits (math, code, reasoning). SRA builds a registry of *Concept Atoms* from benign activations and uses ridge-regularized spectral residualization to orthogonalize the refusal vector against these protected directions.
@@ -115,11 +267,28 @@ llm_judge_model = "google/gemini-3.1-flash-lite-preview"
 
 | Section | Option | Values | Description |
 |---------|--------|--------|-------------|
-| `[steering]` | `vector_method` | `mean`, `median_of_means`, `pca`, `optimal_transport`, `cosmic`, `sra` | How to compute steering vectors |
+| `[steering]` | `vector_method` | `mean`, `median_of_means`, `pca`, `optimal_transport`, `cosmic`, `sra`, `som`, `sae`, `rdo` | How to compute steering vectors |
+| `[steering]` | `rdo_steps` / `rdo_lr` | int / float | RDO AdamW steps and learning rate (`vector_method = 'rdo'`) |
+| `[steering]` | `rdo_lambda_ablation` / `rdo_lambda_addition` / `rdo_lambda_retain` | float | RDO loss weights (paper: 1.0 / 0.2 / 1.0) |
+| `[steering]` | `rdo_init` | `mean_diff` / `random` | RDO direction initialisation (warm-start vs paper's random) |
+| `[steering]` | `rdo_add_layer_frac` / `rdo_add_scale` | 0–1 / float | RDO addition-loss layer depth and scale α |
+| `[steering]` | `rdo_max_prompts` / `rdo_batch_size` | int | RDO training subset size and per-step batch |
+| `[steering]` | `som_grid_h` / `som_grid_w` | int | SOM grid shape (default 3×3 = 9 directions) |
+| `[steering]` | `som_n_iters` | int | Kohonen training iterations per layer |
+| `[steering]` | `sae_path` | str | Path to pre-trained SAE checkpoint (required when `vector_method = "sae"`) |
+| `[steering]` | `sae_layer` | int | Transformer layer the SAE was trained on |
+| `[steering]` | `sae_top_k` | int | Number of refusal features to use as directions |
 | `[steering]` | `steering_mode` | `lora`, `direct`, `angular`, `adaptive_angular`, `spherical`, `vector_field` | Steering application strategy (`direct` for double-norm architectures like Gemma 4) |
 | `[steering]` | `projected_abliteration` | true/false | Improved projection preserving helpfulness |
 | `[steering]` | `discriminative_layer_selection` | true/false | Only steer discriminative layers |
 | `[steering]` | `n_directions` | 1–k | Multi-direction refusal removal |
+| `[steering]` | `ablate_harmfulness_direction` | true/false | Joint ablation of refusal + harmfulness directions (Zhao et al. 2025) |
+| `[steering]` | `harmfulness_layer_band` | `[lo, hi]` (0–1) | Mid-layer band where the harmfulness signal is strongest |
+| `[steering]` | `cliff_head_ablation` | true/false | Surgical o_proj head ablation for reasoning models (Bao et al. 2025) |
+| `[steering]` | `cliff_head_top_k_frac` | 0.0–1.0 | Fraction of (layer, head) pairs to ablate (default 3%) |
+| `[steering]` | `cliff_head_strength` | 0.0–1.0 | Multiplicative ablation strength (1.0 = full zero) |
+| `[steering]` | `direct_transform` | `standard` / `orba` / `biprojected` / `householder` | Direct-mode weight-space transform variant |
+| `[steering]` | `direct_transform_preserve_row_norm` | true/false | Enforce row-Frobenius-norm preservation for ORBA |
 | `[steering]` | `sra_base_method` | `mean`, `pca`, etc. | Base method for SRA initial direction |
 | `[steering]` | `sra_n_atoms` | 1–16 | Number of concept atoms for SRA |
 | `[steering]` | `sra_ridge_alpha` | 0.001–1.0 | Ridge regularization for SRA |

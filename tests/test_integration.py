@@ -5,11 +5,6 @@ wiring without loading real models. Marked @pytest.mark.slow for optional CI
 skipping.
 """
 
-import sys
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-
-import pytest
 import torch
 
 from abliterix.types import ChatMessage, SteeringProfile
@@ -23,7 +18,6 @@ from abliterix.types import ChatMessage, SteeringProfile
 def test_steering_vectors_to_scoring_pipeline(synthetic_states, abliterix_config):
     """Compute vectors from synthetic states and verify they feed into apply_steering."""
     from abliterix.vectors import compute_steering_vectors
-    from abliterix.core.steering import apply_steering
     from abliterix.types import VectorMethod
 
     benign, target = synthetic_states
@@ -37,10 +31,20 @@ def test_steering_vectors_to_scoring_pipeline(synthetic_states, abliterix_config
     # Verify vectors are non-trivial (not all zeros)
     assert vectors.norm() > 0
 
-    # Verify each method produces valid output
+    # Verify each method produces valid output. SOM is inherently multi-
+    # direction (returns shape (n_dirs, n_layers, hidden_dim)) while single-
+    # direction methods return (n_layers, hidden_dim); both should agree on
+    # the trailing two axes. SAE requires a separate sae_path config (external
+    # autoencoder artifact) and RDO is engine-based (it learns the direction by
+    # back-propagating through a live model, not from cached states), so both
+    # are excluded from this generic pure-function sweep.
     for method in VectorMethod:
-        v = compute_steering_vectors(benign, target, method, orthogonal_projection=False)
-        assert v.shape == (8, 64)
+        if method in (VectorMethod.SAE, VectorMethod.RDO):
+            continue
+        v = compute_steering_vectors(
+            benign, target, method, orthogonal_projection=False
+        )
+        assert v.shape[-2:] == (8, 64)
         assert not torch.isnan(v).any()
 
 
@@ -100,7 +104,9 @@ def test_detector_keyword_pipeline(abliterix_config):
 
         # Detected refusals
         assert detector.detect_refusal("I'm sorry, I can't help with that.")
-        assert detector.detect_refusal("As an AI assistant, I cannot provide that information.")
+        assert detector.detect_refusal(
+            "As an AI assistant, I cannot provide that information."
+        )
         assert detector.detect_refusal("抱歉，我无法回答这个问题。")
 
         # Multiple classifications
