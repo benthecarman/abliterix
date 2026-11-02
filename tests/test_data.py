@@ -69,3 +69,41 @@ def test_model_card_refusal_counts(mock_trial, abliterix_config):
     # trial_refusals = 3, baseline = 10, len(target) = 10
     assert "3/10" in card
     assert "10/10" in card
+
+
+def test_model_card_method_settings_fall_back_for_legacy_trials(
+    mock_trial, abliterix_config
+):
+    from abliterix.types import VectorMethod
+
+    abliterix_config.steering.vector_method = VectorMethod.SRA
+    card = generate_model_card(abliterix_config, mock_trial, 1, [])
+
+    assert "| **steering.vector_method** | sra |" in card
+    assert "| **steering.steering_mode** | lora |" in card
+    assert "| **steering.n_directions** | 1 |" in card
+    assert "| **steering.weight_normalization** | full |" in card
+    assert "active export configuration" in card
+
+
+def test_model_card_prefers_selected_trial_recipe_over_current_settings(
+    mock_trial, abliterix_config
+):
+    mock_trial.user_attrs["steering_recipe"] = {
+        "schema_version": 1,
+        "steering": {
+            "vector_method": "pca",
+            "steering_mode": "direct",
+            "n_directions": 2,
+            "weight_normalization": "none",
+        },
+    }
+    before = abliterix_config.steering.model_dump()
+
+    card = generate_model_card(abliterix_config, mock_trial, 1, [])
+
+    assert "| **steering.vector_method** | pca |" in card
+    assert "| **steering.steering_mode** | direct |" in card
+    assert "| **steering.n_directions** | 2 |" in card
+    assert "| **steering.weight_normalization** | none |" in card
+    assert abliterix_config.steering.model_dump() == before

@@ -19,15 +19,16 @@ exclude-newer = "2026-06-19T00:00:00Z"
 
 [[package]]
 name = "abliterix"
-version = "1.8.0"
+version = "1.12.2"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
-    { name = "bitsandbytes" },
+    { name = "bitsandbytes", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
     { name = "datasets" },
     { name = "hf-transfer" },
     { name = "huggingface-hub" },
     { name = "kernels" },
+    { name = "openai" },
     { name = "optuna" },
     { name = "peft" },
     { name = "psutil" },
@@ -70,7 +71,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = "~=1.10" },
-    { name = "bitsandbytes", specifier = "~=0.45" },
+    { name = "bitsandbytes", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'", specifier = "~=0.45" },
     { name = "datasets", specifier = "~=4.0" },
     { name = "geom-median", marker = "extra == 'research'", specifier = "~=0.1" },
     { name = "gradio", marker = "extra == 'ui'", specifier = "~=5.20" },
@@ -81,6 +82,7 @@ requires-dist = [
     { name = "lm-eval", marker = "extra == 'bench'", specifier = ">=0.4.5" },
     { name = "matplotlib", marker = "extra == 'research'", specifier = "~=3.10" },
     { name = "numpy", marker = "extra == 'research'", specifier = "~=2.2" },
+    { name = "openai", specifier = ">=2,<3" },
     { name = "optuna", specifier = "~=4.5" },
     { name = "pacmap", marker = "extra == 'research'", specifier = "~=0.8" },
     { name = "peft", specifier = "~=0.18" },

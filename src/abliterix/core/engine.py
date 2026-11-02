@@ -5,8 +5,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import json
+import inspect
 import os
-import sys
 from collections import defaultdict
 from contextlib import suppress
 from typing import Any, Type, cast
@@ -35,9 +35,11 @@ from transformers.generation import (
 )
 
 from ..settings import AbliterixConfig
-from ..types import ChatMessage, QuantMode, SteeringMode, WeightNorm
+from ..types import ChatMessage, QuantMode, SteeringMode, VectorMethod, WeightNorm
 from ..util import chunk_batches, flush_memory, print
+from .bnb_utils import is_bnb_int8_weight, validate_bnb_int8_weight
 from . import fp8_utils
+from .quantization_validation import validate_quantization_state
 
 # transformers < 5.0 uses torch_dtype=, >= 5.0 uses dtype= in from_pretrained.
 import transformers as _tf
@@ -45,8 +47,101 @@ import transformers as _tf
 _dtype_kwarg = "dtype" if int(_tf.__version__.split(".")[0]) >= 5 else "torch_dtype"
 
 
+def extract_router_expert_ids(out: Any, top_k: int = 8) -> Tensor:
+    """Return the top-k expert-id tensor from a MoE router forward.
+
+    Router tuple order is family-specific. Bailing MoE v3 returns
+    ``(topk_idx, topk_weight, logits)`` — indices first — while several
+    other families put indices last. Prefer the first integer tensor
+    instead of a fixed ``out[2]`` slot.
+    """
+    if isinstance(out, tuple) and len(out) >= 3:
+        for cand in out:
+            if isinstance(cand, Tensor) and cand.dtype in (torch.int32, torch.int64):
+                return cand
+        return out[0] if isinstance(out[0], Tensor) else out[1]
+    if isinstance(out, tuple) and len(out) == 2:
+        return out[1]
+    logits = out if not isinstance(out, tuple) else out[0]
+    _, selected = logits.topk(top_k, dim=-1)
+    return selected
+
+
+# Models registered here have a known remote-config mismatch where MTP heads
+# are appended to ``layer_types`` even though ``num_hidden_layers`` describes
+# decoder layers only.  The registry is populated from the model's own
+# config.json before its remote configuration class is instantiated.
+_MTP_LAYER_TYPE_ADAPTERS: dict[str, tuple[int, int]] = {}
+
+
+def _model_config_name(config: PretrainedConfig) -> str:
+    """Return the loader identity attached to a Transformers config."""
+    return str(
+        getattr(config, "_name_or_path", "") or getattr(config, "name_or_path", "")
+    ).rstrip("/")
+
+
+def _adapt_registered_mtp_layer_types(config: PretrainedConfig) -> bool:
+    """Apply a registered MTP layer mapping to one in-memory config.
+
+    The exact model identity and both observed lengths must match the
+    preflighted config.json.  This prevents the compatibility adapter from
+    hiding unrelated or newly changed model configuration errors.
+    """
+    spec = _MTP_LAYER_TYPE_ADAPTERS.get(_model_config_name(config))
+    if spec is None:
+        return False
+
+    expected_total, expected_hidden = spec
+    layer_types = getattr(config, "layer_types", None)
+    n_hidden = getattr(config, "num_hidden_layers", None)
+    if (
+        not isinstance(layer_types, list)
+        or len(layer_types) != expected_total
+        or n_hidden != expected_hidden
+    ):
+        return False
+
+    config.layer_types = layer_types[:expected_hidden]
+    return True
+
+
+def _install_mtp_layer_type_validator() -> None:
+    """Install the process-local adapter ahead of Transformers validation."""
+    validators = list(PretrainedConfig.__class_validators__)  # ty:ignore[unresolved-attribute]
+    if any(
+        getattr(validator, "_abliterix_mtp_adapter", False) for validator in validators
+    ):
+        return
+
+    for index, validator in enumerate(validators):
+        if getattr(validator, "__name__", "") != "validate_layer_type":
+            continue
+
+        def validate_layer_type(config, _original=validator):
+            _adapt_registered_mtp_layer_types(config)
+            _original(config)
+
+        validate_layer_type._abliterix_mtp_adapter = True  # type: ignore[attr-defined]
+        validators[index] = validate_layer_type
+        PretrainedConfig.__class_validators__ = validators  # ty:ignore[unresolved-attribute]
+        return
+
+
+_install_mtp_layer_type_validator()
+
+
+# Cap the dequantised-weight cache so large MoE expert counts cannot retain
+# hundreds of GB of fp32 copies in RAM.  Shared by SteeringEngine.__init__ and
+# the fast vLLM engine shell in cli.py so the two cannot drift apart.
+DEQUANT_CACHE_MAX_BYTES = 4 * 1024**3  # 4 GiB
+
+
 def resolve_model_class(
     model_id: str,
+    revision: str | None = None,
+    *,
+    text_only: bool = False,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
     """Choose the correct AutoModel class based on the model's configuration.
 
@@ -54,28 +149,58 @@ def resolve_model_class(
     ``AutoModelForImageTextToText``; their text backbone is accessed via the
     ``model.language_model`` path in ``transformer_layers``.  Pure text models
     use ``AutoModelForCausalLM``.
+
+    When *text_only* is true, always return ``AutoModelForCausalLM`` even if
+    the checkpoint advertises multimodal fields (opt-in for text abliteration
+    of dual-registered MoE VLMs such as some Qwen3.5-MoE checkpoints).
     """
-    configs = PretrainedConfig.get_config_dict(model_id)
-    if any("vision_config" in cfg for cfg in configs):
+    configs = PretrainedConfig.get_config_dict(model_id, revision=revision)
+    if text_only:
+        return AutoModelForCausalLM
+
+    config_dicts = configs if isinstance(configs, tuple) else (configs,)
+
+    if any(isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
 
 
-def _patch_mtp_layer_types(model_id: str, trust_remote_code: bool | None) -> None:
-    """Patch models whose ``layer_types`` includes MTP head layers.
+def _bf16_compute_supported() -> bool:
+    """True when the active accelerator has native (non-emulated) bf16.
+
+    ``torch.cuda.is_bf16_supported()`` defaults to including software
+    emulation, so pre-Ampere CUDA cards still return True. We only treat
+    ROCm and sm_80+ as native bf16 so older CUDA targets can fall back to
+    float16 for both bnb compute dtype and residual promotion.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.hip:  # ROCm: native on supported archs
+        return True
+    return torch.cuda.get_device_capability()[0] >= 8
+
+
+def _register_mtp_layer_types_adapter(
+    model_id: str,
+    trust_remote_code: bool | None,
+    revision: str | None = None,
+) -> None:
+    """Register models whose ``layer_types`` includes MTP head layers.
 
     Models like Step-3.5-Flash define ``layer_types`` with 48 entries (45
     decoder + 3 MTP) but ``num_hidden_layers=45``.  Transformers >= 5.5
     validates that ``len(layer_types) == num_hidden_layers``, causing a
     ``ValueError``.
 
-    We patch the cached remote config module source file to truncate
-    ``layer_types`` before the parent ``__init__`` validator runs.
+    The compatibility adjustment is performed on the in-memory config just
+    before the parent validator runs.  No files in the Hugging Face cache are
+    modified.
     """
     try:
         cfgs = PretrainedConfig.get_config_dict(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
         cfg_dict = cfgs[0] if isinstance(cfgs, tuple) else cfgs
         layer_types = cfg_dict.get("layer_types")
@@ -83,42 +208,14 @@ def _patch_mtp_layer_types(model_id: str, trust_remote_code: bool | None) -> Non
         if not (layer_types and n_hidden and len(layer_types) > n_hidden):
             return
 
-        # Find the cached configuration_*.py file for this model and patch it
-        # to truncate layer_types before super().__init__().
-        from pathlib import Path
-
-        cache_dir = (
-            Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-            / "modules"
-            / "transformers_modules"
+        _MTP_LAYER_TYPE_ADAPTERS[model_id.rstrip("/")] = (
+            len(layer_types),
+            n_hidden,
         )
-
-        # Search for configuration files matching this model.
-        for config_py in cache_dir.rglob("configuration_*.py"):
-            if model_id.split("/")[-1].lower().replace("-", "_").replace(
-                ".", "_"
-            ) not in str(config_py).lower().replace("-", "_").replace(".", "_"):
-                continue
-            text = config_py.read_text()
-            marker = "self.layer_types = layer_types"
-            patch = (
-                "# Truncate MTP head layers (transformers >= 5.5 validation fix)\n"
-                "        if layer_types is not None and len(layer_types) > num_hidden_layers:\n"
-                "            layer_types = layer_types[:num_hidden_layers]\n"
-                "        self.layer_types = layer_types"
-            )
-            if marker in text and "Truncate MTP" not in text:
-                text = text.replace(marker, patch)
-                config_py.write_text(text)
-                # Invalidate any cached import of this module.
-                for mod_name in list(sys.modules):
-                    if "configuration_step3p5" in mod_name:
-                        del sys.modules[mod_name]
-                print(
-                    f"  [dim]Patched {config_py.name}: "
-                    f"truncating {len(layer_types)} layer_types → {n_hidden}[/]"
-                )
-                return
+        print(
+            "  [dim]Enabled process-local MTP config adapter: "
+            f"truncating {len(layer_types)} layer_types → {n_hidden}[/]"
+        )
     except Exception:
         pass
 
@@ -126,11 +223,13 @@ def _patch_mtp_layer_types(model_id: str, trust_remote_code: bool | None) -> Non
 def load_tokenizer(
     model_id: str,
     trust_remote_code: bool | None = None,
+    revision: str | None = None,
 ) -> PreTrainedTokenizerBase:
     try:
         return AutoTokenizer.from_pretrained(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
     except AttributeError as exc:
         if "'list' object has no attribute 'keys'" not in str(exc):
@@ -139,14 +238,15 @@ def load_tokenizer(
         return AutoTokenizer.from_pretrained(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
             extra_special_tokens={},
         )
     except ValueError as exc:
         if "TokenizersBackend" not in str(exc):
             raise
 
-        cfg_path = hf_hub_download(model_id, "tokenizer_config.json")
-        tok_path = hf_hub_download(model_id, "tokenizer.json")
+        cfg_path = hf_hub_download(model_id, "tokenizer_config.json", revision=revision)
+        tok_path = hf_hub_download(model_id, "tokenizer.json", revision=revision)
         with open(cfg_path, encoding="utf-8") as f:
             cfg = json.load(f)
 
@@ -181,6 +281,127 @@ class _LogitsSampler(LogitsProcessor):
         return scores
 
 
+class _ForcedContinuationProcessor(LogitsProcessor):
+    """Force a known continuation while preserving earlier captured logits."""
+
+    def __init__(self, token_ids: list[list[int]]):
+        self.token_ids = token_ids
+        self.step = 0
+
+    def __call__(self, input_ids: LongTensor, scores: FloatTensor) -> FloatTensor:
+        if self.step >= len(self.token_ids[0]):
+            raise RuntimeError("Forced continuation received too many decode steps")
+        if scores.shape[0] != len(self.token_ids):
+            raise RuntimeError(
+                "Forced continuation batch changed during generation: "
+                f"expected {len(self.token_ids)}, got {scores.shape[0]}"
+            )
+
+        next_ids = torch.tensor(
+            [row[self.step] for row in self.token_ids],
+            dtype=torch.long,
+            device=scores.device,
+        ).unsqueeze(1)
+        forced = torch.full_like(scores, float("-inf"))
+        forced.scatter_(1, next_ids, 0.0)
+        self.step += 1
+        return forced
+
+
+def _captured_logprobs(sampler: _LogitsSampler, expected_steps: int) -> Tensor:
+    """Return normalized captured scores without collapsing the token axis.
+
+    A single-token measurement retains the historical ``(batch, vocab)``
+    shape.  Multi-token measurements use ``(batch, step, vocab)`` so the
+    scorer can average per-step KL divergences instead of treating an
+    arithmetic mean of log-probabilities as a distribution.
+    """
+    if len(sampler.scores) != expected_steps:
+        raise RuntimeError(
+            "Generation ended before all KL score steps were captured: "
+            f"expected {expected_steps}, got {len(sampler.scores)}"
+        )
+
+    stacked = torch.stack(
+        # A full-vocabulary log-softmax in BF16 loses enough tail precision to
+        # materially distort small KL values (and made the one-token HF result
+        # disagree with vLLM while later FP32 steps agreed).  Keep model logits
+        # in their native dtype, but normalise the captured metric in FP32.
+        [F.log_softmax(scores.float(), dim=-1) for scores in sampler.scores],
+        dim=1,
+    )
+    if expected_steps == 1:
+        return stacked[:, 0, :]
+    return stacked
+
+
+def _forward_supports_kwarg(model: Module, name: str) -> bool:
+    """Return whether the underlying model explicitly accepts a keyword.
+
+    PEFT and ``torch.compile`` expose generic ``**kwargs`` forward signatures,
+    so inspect their wrapped base model instead.  A generic ``**kwargs`` alone
+    is deliberately not treated as support: older and remote-code models may
+    reject or mishandle an unknown keyword deeper in their forward path.
+    """
+    current: Any = model
+    seen: set[int] = set()
+
+    while id(current) not in seen:
+        seen.add(id(current))
+
+        original = getattr(current, "_orig_mod", None)
+        if original is not None and original is not current:
+            current = original
+            continue
+
+        get_base_model = getattr(current, "get_base_model", None)
+        if callable(get_base_model):
+            try:
+                base = get_base_model()
+            except Exception:
+                base = None
+            if base is not None and base is not current:
+                current = base
+                continue
+        break
+
+    try:
+        parameter = inspect.signature(current.forward).parameters.get(name)
+        return parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _forward_supports_logits_to_keep(model: Module) -> bool:
+    return _forward_supports_kwarg(model, "logits_to_keep")
+
+
+def _required_lora_rank(config: AbliterixConfig) -> int:
+    """Return the adapter rank required by every configured vector recipe."""
+    steering = config.steering
+    if steering.steering_mode != SteeringMode.LORA:
+        return 1
+
+    required = max(1, steering.n_directions)
+    if steering.ablate_harmfulness_direction or steering.search_harmfulness_direction:
+        required = max(required, 2)
+    if steering.vector_method == VectorMethod.SOM:
+        required = max(required, steering.som_grid_h * steering.som_grid_w)
+    if steering.vector_method == VectorMethod.SAE:
+        required = max(required, steering.sae_top_k)
+    if config.iterative.enabled:
+        iterative_rank = (
+            config.iterative.max_iterations * config.iterative.per_iteration_directions
+        )
+        required = max(required, iterative_rank)
+    if steering.weight_normalization == WeightNorm.FULL:
+        required = max(required, steering.full_norm_lora_rank)
+    return required
+
+
 class SteeringEngine:
     """Manages model loading, tokenisation, generation, and LoRA adapters.
 
@@ -198,6 +419,10 @@ class SteeringEngine:
         self.response_prefix = ""
         self.needs_reload = False
         self._dequant_cache: dict[int, Tensor] = {}
+        self._dequant_cache_bytes: int = 0
+        # Cap dequant cache so large MoE expert counts cannot retain
+        # hundreds of GB of fp32 weights in RAM.
+        self._dequant_cache_max_bytes: int = DEQUANT_CACHE_MAX_BYTES
 
         # Cached metadata — populated by prepare_for_unload() before the HF
         # model is freed, so the optimizer can still query layer/component
@@ -210,13 +435,18 @@ class SteeringEngine:
         print()
         print(f"Loading model [bold]{model_id}[/]...")
 
-        # Patch MTP models whose layer_types length exceeds num_hidden_layers
+        # Adapt MTP models whose layer_types length exceeds num_hidden_layers
         # (e.g. Step-3.5-Flash: 48 layer_types vs 45 num_hidden_layers).
-        _patch_mtp_layer_types(model_id, config.model.trust_remote_code)
+        _register_mtp_layer_types_adapter(
+            model_id,
+            config.model.trust_remote_code,
+            config.model.revision,
+        )
 
         self.tokenizer = load_tokenizer(
             model_id,
             trust_remote_code=config.model.trust_remote_code,
+            revision=config.model.revision,
         )
 
         # Tokenizers that lack a dedicated pad token fall back to EOS.
@@ -265,7 +495,11 @@ class SteeringEngine:
         try:
             from transformers import AutoConfig as _AC
 
-            _auto_cfg = _AC.from_pretrained(model_id, trust_remote_code=True)
+            _auto_cfg = _AC.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                revision=config.model.revision,
+            )
             _qcfg = getattr(_auto_cfg, "quantization_config", None)
             if _qcfg is None:
                 _text_cfg = getattr(_auto_cfg, "text_config", None)
@@ -328,13 +562,13 @@ class SteeringEngine:
         # AttributeError during replace_with_fp8_linear. Patch the config class
         # to alias intermediate_size → moe_intermediate_size if needed.
         if is_fp8:
-            self._patch_moe_config_for_fp8(model_id)
+            self._patch_moe_config_for_fp8(model_id, config.model.revision)
 
         for dtype in config.model.dtype_fallback_order:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
             try:
-                qconfig = self._build_quant_config(dtype)
+                qconfig = self._build_quant_config()
 
                 extra: dict[str, Any] = {}
                 if qconfig is not None:
@@ -345,7 +579,17 @@ class SteeringEngine:
                 # Without this override, transformers wraps the experts in
                 # Mxfp4GptOssExperts whose `down_proj` is a packed triton
                 # tensor that _locate_fused_weights cannot edit.
-                if self._is_native_mxfp4 and qconfig is None:
+                #
+                # `steering.frozen_experts` is exactly the case where we do NOT
+                # want that: forward-time EGA never touches the weights, so the
+                # experts stay packed and the model loads at its 4-bit size
+                # (gpt-oss-20b: ~13.8 GB rather than ~30 GB).
+                if getattr(config.steering, "frozen_experts", False):
+                    print(
+                        "  [dim]frozen_experts: keeping MXFP4 experts packed "
+                        "(forward-time EGA, no weight mutation)[/]"
+                    )
+                elif self._is_native_mxfp4 and qconfig is None:
                     try:
                         from transformers import Mxfp4Config
 
@@ -366,12 +610,17 @@ class SteeringEngine:
                         config.model.experts_implementation
                     )
 
-                self.model = resolve_model_class(model_id).from_pretrained(
+                self.model = resolve_model_class(
+                    model_id,
+                    config.model.revision,
+                    text_only=config.model.text_only,
+                ).from_pretrained(
                     model_id,
                     **{_dtype_kwarg: dtype},
                     device_map=config.model.device_map,
                     max_memory=self.max_memory,
                     trust_remote_code=self.trusted_models.get(model_id),
+                    revision=config.model.revision,
                     offload_folder="/tmp/offload",
                     **extra,
                 )
@@ -421,12 +670,16 @@ class SteeringEngine:
                             "offline.[/]"
                         )
 
+                validate_quantization_state(self.model, stage="after loading")
+
                 # Smoke-test: a single forward pass catches dtype-related
                 # runtime errors (inf/nan probability tensors, etc.).
+                self._validate_int8_state()
                 self._generate(
                     [ChatMessage(system=config.system_prompt, user="What is 1+1?")],
                     max_new_tokens=1,
                 )
+                self._validate_int8_state()
             except (
                 Exception
             ) as error:  # Model loading may fail with diverse errors (OOM, dtype, CUDA)
@@ -449,13 +702,31 @@ class SteeringEngine:
         if self.model is None:
             raise RuntimeError("Failed to load model with all configured dtypes.")
 
+        # bnb 4-bit: non-quantized tensors (embed/norm/lm_head) may still be
+        # float16 after load (including dtype="auto" when the checkpoint is
+        # float16). When native bf16 is available, promote live float16 params
+        # so residual norms match the bf16 compute path. Skip promotion when
+        # we fell back to float16 compute (pre-Ampere CUDA). Parameters on
+        # meta (accelerate offload) may not retain this.
+        if (
+            config.model.quant_method == QuantMode.BNB_4BIT
+            and _bf16_compute_supported()
+        ):
+            n_conv = 0
+            for _n, _p in self.model.named_parameters():
+                if _p.dtype == torch.float16:
+                    _p.data = _p.data.to(torch.bfloat16)
+                    n_conv += 1
+            if n_conv:
+                print(f"  [dim]Promoted {n_conv} non-quantized params fp16→bf16[/]")
+
         # NOTE: FP8 dequant is now applied inside the dtype loop (above),
         # before the smoke-test, so we no longer need it here.
 
         if config.model.backend in ("vllm", "sglang"):
             print("* TP backend: skipping HF LoRA adapter initialisation")
             self._lora_b_weights = []
-            self.peft_config = None  # ty:ignore[assignment]
+            self.peft_config = None  # ty:ignore[invalid-assignment]
         else:
             self._init_adapters()
         self._init_expert_routing()
@@ -702,6 +973,7 @@ class SteeringEngine:
     def _init_adapters(self):
         """Wrap the base model in PEFT LoRA adapters targeting steerable modules."""
         assert isinstance(self.model, PreTrainedModel)
+        validate_quantization_state(self.model, stage="before adapter initialization")
 
         # Build a map from module id to its full path in the model tree.
         # We use full paths (not leaf names) to avoid collisions with identically
@@ -711,6 +983,7 @@ class SteeringEngine:
         id_to_path: dict[int, str] = {
             id(m): name for name, m in self.model.named_modules()
         }
+        self._validate_int8_state()
 
         target_paths: set[str] = set()
         for idx in range(len(self.transformer_layers)):
@@ -722,10 +995,7 @@ class SteeringEngine:
 
         targets = sorted(target_paths)
 
-        if self.config.steering.weight_normalization != WeightNorm.FULL:
-            rank = 1
-        else:
-            rank = self.config.steering.full_norm_lora_rank
+        rank = _required_lora_rank(self.config)
 
         self.peft_config = LoraConfig(
             r=rank,
@@ -737,6 +1007,9 @@ class SteeringEngine:
         )
 
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
+        # Adapter insertion can redispatch offloaded weights after the load
+        # smoke test, so validate the resulting metadata as well.
+        validate_quantization_state(self.model, stage="after adapter initialization")
 
         # PEFT inherits the base layer's dtype for LoRA A/B weights.  For FP8
         # models this produces Float8_e4m3fn parameters that crash F.linear
@@ -746,6 +1019,8 @@ class SteeringEngine:
             for name, param in self.model.named_parameters():
                 if "lora_" in name and param.dtype in _fp8:
                     param.data = param.data.to(torch.bfloat16)
+
+        self._validate_int8_state()
 
         # Pre-cache references to every lora_B weight tensor for O(adapter-count)
         # resets instead of a full named_modules walk.
@@ -761,8 +1036,22 @@ class SteeringEngine:
             f"({len(targets)} modules, leaves: {', '.join(leaf_summary)})"
         )
 
+    def _validate_int8_state(self) -> None:
+        """Check int8 metadata before expensive extraction and optimization."""
+        for name, module in self.model.named_modules():
+            # The underlying module is visited separately; skip PEFT wrappers.
+            if getattr(module, "base_layer", None) is not None:
+                continue
+            if is_bnb_int8_weight(module):
+                try:
+                    validate_bnb_int8_weight(module)
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        f"Invalid bitsandbytes int8 state in {name or '<root>'}: {error}"
+                    ) from error
+
     @staticmethod
-    def _patch_moe_config_for_fp8(model_id: str) -> None:
+    def _patch_moe_config_for_fp8(model_id: str, revision: str | None = None) -> None:
         """Patch MoE config classes that lack ``intermediate_size``.
 
         The transformers FP8 quantizer (``finegrained_fp8.py``) falls back to
@@ -777,7 +1066,9 @@ class SteeringEngine:
         from transformers import AutoConfig
 
         try:
-            auto_cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+            auto_cfg = AutoConfig.from_pretrained(
+                model_id, trust_remote_code=True, revision=revision
+            )
             text_cfg = getattr(auto_cfg, "text_config", auto_cfg)
             cfg_cls = type(text_cfg)
 
@@ -794,11 +1085,16 @@ class SteeringEngine:
         except Exception:
             pass  # Best-effort; if this fails, the original error will surface.
 
-    def _build_quant_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _build_quant_config(self) -> BitsAndBytesConfig | None:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
-            compute_dtype = torch.bfloat16 if dtype == "auto" else getattr(torch, dtype)
+            # Prefer native bf16 compute for residual dynamic range; fall back
+            # to float16 on pre-Ampere CUDA (and CPU). Does not control which
+            # modules are quantized — only matmul compute dtype.
+            compute_dtype = (
+                torch.bfloat16 if _bf16_compute_supported() else torch.float16
+            )
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -909,6 +1205,26 @@ class SteeringEngine:
         # GatedDeltaNet linear-attention variant (Qwen3.5 MoE hybrid layers).
         with suppress(Exception):
             _register("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # Bailing MoE v3 hybrid (Ling-3.0-flash, inclusionAI): decoder blocks
+        # expose attention under ``layer.attention`` (not ``self_attn``).
+        # Layers alternate MultiLatentAttention (output proj = ``dense``) and
+        # KimiDeltaAttention (output proj = ``o_proj``). Without these paths
+        # only ``mlp.down_proj`` is steerable.
+        with suppress(Exception):
+            _register("attn.o_proj", layer.attention.o_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.o_proj", layer.attention.dense)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.q_proj", layer.attention.q_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.k_proj", layer.attention.k_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.v_proj", layer.attention.v_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.q_b_proj", layer.attention.q_b_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.kv_b_proj", layer.attention.kv_b_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Dense-model MLP down-projection.
         with suppress(Exception):
@@ -1030,6 +1346,25 @@ class SteeringEngine:
         self._cached_n_layers = len(self.transformer_layers)
         self._cached_components = self.list_steerable_components()
 
+        # Drop every engine-held reference into the model being unloaded;
+        # anything left here pins the model's VRAM after
+        # ``engine.model = None`` (issue #83).
+        self._dequant_cache.clear()
+        self._dequant_cache_bytes = 0
+        for handle in getattr(self, "_angular_hooks", []):
+            handle.remove()
+        self._angular_hooks = []
+        for attr in (
+            "_lora_b_weights",
+            "_router_originals",
+            "_expert_deltas",
+            "_direct_weight_originals",
+            "_cliff_head_originals",
+        ):
+            buffers = getattr(self, attr, None)
+            if buffers is not None:
+                buffers.clear()
+
     # ------------------------------------------------------------------
     # MoE expert routing helpers
     # ------------------------------------------------------------------
@@ -1094,7 +1429,9 @@ class SteeringEngine:
     def _init_expert_routing(self):
         """Prepare bookkeeping lists for router/expert weight rollback."""
         self._router_originals: list[tuple[int, int, Tensor]] = []
-        self._expert_deltas: list[tuple[int, int, float, Tensor, Tensor]] = []
+        # ``(layer_idx, expert_idx, original_expert_slice)`` — the untouched
+        # weight slice, not a reconstructible delta.
+        self._expert_deltas: list[tuple[int, int, Tensor]] = []
 
     def identify_safety_experts(
         self,
@@ -1131,14 +1468,9 @@ class SteeringEngine:
         def _make_hook(layer_idx: int):
             def hook(module: Module, inp: Any, out: Any):
                 with torch.no_grad():
-                    if isinstance(out, tuple) and len(out) >= 3:
-                        selected = out[2]
-                    elif isinstance(out, tuple) and len(out) == 2:
-                        selected = out[1]
-                    else:
-                        logits = out if not isinstance(out, tuple) else out[0]
-                        k = getattr(module, "top_k", 8)
-                        _, selected = logits.topk(k, dim=-1)
+                    selected = extract_router_expert_ids(
+                        out, top_k=getattr(module, "top_k", 8)
+                    )
 
                     flat = selected.reshape(-1)
                     k = getattr(module, "top_k", selected.shape[-1])
@@ -1146,28 +1478,45 @@ class SteeringEngine:
 
                     active_tokens[0][layer_idx] += n_tok
                     cnts = active_counts[0][layer_idx]
-                    for eid in flat.unique().tolist():
-                        cnts[eid] += int((flat == eid).sum().item())
+                    # One bincount instead of per-expert (flat == eid) GPU
+                    # syncs — the loop is catastrophically slow on 512-expert
+                    # MoEs (hours vs minutes).
+                    weight = getattr(module, "weight", None)
+                    n_experts = (
+                        weight.shape[0]
+                        if weight is not None
+                        else int(flat.max().item()) + 1
+                    )
+                    for eid, count in enumerate(
+                        torch.bincount(flat.long(), minlength=n_experts).cpu().tolist()
+                    ):
+                        if count:
+                            cnts[eid] += count
 
             return hook
 
         for idx, gate in gates.items():
             handles.append(gate.register_forward_hook(_make_hook(idx)))
 
-        print("  Profiling benign prompts...")
-        active_counts[0] = benign_counts
-        active_tokens[0] = benign_tokens
-        with torch.no_grad():
-            self.extract_hidden_states_batched(benign_msgs)
+        # The profiling passes run two full sweeps over every prompt; an OOM
+        # or dtype error there would otherwise leave every router hook
+        # registered for the rest of the process, mutating counters on every
+        # later forward pass.
+        try:
+            print("  Profiling benign prompts...")
+            active_counts[0] = benign_counts
+            active_tokens[0] = benign_tokens
+            with torch.no_grad():
+                self.extract_hidden_states_batched(benign_msgs)
 
-        print("  Profiling target prompts...")
-        active_counts[0] = target_counts
-        active_tokens[0] = target_tokens
-        with torch.no_grad():
-            self.extract_hidden_states_batched(target_msgs)
-
-        for h in handles:
-            h.remove()
+            print("  Profiling target prompts...")
+            active_counts[0] = target_counts
+            active_tokens[0] = target_tokens
+            with torch.no_grad():
+                self.extract_hidden_states_batched(target_msgs)
+        finally:
+            for h in handles:
+                h.remove()
 
         safety: dict[int, list[tuple[int, float]]] = {}
         for idx, gate in gates.items():
@@ -1211,8 +1560,16 @@ class SteeringEngine:
         if hasattr(self, "_direct_weight_originals"):
             self._direct_weight_originals.clear()
 
-        current_id = getattr(self.model.config, "name_or_path", None)
-        if current_id == self.config.model.model_id and not self.needs_reload:
+        # ``_model_config_name`` is the canonical loader identity and also
+        # falls back to the legacy ``name_or_path`` alias, which transformers
+        # >=5 may drop. Reading only ``name_or_path`` (as this did) yields
+        # ``None`` there, making the comparison always fail and forcing a full
+        # model reload on *every* trial.
+        current_id = _model_config_name(self.model.config)
+        if (
+            current_id == self.config.model.model_id.rstrip("/")
+            and not self.needs_reload
+        ):
             for w in self._lora_b_weights:
                 torch.nn.init.zeros_(w)
 
@@ -1222,12 +1579,18 @@ class SteeringEngine:
                     gate.weight.data[expert_idx] = original_row.to(gate.weight.device)  # ty:ignore[invalid-assignment,no-matching-overload]
             self._router_originals.clear()
 
-            for layer_idx, expert_idx, w, v, vTW in self._expert_deltas:
+            # Write back the exact pre-edit expert slice. Storing the original
+            # (rather than reconstructing it from the applied delta) keeps this
+            # idempotent: when the same fused tensor was also edited by EGA,
+            # the whole-tensor restore above has already undone the expert
+            # edit, and re-applying the inverse delta here would inject a
+            # spurious rank-1 term that would then be cached as the "original"
+            # for the next trial. It also avoids an fp32 round trip, which
+            # silently loses precision for fp8/packed storage dtypes.
+            for layer_idx, expert_idx, original_slice in self._expert_deltas:
                 dp = self._locate_fused_weights(self.transformer_layers[layer_idx])
                 if dp is not None:
-                    W = dp.data[expert_idx].to(torch.float32)
-                    W += (w * torch.outer(v, vTW)).to(device=W.device)
-                    dp.data[expert_idx] = W.to(dp.dtype)
+                    dp.data[expert_idx] = original_slice.to(dp.device).to(dp.dtype)
             self._expert_deltas.clear()
             return
 
@@ -1235,17 +1598,29 @@ class SteeringEngine:
         self.model = None  # ty:ignore[invalid-assignment]
         flush_memory()
 
-        qconfig = self._build_quant_config(str(dtype).split(".")[-1])
+        # The dequant cache is keyed by ``id(module)``. Once the old model is
+        # freed the freshly allocated wrappers routinely land on the same
+        # addresses, so a surviving entry would hand the next trial a stale
+        # dequantized weight tensor from a *different* model object.
+        self._dequant_cache.clear()
+        self._dequant_cache_bytes = 0
+
+        qconfig = self._build_quant_config()
         extra: dict[str, Any] = {}
         if qconfig is not None:
             extra["quantization_config"] = qconfig
 
-        self.model = resolve_model_class(self.config.model.model_id).from_pretrained(
+        self.model = resolve_model_class(
+            self.config.model.model_id,
+            self.config.model.revision,
+            text_only=self.config.model.text_only,
+        ).from_pretrained(
             self.config.model.model_id,
             **{_dtype_kwarg: dtype},
             device_map=self.config.model.device_map,
             max_memory=self.max_memory,
             trust_remote_code=self.trusted_models.get(self.config.model.model_id),
+            revision=self.config.model.revision,
             **extra,
         )
         if self.config.model.quant_method == QuantMode.FP8 or self._is_native_fp8:
@@ -1261,13 +1636,40 @@ class SteeringEngine:
         For quantised models the base model is reloaded in full precision on
         CPU before merging, as in-place dequantisation is not supported.
         """
-        assert isinstance(self.model, PeftModel)
+        mode = self.config.steering.steering_mode
+        runtime_only = {
+            SteeringMode.ANGULAR,
+            SteeringMode.ADAPTIVE_ANGULAR,
+            SteeringMode.SPHERICAL,
+            SteeringMode.VECTOR_FIELD,
+        }
+        if mode in runtime_only:
+            raise RuntimeError(
+                f"Steering mode {mode.value!r} is runtime-only and cannot be "
+                "represented by a merged checkpoint. Export a runtime artifact "
+                "or choose 'lora'/'direct' instead."
+            )
 
-        if self.config.model.quant_method in (
+        quantized = self.config.model.quant_method in (
             QuantMode.BNB_4BIT,
             QuantMode.BNB_8BIT,
             QuantMode.FP8,
-        ):
+        )
+        has_non_lora_edits = bool(
+            getattr(self, "_router_originals", None)
+            or getattr(self, "_expert_deltas", None)
+        )
+        if quantized and (mode == SteeringMode.DIRECT or has_non_lora_edits):
+            raise RuntimeError(
+                "Cannot faithfully export active direct/router/expert edits "
+                "from a quantized model: full-precision reload would discard "
+                "those base-weight changes. Replay the resolved steering plan "
+                "on an unquantized HF model before exporting."
+            )
+
+        assert isinstance(self.model, PeftModel)
+
+        if quantized:
             adapter_state = {
                 n: p.data.clone().cpu()
                 for n, p in self.model.named_parameters()
@@ -1275,11 +1677,16 @@ class SteeringEngine:
             }
 
             print("* Loading base model on CPU (this may take a while)...")
-            base = resolve_model_class(self.config.model.model_id).from_pretrained(
+            base = resolve_model_class(
+                self.config.model.model_id,
+                self.config.model.revision,
+                text_only=self.config.model.text_only,
+            ).from_pretrained(
                 self.config.model.model_id,
                 **{_dtype_kwarg: self.model.dtype},
                 device_map="cpu",
                 trust_remote_code=self.trusted_models.get(self.config.model.model_id),
+                revision=self.config.model.revision,
             )
 
             print("* Applying LoRA adapters...")
@@ -1295,6 +1702,56 @@ class SteeringEngine:
             merged = self.model.merge_and_unload()
             self.needs_reload = True
             return merged
+
+    def _cache_dequant(self, mid: int, weight: Tensor) -> None:
+        """Store a dequantized weight tensor if under the byte budget.
+
+        Pure performance cache: skipping an insert only costs re-dequant time.
+        """
+        if self._dequant_cache_bytes < self._dequant_cache_max_bytes:
+            self._dequant_cache[mid] = weight
+            self._dequant_cache_bytes += weight.nelement() * weight.element_size()
+
+    def export_adapter(self, save_directory: str | os.PathLike[str]) -> None:
+        """Save the active LoRA adapter without BF16 merge-rounding drift.
+
+        Loading this adapter on the same base model/revision preserves the
+        runtime LoRA computation.  Base-weight edits (such as MoE router or
+        expert edits) are deliberately rejected because PEFT adapter files
+        cannot represent them.
+        """
+        mode = self.config.steering.steering_mode
+        if mode != SteeringMode.LORA:
+            raise RuntimeError(
+                "Adapter export only represents LoRA steering; use merged "
+                "export for an unquantized direct-edit model."
+            )
+        if getattr(self, "_router_originals", None) or getattr(
+            self, "_expert_deltas", None
+        ):
+            raise RuntimeError(
+                "Adapter export cannot represent active router/expert base-weight "
+                "edits. Export a merged unquantized model instead."
+            )
+        if not isinstance(self.model, PeftModel):
+            raise RuntimeError("No active PEFT LoRA adapter is available to export.")
+        # `export_merged()` calls `merge_and_unload()` in place on the
+        # unquantized path: the LoRA layers are folded into the base weights
+        # and removed, but `self.model` stays a PeftModel object.  The
+        # isinstance check above therefore still passes and PEFT would happily
+        # write a zero-tensor adapter.  `needs_reload` is the engine's
+        # canonical "weights were destructively mutated" flag; the state-dict
+        # check also covers any other route to an emptied adapter.
+        if self.needs_reload or not any(
+            "lora_" in name for name, _ in self.model.named_parameters()
+        ):
+            raise RuntimeError(
+                "The in-memory LoRA adapter was consumed by a previous merged "
+                "export. Re-select the trial to reload the base model before "
+                "exporting an adapter."
+            )
+
+        self.model.save_pretrained(save_directory)
 
     # ------------------------------------------------------------------
     # Internal position-cache management
@@ -1318,8 +1775,8 @@ class SteeringEngine:
     # Tokenisation helpers
     # ------------------------------------------------------------------
 
-    def _tokenize(self, messages: list[ChatMessage]) -> BatchEncoding:
-        """Apply the chat template, optionally prepend the response prefix, and tokenise."""
+    def _render_messages(self, messages: list[ChatMessage]) -> list[str]:
+        """Render messages exactly as the model-facing tokenizer sees them."""
         chats = []
         for msg in messages:
             chat: list[dict] = []
@@ -1340,6 +1797,44 @@ class SteeringEngine:
 
         if self.response_prefix:
             texts = [t + self.response_prefix for t in texts]
+
+        return texts
+
+    def _length_sorted_indices(self, messages: list[ChatMessage]) -> list[int]:
+        """Return a stable ordering by rendered, unpadded token length."""
+        if not messages:
+            return []
+
+        encoded = self.tokenizer(
+            self._render_messages(messages),
+            padding=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        input_ids = encoded["input_ids"]
+        lengths = [len(row) for row in input_ids]
+        if len(lengths) != len(messages):
+            raise RuntimeError(
+                "Tokenizer returned a different number of rows while sorting "
+                f"messages: expected {len(messages)}, got {len(lengths)}"
+            )
+        return sorted(range(len(messages)), key=lambda index: lengths[index])
+
+    @staticmethod
+    def _restore_tensor_rows(values: Tensor, original_indices: list[int]) -> Tensor:
+        """Restore rows whose current positions follow ``original_indices``."""
+        inverse = torch.empty(
+            len(original_indices),
+            dtype=torch.long,
+            device=values.device,
+        )
+        for sorted_index, original_index in enumerate(original_indices):
+            inverse[original_index] = sorted_index
+        return values.index_select(0, inverse)
+
+    def _tokenize(self, messages: list[ChatMessage]) -> BatchEncoding:
+        """Apply the chat template, optionally prepend the response prefix, and tokenise."""
+        texts = self._render_messages(messages)
 
         return self.tokenizer(
             texts,
@@ -1406,10 +1901,22 @@ class SteeringEngine:
         skip_special_tokens: bool = False,
         max_new_tokens: int | None = None,
         min_new_tokens: int | None = None,
+        *,
+        sort_by_length: bool = False,
     ) -> list[str]:
-        """Batched wrapper around :meth:`generate_text`."""
+        """Batched generation, optionally grouped by near-equal token length."""
+        original_indices = (
+            self._length_sorted_indices(messages)
+            if sort_by_length
+            else list(range(len(messages)))
+        )
+        ordered_messages = [messages[index] for index in original_indices]
+
         out: list[str] = []
-        for batch in chunk_batches(messages, self.config.inference.batch_size):
+        for batch in chunk_batches(
+            ordered_messages,
+            self.config.inference.batch_size,
+        ):
             out.extend(
                 self.generate_text(
                     batch,
@@ -1418,7 +1925,13 @@ class SteeringEngine:
                     min_new_tokens=min_new_tokens,
                 )
             )
-        return out
+        if not sort_by_length:
+            return out
+
+        restored = ["" for _ in out]
+        for sorted_index, original_index in enumerate(original_indices):
+            restored[original_index] = out[sorted_index]
+        return restored
 
     def generate_and_score(
         self,
@@ -1433,31 +1946,33 @@ class SteeringEngine:
         Avoids the duplicate-prefill overhead of calling generate_text() and
         compute_logprobs() separately on the same prompt batch.
         """
+        if kl_token_count < 1:
+            raise ValueError("kl_token_count must be at least 1")
+        if kl_token_count > max_new_tokens:
+            raise ValueError(
+                f"kl_token_count ({kl_token_count}) cannot exceed "
+                f"max_new_tokens ({max_new_tokens})"
+            )
+
         sampler = _LogitsSampler(kl_token_count)
 
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
             "logits_processor": [sampler],
         }
-        if min_new_tokens is not None:
-            if min_new_tokens > max_new_tokens:
+        resolved_min = min_new_tokens
+        if kl_token_count > 1:
+            resolved_min = max(resolved_min or 0, kl_token_count)
+        if resolved_min is not None:
+            if resolved_min > max_new_tokens:
                 raise ValueError(
-                    f"min_gen_tokens ({min_new_tokens}) cannot exceed "
+                    f"min_gen_tokens ({resolved_min}) cannot exceed "
                     f"max_gen_tokens ({max_new_tokens})"
                 )
-            gen_kwargs["min_new_tokens"] = min_new_tokens
+            gen_kwargs["min_new_tokens"] = resolved_min
 
         inputs, outputs = self._generate(messages, **gen_kwargs)
-
-        actual_n = min(kl_token_count, len(sampler.scores))
-        if actual_n == 1:
-            logprobs = F.log_softmax(sampler.scores[0], dim=-1)
-        else:
-            stacked = torch.stack(
-                [F.log_softmax(s, dim=-1) for s in sampler.scores[:actual_n]],
-                dim=1,
-            )
-            logprobs = stacked.mean(dim=1)
+        logprobs = _captured_logprobs(sampler, kl_token_count)
 
         input_len = cast(Tensor, inputs["input_ids"]).shape[1]
         responses = self.tokenizer.batch_decode(
@@ -1475,6 +1990,7 @@ class SteeringEngine:
         min_new_tokens: int | None = None,
     ) -> tuple[list[str], Tensor]:
         """Batched wrapper around :meth:`generate_and_score`."""
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
         all_resp: list[str] = []
         all_lp: list[Tensor] = []
         for batch in chunk_batches(messages, self.config.inference.batch_size):
@@ -1486,6 +2002,8 @@ class SteeringEngine:
                 min_new_tokens=min_new_tokens,
             )
             all_resp.extend(resp)
+            if offload:
+                lp = lp.cpu()
             all_lp.append(lp)
         return all_resp, torch.cat(all_lp, dim=0)
 
@@ -1514,7 +2032,26 @@ class SteeringEngine:
         inputs = self._tokenize(messages)
         self._reset_position_cache()
 
-        outputs = self.model(**inputs, output_hidden_states=True)
+        # Most recent Transformers causal-LM heads can avoid materialising
+        # logits for every prompt token.  This matters especially for Qwen3.5
+        # (248k vocabulary): hidden-state extraction only consumes residuals,
+        # so retaining one final-token logit slice is sufficient.  Inspect the
+        # explicit base-model signature first to keep older/custom models
+        # compatible instead of optimistically passing an unknown keyword.
+        cache = getattr(self, "_logits_to_keep_support", None)
+        model_identity = id(self.model)
+        if cache is None or cache[0] != model_identity:
+            cache = (
+                model_identity,
+                _forward_supports_logits_to_keep(cast(Module, self.model)),
+            )
+            self._logits_to_keep_support = cache
+
+        forward_kwargs: dict[str, Any] = {"output_hidden_states": True}
+        if cache[1]:
+            forward_kwargs["logits_to_keep"] = 1
+
+        outputs = self.model(**inputs, **forward_kwargs)
         hidden_states = outputs.hidden_states
 
         residuals = torch.stack(
@@ -1534,10 +2071,33 @@ class SteeringEngine:
 
         return residuals
 
-    def extract_hidden_states_batched(self, messages: list[ChatMessage]) -> Tensor:
-        offload = self.config.inference.offload_outputs_to_cpu
+    def extract_hidden_states_batched(
+        self,
+        messages: list[ChatMessage],
+        *,
+        sort_by_length: bool = False,
+    ) -> Tensor:
+        """Extract residuals, optionally using near-length prompt batches."""
+        if not messages:
+            raise ValueError("messages must not be empty")
+
+        original_indices = (
+            self._length_sorted_indices(messages)
+            if sort_by_length
+            else list(range(len(messages)))
+        )
+        ordered_messages = [messages[index] for index in original_indices]
+
+        offload = getattr(
+            self.config.inference,
+            "offload_outputs_to_cpu",
+            False,
+        )
         parts = []
-        for batch in chunk_batches(messages, self.config.inference.batch_size):
+        for batch in chunk_batches(
+            ordered_messages,
+            self.config.inference.batch_size,
+        ):
             part = self.extract_hidden_states(batch)
             if offload:
                 # Move each batch's residuals to host RAM immediately so the
@@ -1548,37 +2108,62 @@ class SteeringEngine:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             parts.append(part)
-        return torch.cat(parts, dim=0)
+        residuals = torch.cat(parts, dim=0)
+        if not sort_by_length:
+            return residuals
+        return self._restore_tensor_rows(residuals, original_indices)
 
     # ------------------------------------------------------------------
     # Log-probability measurement
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
     def _logprobs_forward_pass(self, messages: list[ChatMessage]) -> Tensor:
         """Next-token logprobs via a single forward pass (no generation overhead)."""
         inputs = self._tokenize(messages)
         self._reset_position_cache()
-        outputs = self.model(**inputs)
-        return F.log_softmax(outputs.logits[:, -1, :], dim=-1)
+        cache = getattr(self, "_logprobs_forward_options", None)
+        model_identity = id(self.model)
+        if cache is None or cache[0] != model_identity:
+            forward_kwargs: dict[str, Any] = {}
+            if _forward_supports_logits_to_keep(cast(Module, self.model)):
+                forward_kwargs["logits_to_keep"] = 1
+            if _forward_supports_kwarg(cast(Module, self.model), "use_cache"):
+                forward_kwargs["use_cache"] = False
+            cache = (model_identity, forward_kwargs)
+            self._logprobs_forward_options = cache
+        outputs = self.model(**inputs, **cache[1])
+        return F.log_softmax(outputs.logits[:, -1, :], dim=-1, dtype=torch.float32)
 
     def compute_logprobs(self, messages: list[ChatMessage]) -> Tensor:
-        """Compute averaged next-token log-probabilities over kl_token_count steps."""
+        """Compute next-token log-probabilities over ``token_count`` steps.
+
+        The legacy single-token result has shape ``(batch, vocab)``.  For
+        multiple tokens, the result has shape ``(batch, step, vocab)`` so
+        callers can compute a normalized divergence for each generated step.
+        """
         n = self.config.kl.token_count
 
+        if n < 1:
+            raise ValueError("kl.token_count must be at least 1")
         if n == 1:
             return self._logprobs_forward_pass(messages)
 
         sampler = _LogitsSampler(n)
-        self._generate(messages, max_new_tokens=n, logits_processor=[sampler])
-
-        stacked = torch.stack(
-            [F.log_softmax(s, dim=-1) for s in sampler.scores],
-            dim=1,
+        self._generate(
+            messages,
+            max_new_tokens=n,
+            min_new_tokens=n,
+            logits_processor=[sampler],
         )
-        return stacked.mean(dim=1)
+        return _captured_logprobs(sampler, n)
 
     def compute_logprobs_batched(self, messages: list[ChatMessage]) -> Tensor:
-        offload = self.config.inference.offload_outputs_to_cpu
+        offload = getattr(
+            self.config.inference,
+            "offload_outputs_to_cpu",
+            False,
+        )
         parts = []
         for batch in chunk_batches(messages, self.config.inference.batch_size):
             part = self.compute_logprobs(batch)
@@ -1592,6 +2177,92 @@ class SteeringEngine:
                     torch.cuda.empty_cache()
             parts.append(part)
         return torch.cat(parts, dim=0)
+
+    def score_continuation_logprobs_batched(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+        token_count: int,
+        *,
+        sort_by_length: bool = False,
+    ) -> Tensor:
+        """Score fixed continuations on identical teacher-forced prefixes.
+
+        For continuation token ``t`` this returns the full-vocabulary
+        distribution conditioned on the prompt and continuation tokens before
+        ``t``.  Reusing the same continuations for baseline and steered models
+        therefore measures both models on the same contexts instead of on
+        their independently generated trajectories.
+
+        A one-token result has shape ``(batch, vocab)``; multiple tokens have
+        shape ``(batch, step, vocab)``.  Results are always normalised in
+        ``float32``.
+        """
+        if token_count < 1:
+            raise ValueError("token_count must be at least 1")
+        if len(messages) != len(continuations):
+            raise ValueError(
+                "messages and continuations must have the same length: "
+                f"got {len(messages)} and {len(continuations)}"
+            )
+        if not messages:
+            raise ValueError("messages and continuations must not be empty")
+
+        original_indices = (
+            self._length_sorted_indices(messages)
+            if sort_by_length
+            else list(range(len(messages)))
+        )
+        ordered_messages = [messages[index] for index in original_indices]
+        ordered_continuations = [continuations[index] for index in original_indices]
+
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
+        all_logprobs: list[Tensor] = []
+        batch_size = self.config.inference.batch_size
+        for start in range(0, len(ordered_messages), batch_size):
+            message_batch = ordered_messages[start : start + batch_size]
+            continuation_batch = ordered_continuations[start : start + batch_size]
+
+            encoded_continuations = self.tokenizer(
+                continuation_batch,
+                add_special_tokens=False,
+                padding=False,
+                truncation=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            continuation_ids = encoded_continuations["input_ids"]
+            if isinstance(continuation_ids, Tensor):
+                continuation_rows = continuation_ids.tolist()
+            else:
+                continuation_rows = [list(row) for row in continuation_ids]
+
+            for row_index, continuation in enumerate(continuation_rows):
+                if len(continuation) < token_count:
+                    original_index = original_indices[start + row_index]
+                    raise ValueError(
+                        "Continuation is shorter than token_count after "
+                        f"tokenization at batch index {original_index}: "
+                        f"expected at least {token_count}, got {len(continuation)}"
+                    )
+
+            forced_rows = [row[:token_count] for row in continuation_rows]
+            sampler = _LogitsSampler(token_count)
+            forcing = _ForcedContinuationProcessor(forced_rows)
+            self._generate(
+                message_batch,
+                max_new_tokens=token_count,
+                logits_processor=[sampler, forcing],
+            )
+            logprobs = _captured_logprobs(sampler, token_count)
+            if offload:
+                logprobs = logprobs.cpu()
+            all_logprobs.append(logprobs)
+
+        logprobs = torch.cat(all_logprobs, dim=0)
+        if not sort_by_length:
+            return logprobs
+        return self._restore_tensor_rows(logprobs, original_indices)
 
     # ------------------------------------------------------------------
     # Interactive chat

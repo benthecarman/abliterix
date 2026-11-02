@@ -27,9 +27,21 @@
 
 It also ships **HonestAbliterationBench**, a reproducible public benchmark that resists the two failure modes (short generations + keyword-only judges) that make most abliteration leaderboards meaningless.
 
+## Safety and Responsible Use
+
+> [!WARNING]
+> Abliterix intentionally modifies model internals to reduce refusal behavior. This can weaken or remove safeguards and may cause resulting models to generate inaccurate, biased, offensive, explicit, dangerous, or illegal content.
+
+Abliterix is experimental research software. You are responsible for evaluating any resulting model, complying with applicable laws and third-party terms, and deploying appropriate safeguards. Do not rely on generated outputs for medical, legal, financial, safety-critical, or other high-stakes decisions without qualified human review.
+
+Before use or deployment, read the full **[Safety, Responsible Use, and Disclaimer Notice](SAFETY.md)**. The software is provided **"AS IS"**, without warranty, under Sections 15–17 of the [AGPL-3.0-or-later](LICENSE). The safety guidance does not add restrictions to the rights granted by the AGPL.
+
 ## Table of Contents
 
+- [Safety and Responsible Use](#safety-and-responsible-use)
 - [Quick Start](#quick-start)
+- [Stable and Reproducible by Default](#stable-and-reproducible-by-default)
+- [How It Works](#how-it-works)
 - [Broken Defenses](#broken-defenses)
 - [Results](#results)
 - [Honest Abliteration Leaderboard](#honest-abliteration-leaderboard)
@@ -54,9 +66,68 @@ abliterix --model Qwen/Qwen3-4B-Instruct-2507
 
 That's it. The process is fully automatic — after optimization completes, you can save the model, upload to Hugging Face, or chat with it interactively.
 
+The default evaluator is deterministic and offline. For a semantic LLM-judge audit, opt in explicitly; the credential is checked before any model is loaded:
+
+```bash
+export OPENROUTER_API_KEY=...
+abliterix --model Qwen/Qwen3-4B-Instruct-2507 --detection.llm-judge
+```
+
 > **Reproducible install (recommended)**: Abliterix uses [uv](https://docs.astral.sh/uv/) and commits a `uv.lock` pinning every dependency, plus a `[tool.uv] exclude-newer` cutoff so lock regeneration can't drift onto a newer dep that breaks the GPU path. If you use uv, clone the repo and run `uv run abliterix --model <model>` to get the exact dependency set the maintainers tested against.
 
 > **Windows**: use `python scripts/run_abliterix.py --model <model>` or set `PYTHONIOENCODING=utf-8` to avoid Rich encoding issues.
+
+
+## Stable and Reproducible by Default
+
+Abliterix resolves every remote model and dataset input to an immutable Hugging Face commit before loading it. The HF default uses orthogonal projection plus full row-norm preservation; vLLM automatically uses `pre`, the strongest normalization its rank-1 projection cache can materialize. A global seed controls search and randomized low-rank operations.
+
+Published reproducibility manifests use schema v2 and include the resolved configuration, exact winning-trial steering recipe, model/dataset commits, environment, metrics, and model-weight SHA256 values. The `reproducible` tag is only added when all inputs are pinned, the source tree is clean, the evaluator is deterministic, and the backend supports exact materialization.
+
+```bash
+# Exact replay: verifies manifest integrity, applies the winning trial without
+# searching, then independently re-measures KL divergence and refusal count.
+abliterix --reproduce reproduce/reproduce.json
+
+# Headless optimization + exact best-trial export + hashes + manifest.
+abliterix --model org/model --non-interactive \
+  --non-interactive-output-dir ./verified-model
+```
+
+CI also runs a commit-pinned tiny model twice, requires identical exported weight hashes, and verifies exact manifest replay. See [`tests/e2e/`](tests/e2e/) and the [Heretic parity audit](research_heretic_stability_reproducibility_20260806.md).
+
+
+## How It Works
+
+Abliterix modifies model internals rather than relying on prompt-level jailbreaks. Its basic assumption is that benign prompts and prompts that trigger refusal produce measurably different activation patterns in the model's residual stream.
+
+<p align="center">
+  <img src="assets/how-it-works.svg" alt="How Abliterix extracts activations, derives a refusal direction, projects it out of model weights, and optimizes the refusal-versus-drift trade-off" width="100%">
+</p>
+
+For each layer, let $g$ be the mean activation for benign prompts and $b$ the mean activation for target prompts. The simplest refusal direction is:
+
+$$
+r = \frac{b-g}{\lVert b-g \rVert_2}
+$$
+
+Abliteration removes weight components aligned with this direction. A simplified input-side transformation is:
+
+$$
+W' = W-\alpha(Wr)r^\top
+$$
+
+where $\alpha$ controls the intervention strength. In practice, Abliterix can apply the corresponding projection on either side of a weight matrix, depending on whether a module reads from or writes to the residual stream.
+
+The automated pipeline is:
+
+1. **Extract activations** — run benign and target prompt sets through the original model and capture hidden states from every layer.
+2. **Derive steering vectors** — compute a refusal direction or subspace using mean difference, PCA, SRA, SAE, SOM, optimal transport, RDO, or other configured methods.
+3. **Apply candidate edits** — modify attention, MLP, and, where applicable, MoE expert/router components using reversible LoRA adapters, direct weight projections, or runtime steering hooks.
+4. **Evaluate the trade-off** — count refusals on target prompts while measuring KL divergence and generation quality against the untouched model on benign prompts.
+5. **Optimize automatically** — use Optuna TPE to search layer locations, component strengths, decay profiles, vector scope, and MoE routing parameters. The result is a Pareto frontier balancing fewer refusals against less behavioral drift.
+
+In short, Abliterix identifies refusal-related geometry in hidden space, suppresses it in the model, and automatically searches for the least damaging effective intervention. See [docs/architecture.md](docs/architecture.md) for the full pipeline and [docs/methods.md](docs/methods.md) for the available steering methods.
 
 
 ## Broken Defenses
@@ -137,15 +208,23 @@ For MoE-specific steering mechanisms (EGA, expert profiling, router suppression)
 Abliterix auto-detects available accelerators (CUDA, XPU, MLU, MUSA, SDAA, NPU, MPS) and distributes layers across devices with `device_map = "auto"`.
 
 For large models:
-- **4-bit quantization**: `--model.quant-method bnb_4bit` cuts VRAM by ~4x
+- **4-bit quantization**: `--model.quant-method bnb_4bit` cuts VRAM by ~4x (LoRA mode; the quantised base stays frozen and the ablation rides in a BF16 adapter)
 - **8-bit quantization**: `--model.quant-method bnb_8bit` — higher quality than 4-bit, ~2x VRAM reduction with CPU offload
+- **Native FP4 models** (gpt-oss MXFP4, DeepSeek-V4-Flash routed experts): abliterate and re-pack **without a BF16 blow-up** via `abliterix-abliterate-fp4` — the output stays 4-bit and serves natively on vLLM. Validated end to end on gpt-oss-20b. `core.frozen_experts` additionally lets the *search* run against packed 4-bit weights by applying the rank-1 EGA edit at forward time instead of mutating weights. See [docs/fp4_repack.md](docs/fp4_repack.md).
 - **Per-device memory limits**: set `[model] max_memory = {"0": "20GB", "cpu": "64GB"}` in your config
 - **Non-interactive mode**: `--non-interactive` for fully automated batch runs
 
 
 ## Datasets
 
-Bilingual harm/benign evaluation datasets live in [`datasets/`](datasets/) and on Hugging Face at [wangzhang/abliterix-datasets](https://huggingface.co/datasets/wangzhang/abliterix-datasets). The 500-example sets (`harmful_500`, `good_500`) are the recommended starting point — they're also the SHA256-pinned inputs to HonestAbliterationBench.
+Default runs use the public `mlabonne/harmless_alpaca` and
+`mlabonne/harmful_behaviors` datasets. Historical recipes also reference local
+bilingual `good_*` / `harmful_*` corpora for vector extraction and trial scoring.
+Those corpora are not bundled in this repository, and their historical
+[Hugging Face location](https://huggingface.co/datasets/wangzhang/abliterix-datasets)
+was not publicly retrievable in our 2026-11-01 access check. The original
+`harmful_500` / `good_500` files are required to reproduce the SHA256-pinned
+HonestAbliterationBench protocol; substitute datasets produce different results.
 
 See [docs/datasets.md](docs/datasets.md) for the design rationale, category breakdown, and a comparison with public alternatives.
 
@@ -156,13 +235,18 @@ The deep details live in `docs/` and `benchmarks/`:
 
 - **[docs/architecture.md](docs/architecture.md)** — the 9 papers Abliterix integrates and the 5-step pipeline.
 - **[docs/methods.md](docs/methods.md)** — every steering method (SRA, Spherical, SVF, Projected, Discriminative, COSMIC, Angular, OT, Multi-direction) with the TOML knobs that control it.
+- **[docs/method_maturity.md](docs/method_maturity.md)** — evidence levels for every method, from implementation to leading claims.
 - **[docs/evaluation.md](docs/evaluation.md)** — why most abliteration benchmarks lie, our standards, and the architecture A/B test.
+- **[docs/evidence_resources.md](docs/evidence_resources.md)** — GPU/API/storage resources needed to turn method claims into reproducible evidence.
+- **[November 2026 evaluation reliability review](docs/research/evaluation-reliability-2026-11.md)** — current research, bounded-memory KL, benchmark integrity, and measured performance tradeoffs.
 - **[docs/moe.md](docs/moe.md)** — the four independent MoE steering mechanisms and supported MoE models.
+- **[docs/fp4_repack.md](docs/fp4_repack.md)** — abliterate native FP4 (MXFP4/NVFP4) models and re-pack to 4-bit offline, no BF16 blow-up.
 - **[docs/configuration.md](docs/configuration.md)** — config loading order, the 150+ shipped configs, the Web UI, and research-mode visualization.
-- **[docs/datasets.md](docs/datasets.md)** — bilingual dataset design rationale and metadata schema.
+- **[docs/datasets.md](docs/datasets.md)** — current public defaults, prompt roles, and historical bilingual corpus availability. Bilingual coverage requires supplying those datasets; it is not included automatically.
 - **[docs/references.md](docs/references.md)** — paper references and BibTeX.
 - **[docs/benchmarks/2026-05-pod-validation.md](docs/benchmarks/2026-05-pod-validation.md)** — measured 10-feature sweep on Qwen2.5-7B-Instruct with LLM judge (Blackwell GPU).
-- **[benchmarks/SPEC.md](benchmarks/SPEC.md)** — the frozen HonestAbliterationBench contract (`spec_version 1.0`).
+- **[benchmarks/METHOD_MATRIX.md](benchmarks/METHOD_MATRIX.md)** — cross-model method matrix for promoting methods through the maturity ladder.
+- **[benchmarks/SPEC.md](benchmarks/SPEC.md)** — the frozen HonestAbliterationBench contract (`spec_version 1.1`).
 - **[benchmarks/CONTRIBUTING.md](benchmarks/CONTRIBUTING.md)** — how to submit a leaderboard row (self-reported / verified tiers).
 
 
@@ -209,6 +293,7 @@ All contributions are released under the [AGPL-3.0](LICENSE) license.
 
 - **Questions & ideas**: [GitHub Discussions](https://github.com/wuwangzhang1216/abliterix/discussions)
 - **Bugs & feature requests**: [GitHub Issues](https://github.com/wuwangzhang1216/abliterix/issues)
+- **Security vulnerabilities**: follow the private reporting process in [SECURITY.md](SECURITY.md)
 - **Share your models**: tag models you publish with `abliterix` on the Hugging Face Hub so others can find them — browse the growing list at [huggingface.co/models?other=abliterix](https://huggingface.co/models?other=abliterix). Uploading through the built-in menu adds this tag (plus a `reproducible` tag and a `reproduce/` manifest) automatically.
 
 

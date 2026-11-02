@@ -42,6 +42,37 @@ som_initial_lr = 0.5
 
 Output shape `(n_dirs, layers+1, hidden_dim)` matches the existing multi-direction conventions, so all downstream LoRA / direct paths work without modification.
 
+## RDO — Gradient-Based Refusal Direction Optimization *(new — learned direction)*
+
+Every other `vector_method` derives the refusal direction from **activation statistics** of cached residuals (a mean difference, an SVD component, an OT map). RDO instead **learns** the direction by back-propagating through the frozen model, implementing [Wollschläger et al. (ICML 2025, arXiv:2502.17420)](https://arxiv.org/abs/2502.17420) — *The Geometry of Refusal in LLMs: Concept Cones and Representational Independence*.
+
+A single unit vector `r` in hidden space is the only trainable parameter, optimised by AdamW to minimise
+
+```
+L = λ_abl · CE( f_ablate(r)(p_harm),  t_answer  )    # answer harmful prompts after removing r
+  + λ_add · CE( f_add(α·r, l_add)(p_safe),  t_refusal )  # adding r induces refusal on benign
+  + λ_ret · KL( f_ablate(r)(p_safe) ‖ f(p_safe) )    # retain benign behaviour
+```
+
+where `f_ablate(r)` projects `r` out of the residual stream at **every** layer (`h ← h − (h·r̂)r̂`, the exact activation-space equivalent of abliterix's rank-1 direct edit) and `f_add` adds `α·r̂` at a single mid-late layer. The affirmative/refusal continuations (`t_answer` / `t_refusal`) are short fixed strings that make the cross-entropy differentiable without per-prompt labels.
+
+**Why it matters**: the paper reports the *same* refusal-removal efficacy as difference-in-means at markedly lower capability/KL cost (~40% less TruthfulQA degradation at matched ASR on Gemma-2-2B) — which is exactly the quantity abliterix's Optuna `(refusal_rate, KL)` Pareto co-minimises. RDO learns only the **direction**; abliterix's existing per-layer strength profile + Optuna search still pick the magnitude, so the two compose. The learned direction is broadcast to `(layers+1, hidden_dim)`, so all downstream LoRA / direct / projection paths work unchanged.
+
+```toml
+[steering]
+vector_method = "rdo"
+rdo_steps = 100            # AdamW steps (dominates RDO cost)
+rdo_lr = 0.01             # paper default
+rdo_init = "mean_diff"    # warm-start from difference-in-means ("random" = paper)
+rdo_lambda_ablation = 1.0
+rdo_lambda_addition = 0.2
+rdo_lambda_retain = 1.0
+rdo_add_layer_frac = 0.6  # depth of the addition-loss / warm-start layer
+rdo_max_prompts = 32      # subset used for training (keeps it fast vs the Optuna loop)
+```
+
+**Requires a loaded HF model with autograd** — the fast-extraction vLLM path cannot back-propagate, so RDO fails fast there. Incompatible with `n_directions > 1` (single direction; the multi-direction *representational-independence* extension is future work), `ablate_harmfulness_direction`, and `iterative.enabled`. The `rdo_*` weights are exposed so the Optuna loop can tune them as extra search dimensions.
+
 ## ORBA & Biprojected Direct-Mode Transforms *(new)*
 
 Two direct-mode weight transforms ported from [grimjim](https://huggingface.co/blog/grimjim/orthogonal-reflection-bounded-ablation), which has been topping the UGI / NatInt abliteration leaderboards with these variants.
@@ -92,7 +123,21 @@ cliff_head_top_k_frac = 0.03     # 3% of all (layer, head) pairs
 cliff_head_strength = 1.0        # 1.0 = full ablation, 0.5 = halve, 0.0 = no-op
 ```
 
-**When to use.** Any model with `<think>` tags or strong reasoning behaviour. For dense Llama/Mistral models the safety circuit is often even more concentrated — try 1–2 %. Skipped automatically when the HF model is not loaded (fast-extraction vLLM path).
+**Evidence scope.** This is an experimental weight-alignment heuristic, not a
+validated recommendation for every reasoning model. The current
+[maturity assessment](method_maturity.md) records a non-reasoning Qwen2.5 control
+and still requires reasoning-model evaluation. It is skipped when the HF model
+is not loaded (fast-extraction vLLM path).
+
+**Sparse-gate research ([issue #15](https://github.com/wuwangzhang1216/abliterix/issues/15)).**
+This implementation is distinct from Frank's
+[policy-routing circuit study](https://arxiv.org/abs/2604.04385v6).
+It does not perform activation interchange or causal gate-to-amplifier tests,
+so its head scores do not establish causal gate identity. The paper also
+distinguishes an upstream gate from the distributed circuitry that follows it.
+Neither the paper nor this heuristic establishes lower capability damage for
+Abliterix across model families or quantization levels; that requires independent,
+matched evaluations and reproducible result artifacts.
 
 ## Harmfulness ⊥ Refusal Joint Ablation *(new)*
 
@@ -222,7 +267,12 @@ llm_judge_model = "google/gemini-3.1-flash-lite-preview"
 
 | Section | Option | Values | Description |
 |---------|--------|--------|-------------|
-| `[steering]` | `vector_method` | `mean`, `median_of_means`, `pca`, `optimal_transport`, `cosmic`, `sra`, `som`, `sae` | How to compute steering vectors |
+| `[steering]` | `vector_method` | `mean`, `median_of_means`, `pca`, `optimal_transport`, `cosmic`, `sra`, `som`, `sae`, `rdo` | How to compute steering vectors |
+| `[steering]` | `rdo_steps` / `rdo_lr` | int / float | RDO AdamW steps and learning rate (`vector_method = 'rdo'`) |
+| `[steering]` | `rdo_lambda_ablation` / `rdo_lambda_addition` / `rdo_lambda_retain` | float | RDO loss weights (paper: 1.0 / 0.2 / 1.0) |
+| `[steering]` | `rdo_init` | `mean_diff` / `random` | RDO direction initialisation (warm-start vs paper's random) |
+| `[steering]` | `rdo_add_layer_frac` / `rdo_add_scale` | 0–1 / float | RDO addition-loss layer depth and scale α |
+| `[steering]` | `rdo_max_prompts` / `rdo_batch_size` | int | RDO training subset size and per-step batch |
 | `[steering]` | `som_grid_h` / `som_grid_w` | int | SOM grid shape (default 3×3 = 9 directions) |
 | `[steering]` | `som_n_iters` | int | Kohonen training iterations per layer |
 | `[steering]` | `sae_path` | str | Path to pre-trained SAE checkpoint (required when `vector_method = "sae"`) |

@@ -1,0 +1,124 @@
+{
+  "schema_version": "abliterix-kl-reduction-benchmark-v1",
+  "kl_source_sha256": "5576cebcbcb9e2a9941a321bb1420e29fc69e151349def59e52da0351fe573f6",
+  "benchmark_source_sha256": "979c8f4d8a3caf18d69ad9fd529f69a0f6b80a40053ddd0913cd96e7eac5cfe3",
+  "workload": {
+    "shape": [
+      128,
+      8,
+      32768
+    ],
+    "dtype": "float32",
+    "device": "cpu",
+    "seed": 20261101,
+    "inputs": "Two independent finite torch.randn tensors from one seeded device generator; unnormalized log-probabilities.",
+    "max_chunk_elements": 4194304,
+    "warmup_calls_after_memory_pass": 1,
+    "timed_repeats": 3
+  },
+  "methodology": {
+    "isolation": "One fresh subprocess per method, run sequentially.",
+    "timing": "Median perf_counter walltime after warmup; CUDA synchronized before and after each call. Excludes setup, input construction, and memory sampling.",
+    "memory": "First reduction before warmup; subtract pre-call memory with both input tensors already resident. CPU uses sampled RSS; CUDA uses PyTorch peak allocated bytes.",
+    "limits": [
+      "Synthetic finite inputs measure reduction cost only, not end-to-end model performance.",
+      "Identical RNG seed and construction are used in both workers; random values may differ across devices, dtypes, or PyTorch versions.",
+      "Small shapes can be dominated by launch, thread, or Python overhead; timing and memory are separate passes."
+    ]
+  },
+  "methods": {
+    "dense": {
+      "method": "dense",
+      "worker_pid": 48300,
+      "kl_source_sha256": "5576cebcbcb9e2a9941a321bb1420e29fc69e151349def59e52da0351fe573f6",
+      "environment": {
+        "python": "3.12.2",
+        "platform": "Windows-11-10.0.26200-SP0",
+        "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+        "torch": "2.11.0+cpu",
+        "psutil": "7.1.3",
+        "torch_cuda": null,
+        "device": "cpu",
+        "device_name": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+        "torch_threads": 4,
+        "torch_interop_threads": 1
+      },
+      "input_bytes": 268435456,
+      "seconds": [
+        0.053207899909466505,
+        0.05254489998333156,
+        0.06150519987568259
+      ],
+      "median_seconds": 0.053207899909466505,
+      "values": [
+        0.9999205470085144,
+        0.9999205470085144,
+        0.9999205470085144
+      ],
+      "memory_pass_value": 0.9999205470085144,
+      "memory": {
+        "method": "sampled_process_rss_delta",
+        "baseline_bytes": 675442688,
+        "peak_bytes": 1325985792,
+        "peak_extra_bytes": 650543104,
+        "sample_count": 9,
+        "requested_sample_interval_ms": 1.0,
+        "limitations": [
+          "RSS is an estimate of resident process memory, not tensor allocation bytes.",
+          "Sampling and OS scheduling can miss short-lived peaks, especially for small workloads.",
+          "Allocator reuse, residency changes, and sampler overhead affect the delta; a zero delta does not imply zero allocations."
+        ]
+      }
+    },
+    "chunked": {
+      "method": "chunked",
+      "worker_pid": 47432,
+      "kl_source_sha256": "5576cebcbcb9e2a9941a321bb1420e29fc69e151349def59e52da0351fe573f6",
+      "environment": {
+        "python": "3.12.2",
+        "platform": "Windows-11-10.0.26200-SP0",
+        "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+        "torch": "2.11.0+cpu",
+        "psutil": "7.1.3",
+        "torch_cuda": null,
+        "device": "cpu",
+        "device_name": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+        "torch_threads": 4,
+        "torch_interop_threads": 1
+      },
+      "input_bytes": 268435456,
+      "seconds": [
+        0.05058909999206662,
+        0.04888989985920489,
+        0.06164710014127195
+      ],
+      "median_seconds": 0.05058909999206662,
+      "values": [
+        0.9999205332715064,
+        0.9999205332715064,
+        0.9999205332715064
+      ],
+      "memory_pass_value": 0.9999205332715064,
+      "memory": {
+        "method": "sampled_process_rss_delta",
+        "baseline_bytes": 674422784,
+        "peak_bytes": 759623680,
+        "peak_extra_bytes": 85200896,
+        "sample_count": 5,
+        "requested_sample_interval_ms": 1.0,
+        "limitations": [
+          "RSS is an estimate of resident process memory, not tensor allocation bytes.",
+          "Sampling and OS scheduling can miss short-lived peaks, especially for small workloads.",
+          "Allocator reuse, residency changes, and sampler overhead affect the delta; a zero delta does not imply zero allocations."
+        ]
+      }
+    }
+  },
+  "parity": {
+    "passed": true,
+    "absolute_tolerance": 1e-06,
+    "relative_tolerance": 1e-05,
+    "absolute_difference": 1.3737007975578308e-08,
+    "max_absolute_difference_across_passes": 1.3737007975578308e-08
+  }
+}
