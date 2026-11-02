@@ -98,6 +98,20 @@ def generate_model_card(
     else:
         model_link = f"[{model_id}](https://huggingface.co/{model_id})"
 
+    steering_settings = config.steering.model_dump(mode="json")
+    recipe = trial.user_attrs.get("steering_recipe") or {}
+    steering_settings.update(recipe.get("steering") or {})
+    params = {
+        f"steering.{key}": str(steering_settings[key])
+        for key in (
+            "vector_method",
+            "steering_mode",
+            "n_directions",
+            "weight_normalization",
+        )
+    }
+    params.update(format_trial_params(trial))
+
     return f"""# This is a decensored version of {
         model_link
     }, made using [Abliterix](https://github.com/wuwangzhang1216/abliterix) v{
@@ -106,16 +120,12 @@ def generate_model_card(
 
 ## Steering parameters
 
+Method settings use the selected trial's saved recipe where available, falling
+back to the active export configuration for older trials without that metadata.
+
 | Parameter | Value |
 | :-------- | :---: |
-{
-        chr(10).join(
-            [
-                f"| **{name}** | {value} |"
-                for name, value in format_trial_params(trial).items()
-            ]
-        )
-    }
+{chr(10).join([f"| **{name}** | {value} |" for name, value in params.items()])}
 
 ## Performance
 
