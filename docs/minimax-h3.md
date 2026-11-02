@@ -11,12 +11,19 @@ generation, refusal detection, and token-distribution damage metrics.
 This repository provides two H3-oriented building blocks:
 
 1. `abliterix.video_prompt_sets` defines a paired video Prompt Set. Every
-   source target is preserved for provenance, expanded into a higher-intensity
-   harmful target, and paired with a benign counterfactual using the same
+   source target is preserved verbatim and paired with a generated benign
+   counterfactual using the same
    language, camera, visual style, and nearby scene semantics.
 2. `abliterix.h3_training` validates supervised H3 media manifests and lowers
    them into a shell-free cache/training execution plan for a pinned external
    H3 rectified-flow trainer.
+
+New pairs use schema v3 and the explicit
+`preserve_source_benign_counterfactual_v1` policy. Schema v2 amplification-era
+exports remain readable for historical analysis; the generator no longer creates
+or strengthens target scenes. A v3 fingerprint covers every pair field exactly,
+including source text, split, model, and policy. The v2 fingerprint algorithm is
+retained solely for compatibility.
 
 The second boundary is intentional. MiniMax publishes complete weights for
 fine-tuning, but its official repository does not currently contain a trainer.
@@ -37,14 +44,52 @@ uv run python scripts/refine_video_prompt_pairs.py \
   --model google/gemini-3.7-flash \
   --source-dataset wangzhang/abliterix-datasets \
   --source-revision 495e1e892236e41f7c3cf77a2616562b5b44608d \
+  --source-split train \
   --batch-size 8 --workers 4 --rate-limit-rpm 30
 ```
 
-The generator never writes credentials. It uses `OPENROUTER_API_KEY` from the
-process environment, writes resumable validated JSONL, amplifies the target
-side without sanitizing it, canonicalizes the seven visual-style families,
-requires every amplified target to be longer than its immutable source,
-rejects malformed chat/refusal boilerplate, and fingerprints every pair.
+The generator reads `OPENROUTER_API_KEY` from the process environment. Provider
+response bodies and exception details are excluded from diagnostic logs. A
+successful export contains validated pairs; length and schema validation do not
+establish safety, semantic quality, or suitability for training.
+
+The default `.progress.jsonl` file is a checkpoint, **not** an exported dataset.
+Its header binds a SHA-256 of the complete local source rows and metadata to the
+declared dataset, revision, split, selected IDs, requested model, and request
+policy (including the system prompt, schema, sampling options, batch size, and
+attempt limit). Changing any of these requires a new progress path. Legacy
+checkpoints without that header are rejected rather than assumed compatible.
+The script does not verify that the local file actually belongs to the declared
+remote revision. Prefer a pinned commit and retain the original source file.
+Requested model aliases may also change upstream; these hashes establish local
+run identity, not deterministic generation or provider authenticity.
+
+Checkpoint replacements are atomic, and a record checksum detects truncated or
+modified snapshots. Invalid, duplicate, or unknown rows fail before a provider
+client is opened. An exclusive `.lock` file rejects concurrent checkpoint
+writers. After a hard process crash, confirm that no writer remains before
+removing the stale lock; retain the checkpoint. Use distinct output paths for
+separate runs.
+
+Provider refusals, blocked or non-stop finishes (including token truncation),
+empty responses, malformed outputs, and duplicate generated prompts are recorded
+for review without another generation attempt. There is no alternate prompt or
+safety-filter bypass. Only transient transport failures can retry the identical
+request; SDK retries are disabled. A batch is recorded before it is sent, so an
+interrupted request remains for review on resume instead of being submitted
+again. A batch-level failure conservatively excludes all sources in that batch.
+Review records contain source IDs and reason codes, not provider response text.
+
+The export's `.provenance.json` contains the run identity, output-file hash, and
+excluded source IDs/reasons. The summary reports `review_count` and a
+`requires_review` status when any sources were excluded; do not treat such an
+export as complete coverage. Keep the source, checkpoint, export, and provenance
+sidecar together. Fully recorded checkpoints can be exported without an API key.
+
+These contracts follow the [Gemini response and finish-reason documentation](https://ai.google.dev/api/generate-content#v1beta.GenerateContentResponse),
+[OpenRouter's normalized finish reasons](https://openrouter.ai/docs/api/reference/overview),
+and the distinction between [dataset content/transform fingerprints](https://huggingface.co/docs/datasets/about_cache)
+and [declared revisions and splits](https://huggingface.co/docs/datasets/loading).
 
 Prompt pairs alone are suitable for Prompt Set extraction and evaluation. They
 are not supervised H3 training data: a rectified-flow loss requires target
@@ -60,7 +105,6 @@ One JSON object per line:
   "task": "fl2va",
   "caption": "A tracking shot follows an adult walking through a gallery.",
   "target_video": "/data/targets/sample-000001.mp4",
-  "target_audio": "/data/targets/sample-000001.wav",
   "reference_images": [],
   "reference_videos": [],
   "reference_audios": []
@@ -72,7 +116,10 @@ Constraints enforced by the plan validator:
 - height and width are divisible by 32;
 - `frames % 17 == 5`;
 - every media path exists;
-- reference media use the `ref2va` variant;
+- only basic `fl2va` rows are supported; explicit `target_audio`, reference
+  media, and `ref2va` rows are rejected because the reviewed external cache
+  adapter does not consume them;
+- `--encode-audio` uses audio embedded in `target_video`, not a separate WAV;
 - full 33B training uses DeepSpeed rather than the one-GPU DDP smoke path.
 
 Create a JSON configuration containing `model_path`, `trainer_path`,
@@ -85,9 +132,20 @@ uv run python scripts/plan_h3_training.py \
   --output runs/minimax_h3/plan.json
 ```
 
-The resulting artifact contains argument arrays for cache preparation and
-training. Review and execute them in the pinned trainer environment; Abliterix
-does not run an arbitrary shell command on import.
+The schema-v2 plan contains argument arrays and a sibling
+`<plan-stem>.manifest.<SHA256>.jsonl` file. The normalized manifest uses absolute
+media paths and supplies both `target_video` and the `video` alias required by
+the reviewed cache loader. The source manifest is retained. Plan output cannot
+overwrite the input configuration or source manifest.
+
+The adapter was reviewed against external trainer commit
+[`74d535b2cae5cd56f9565059e6f2b6c9ddb39df4`](https://github.com/IAmIronMan42/MiniMax-H3-FineTuning/tree/74d535b2cae5cd56f9565059e6f2b6c9ddb39df4).
+The plan records source/normalized manifest hashes, the local trainer commit
+when available, and cache/training script hashes. It explicitly records
+`compatibility: unvalidated` and `runtime_validation: not_run`: source inspection
+and local contract tests do not demonstrate working GPU training. Review the
+plan in the exact external trainer environment before any execution. Abliterix
+does not launch the external trainer or execute shell commands on import.
 
 ## Recommended training surface
 

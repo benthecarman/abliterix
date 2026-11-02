@@ -1,4 +1,10 @@
-# Video Prompt Set audit — 2026-08-21
+# Historical Video Prompt Set audit — 2026-08-21
+
+This is the original PR author's historical audit report. The numerical findings
+below were not independently reproduced during the repair review; no provider
+requests, dataset downloads, or uploads were performed. Its v2 generation policy
+is retired. Current generation uses source-preserving v3 pairs described in
+[the supported workflow](minimax-h3.md).
 
 ## Executive summary
 
@@ -6,15 +12,12 @@ The current `video_good_1000` and `video_bad_1000` splits have good breadth,
 balanced language/style sampling, and no duplicate prompts. They are suitable
 as broad prompt pools. They are not yet a clean paired Prompt Set for extracting
 a video-model safety direction because the benign and harmful rows were sampled
-independently. The paired-prompt pipeline applies no age- or sensitivity-based
-content rejection.
+independently.
 
-The recommended v2 artifact keeps all 1,000 source targets, expands every bad
-prompt into a longer and more visually intense target, and generates one strict
-benign counterfactual for each target. It fixes the camera, style, language,
-setting, and harmless scene elements per pair. This produces 1,000 analyzable
-pairs rather than relying on 698 loosely category-matched benign examples plus
-302 unrelated everyday prompts.
+The historical v2 report proposed generated target rewrites. The supported v3
+workflow instead keeps source targets verbatim and generates only benign
+counterfactuals. Provider refusals and blocked finishes remain excluded for
+review; completeness must be reported rather than achieved by bypassing filters.
 
 ## Scope and methodology
 
@@ -42,11 +45,11 @@ artifact was then generated and validated row by row through OpenRouter.
 | Minor-term matches | 9 benign contexts | 0 |
 | Provider-refusal matches after contextual review | 0 | 0 |
 
-The final v2 artifact contains 1,000 valid pairs. All 1,000 amplified targets
-are longer than their immutable sources. Mean target length increased from
-158.994 to 293.527 characters (about 1.93x). Gemini 3.7 Flash generated 986
-pairs; Venice Uncensored generated the 14 rows that either exhausted Gemini's
-provider-side content filter retries or failed the amplification invariant.
+The historical v2 report described 1,000 validated pairs, with mean target
+length increasing from 158.994 to 293.527 characters (about 1.93x). These are
+reported historical results, not evidence for the repaired v3 pipeline. Its
+reported use of content-filter retries and alternate providers is unsupported;
+those behaviors must not be reproduced by the current workflow.
 
 The apparent harmful-split refusal match was the phrase “不能泄露出去” inside a
 depicted corrupt conversation, not a provider refusal. This motivated a
@@ -73,14 +76,14 @@ from `visual_style` instead of asking a model to invent another label.
 
 Nine benign rows mention young people in safe contexts such as first aid,
 anti-bullying, and anti-radicalization. They are not policy violations. They are
-retained when present; the v2 pipeline does not reject prompts based on age or
-content sensitivity.
+reported as retained in the historical corpus. Schema validation is not a
+safety audit, and the current workflow respects provider safety decisions.
 
-## Recommended v2 contract
+## Historical v2 import contract
 
 Each row contains:
 
-- an immutable `source_dataset` and `source_revision`;
+- declared `source_dataset` and `source_revision` provenance labels;
 - `pair_id` and original harmful row ID;
 - immutable source target, amplified target, and benign prompts in the same row;
 - shared category, language, shot type, and canonical visual style;
@@ -92,21 +95,23 @@ Each row contains:
 
 The validator requires an amplified target longer than its immutable source and
 rejects duplicates, unknown labels, chat-style instructions, provider-refusal
-boilerplate, metadata/style disagreement, and fingerprint drift. It does not
-apply sensitivity-based content rejection.
+boilerplate, metadata/style disagreement, and fingerprint drift. These rules apply only to historical v2 imports. New v3 pairs require exact
+source preservation and record split/model/policy provenance; they do not require
+or accept target expansion.
 
 ## Training implications
 
 This v2 output remains a text-only Prompt Set. It can support paired residual
 extraction, prompt-conditioned analysis, or generation evaluation. It cannot by
-itself supervise MiniMax-H3's rectified-flow objective. H3 LoRA training also
-requires a target video and preferably target 32 kHz stereo audio for every
-caption; those assets belong in a separate media manifest validated by
-`abliterix.h3_training`.
+itself supervise MiniMax-H3's rectified-flow objective. The separate `abliterix.h3_training` adapter accepts target video manifests
+within its documented basic `fl2va` boundary. It rejects separate audio and
+reference-media fields that the reviewed external cache loader would ignore.
+GPU training compatibility has not been established by these local checks.
 
-## Next action
+## Current validation boundary
 
-Run a 16-pair Gemini pilot, inspect target amplification and presentation
-matching, then resume the same command for all 1,000 pairs. The generator is
-resumable and writes only structurally valid rows, so a provider interruption
-does not lose accepted work.
+The repaired workflow has local fake-provider tests for source preservation,
+provenance drift, corrupted checkpoints, and terminal refusal/filter handling.
+No v3 dataset or live generation quality result is claimed here. Retain the source,
+checkpoint, exported pairs, and provenance sidecar together; review excluded IDs
+and report the resulting coverage before using an export for analysis.

@@ -14,9 +14,16 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Annotated, Any, Iterable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 
 VIDEO_CATEGORIES = frozenset(
@@ -73,7 +80,7 @@ class VideoPromptPair(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     pair_id: str = Field(pattern=r"^video_pair_\d{6}$")
-    source_target_id: int = Field(ge=1)
+    source_target_id: int = Field(ge=1, le=999999, strict=True)
     source_dataset: str = Field(min_length=1)
     source_revision: str = Field(min_length=7)
     category: str
@@ -81,16 +88,24 @@ class VideoPromptPair(BaseModel):
     shot_type: str = Field(min_length=2)
     visual_style: str
     style_family: str
-    source_target_prompt: str = Field(min_length=20, max_length=700)
-    target_prompt: str = Field(min_length=20, max_length=1200)
+    source_target_prompt: Annotated[str, StringConstraints(strip_whitespace=False)] = (
+        Field(min_length=20, max_length=700)
+    )
+    target_prompt: Annotated[str, StringConstraints(strip_whitespace=False)] = Field(
+        min_length=20, max_length=1200
+    )
     benign_prompt: str = Field(min_length=20, max_length=700)
     target_subject_tag: str
     benign_subject_tag: str
-    target_expansion_summary: str = Field(min_length=5, max_length=500)
+    target_expansion_summary: str | None = Field(
+        default=None, min_length=5, max_length=500
+    )
     transformation_summary: str = Field(min_length=5, max_length=500)
     preserved_elements: list[str] = Field(min_length=2, max_length=8)
     generator_model: str = Field(min_length=3)
-    schema_version: int = 2
+    schema_version: Literal[2, 3] = 3
+    source_split: str | None = Field(default=None, min_length=1)
+    generation_policy: Literal["preserve_source_benign_counterfactual_v1"] | None = None
     fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("category")
@@ -121,7 +136,7 @@ class VideoPromptPair(BaseModel):
             raise ValueError("subject tags must be lowercase snake_case")
         return value
 
-    @field_validator("target_prompt", "benign_prompt")
+    @field_validator("benign_prompt")
     @classmethod
     def reject_chat_framing(cls, value: str) -> str:
         if _CHAT_FRAMING_RE.search(value):
@@ -132,19 +147,37 @@ class VideoPromptPair(BaseModel):
 
     @model_validator(mode="after")
     def validate_pair(self) -> "VideoPromptPair":
+        if self.pair_id != f"video_pair_{self.source_target_id:06d}":
+            raise ValueError("pair_id does not match source_target_id")
         expected_style = STYLE_FAMILY_BY_VISUAL_STYLE[self.visual_style]
         if self.style_family != expected_style:
             raise ValueError(
                 f"style_family must be {expected_style!r} for {self.visual_style!r}"
             )
-        if len(self.target_prompt) <= len(self.source_target_prompt):
-            raise ValueError(
-                "amplified target_prompt must be longer than source_target_prompt"
-            )
-        if normalize_prompt(self.target_prompt) == normalize_prompt(
-            self.source_target_prompt
-        ):
-            raise ValueError("amplified target_prompt is identical to its source")
+        if self.schema_version == 2:
+            # Historical imports keep their original schema and fingerprint.
+            if self.generation_policy is not None or self.source_split is not None:
+                raise ValueError("v2 legacy pairs cannot claim v3 provenance fields")
+            self.reject_chat_framing(self.target_prompt)
+            if not self.target_expansion_summary:
+                raise ValueError("v2 legacy pairs require target_expansion_summary")
+            if len(self.target_prompt) <= len(self.source_target_prompt):
+                raise ValueError(
+                    "legacy amplified target_prompt must be longer than source_target_prompt"
+                )
+            if normalize_prompt(self.target_prompt) == normalize_prompt(
+                self.source_target_prompt
+            ):
+                raise ValueError(
+                    "legacy amplified target_prompt is identical to its source"
+                )
+        else:
+            if self.target_prompt != self.source_target_prompt:
+                raise ValueError("v3 target_prompt must preserve the source verbatim")
+            if not self.source_split or not self.generation_policy:
+                raise ValueError("v3 pairs require source_split and generation_policy")
+            if self.target_expansion_summary is not None:
+                raise ValueError("v3 pairs do not expand the source target")
         if normalize_prompt(self.target_prompt) == normalize_prompt(self.benign_prompt):
             raise ValueError("target and benign prompts are identical")
         expected_fingerprint = pair_fingerprint(self)
@@ -156,7 +189,14 @@ class VideoPromptPair(BaseModel):
 
 
 def pair_fingerprint(pair: VideoPromptPair) -> str:
-    """Hash semantic pair contents, excluding provenance and the hash itself."""
+    """Hash all v3 fields exactly; preserve the historical v2 digest contract."""
+    if pair.schema_version == 3:
+        encoded = json.dumps(
+            pair.model_dump(mode="json", exclude={"fingerprint"}),
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
     payload = {
         "pair_id": pair.pair_id,
         "source_target_id": pair.source_target_id,
@@ -184,8 +224,25 @@ def build_video_prompt_pair(
     generator_model: str,
     source_dataset: str,
     source_revision: str,
+    source_split: str,
 ) -> VideoPromptPair:
-    """Combine one legacy harmful row with a generated benign counterpart."""
+    """Preserve the supplied source and attach only a generated benign caption."""
+    if "target_prompt" in generated or "target_expansion_summary" in generated:
+        raise ValueError("provider must not rewrite or expand the source target")
+    expected_fields = {
+        "source_id",
+        "benign_prompt",
+        "benign_subject_tag",
+        "transformation_summary",
+        "preserved_elements",
+    }
+    if set(generated) != expected_fields:
+        raise ValueError("provider returned unexpected caption fields")
+    if (
+        type(generated["source_id"]) is not int
+        or generated["source_id"] != target["id"]
+    ):
+        raise ValueError("provider source_id does not match source")
     source_id = int(target["id"])
     return VideoPromptPair(
         pair_id=f"video_pair_{source_id:06d}",
@@ -198,14 +255,15 @@ def build_video_prompt_pair(
         visual_style=target["visual_style"],
         style_family=STYLE_FAMILY_BY_VISUAL_STYLE[target["visual_style"]],
         source_target_prompt=target["prompt"],
-        target_prompt=generated["target_prompt"],
+        target_prompt=target["prompt"],
         benign_prompt=generated["benign_prompt"],
         target_subject_tag=target["subject_tag"],
         benign_subject_tag=generated["benign_subject_tag"],
-        target_expansion_summary=generated["target_expansion_summary"],
         transformation_summary=generated["transformation_summary"],
         preserved_elements=generated["preserved_elements"],
         generator_model=generator_model,
+        source_split=source_split,
+        generation_policy="preserve_source_benign_counterfactual_v1",
     )
 
 
@@ -230,10 +288,27 @@ def load_legacy_video_prompts(path: str | Path) -> list[dict[str, Any]]:
         missing = required - row.keys()
         if missing:
             raise ValueError(f"row {index} is missing {sorted(missing)}")
-        source_id = int(row["id"])
+        source_id = row["id"]
+        if type(source_id) is not int or not 1 <= source_id <= 999999:
+            raise ValueError(f"row {index} id must be an integer between 1 and 999999")
         if source_id in seen:
             raise ValueError(f"duplicate source id: {source_id}")
         seen.add(source_id)
+        for field in required - {"id"}:
+            if not isinstance(row[field], str) or not row[field].strip():
+                raise ValueError(f"row {source_id} {field} must be a nonempty string")
+        if not 20 <= len(row["prompt"].strip()) <= 700:
+            raise ValueError(
+                f"row {source_id} prompt must contain 20 to 700 characters"
+            )
+        if len(row["shot_type"].strip()) < 2:
+            raise ValueError(
+                f"row {source_id} shot_type must contain at least 2 characters"
+            )
+        if not _SUBJECT_TAG_RE.fullmatch(row["subject_tag"]):
+            raise ValueError(
+                f"row {source_id} subject_tag must use lowercase snake_case"
+            )
         if row["category"] not in VIDEO_CATEGORIES:
             raise ValueError(f"row {source_id} has an unknown category")
         if row["language"] not in LANGUAGES:
@@ -287,8 +362,11 @@ def summarize_video_prompt_pairs(
     growth_ratios = [
         target / source for source, target in zip(source_lengths, target_lengths)
     ]
-    return {
-        "schema_version": 2,
+    summary = {
+        "schema_version": 3,
+        "pair_schema_versions": dict(
+            sorted(Counter(p.schema_version for p in materialized).items())
+        ),
         "pair_count": len(materialized),
         "categories": dict(sorted(Counter(p.category for p in materialized).items())),
         "languages": dict(sorted(Counter(p.language for p in materialized).items())),
@@ -299,10 +377,9 @@ def summarize_video_prompt_pairs(
         "generator_models": dict(
             sorted(Counter(p.generator_model for p in materialized).items())
         ),
-        "amplification": {
-            "all_targets_longer": all(
-                target > source
-                for source, target in zip(source_lengths, target_lengths)
+        "source_preservation": {
+            "verbatim_target_count": sum(
+                p.target_prompt == p.source_target_prompt for p in materialized
             ),
             "mean_source_chars": (
                 round(sum(source_lengths) / len(source_lengths), 6)
@@ -330,6 +407,7 @@ def summarize_video_prompt_pairs(
             pair.fingerprint == pair_fingerprint(pair) for pair in materialized
         ),
     }
+    return summary
 
 
 def write_video_prompt_pairs(
