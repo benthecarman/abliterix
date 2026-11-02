@@ -37,7 +37,9 @@ from transformers.generation import (
 from ..settings import AbliterixConfig
 from ..types import ChatMessage, QuantMode, SteeringMode, VectorMethod, WeightNorm
 from ..util import chunk_batches, flush_memory, print
+from .bnb_utils import is_bnb_int8_weight, validate_bnb_int8_weight
 from . import fp8_utils
+from .quantization_validation import validate_quantization_state
 
 # transformers < 5.0 uses torch_dtype=, >= 5.0 uses dtype= in from_pretrained.
 import transformers as _tf
@@ -129,9 +131,17 @@ def _install_mtp_layer_type_validator() -> None:
 _install_mtp_layer_type_validator()
 
 
+# Cap the dequantised-weight cache so large MoE expert counts cannot retain
+# hundreds of GB of fp32 copies in RAM.  Shared by SteeringEngine.__init__ and
+# the fast vLLM engine shell in cli.py so the two cannot drift apart.
+DEQUANT_CACHE_MAX_BYTES = 4 * 1024**3  # 4 GiB
+
+
 def resolve_model_class(
     model_id: str,
     revision: str | None = None,
+    *,
+    text_only: bool = False,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
     """Choose the correct AutoModel class based on the model's configuration.
 
@@ -139,11 +149,35 @@ def resolve_model_class(
     ``AutoModelForImageTextToText``; their text backbone is accessed via the
     ``model.language_model`` path in ``transformer_layers``.  Pure text models
     use ``AutoModelForCausalLM``.
+
+    When *text_only* is true, always return ``AutoModelForCausalLM`` even if
+    the checkpoint advertises multimodal fields (opt-in for text abliteration
+    of dual-registered MoE VLMs such as some Qwen3.5-MoE checkpoints).
     """
     configs = PretrainedConfig.get_config_dict(model_id, revision=revision)
-    if any("vision_config" in cfg for cfg in configs):
+    if text_only:
+        return AutoModelForCausalLM
+
+    config_dicts = configs if isinstance(configs, tuple) else (configs,)
+
+    if any(isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
+
+
+def _bf16_compute_supported() -> bool:
+    """True when the active accelerator has native (non-emulated) bf16.
+
+    ``torch.cuda.is_bf16_supported()`` defaults to including software
+    emulation, so pre-Ampere CUDA cards still return True. We only treat
+    ROCm and sm_80+ as native bf16 so older CUDA targets can fall back to
+    float16 for both bnb compute dtype and residual promotion.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.hip:  # ROCm: native on supported archs
+        return True
+    return torch.cuda.get_device_capability()[0] >= 8
 
 
 def _register_mtp_layer_types_adapter(
@@ -301,8 +335,8 @@ def _captured_logprobs(sampler: _LogitsSampler, expected_steps: int) -> Tensor:
     return stacked
 
 
-def _forward_supports_logits_to_keep(model: Module) -> bool:
-    """Return whether the underlying model explicitly limits output logits.
+def _forward_supports_kwarg(model: Module, name: str) -> bool:
+    """Return whether the underlying model explicitly accepts a keyword.
 
     PEFT and ``torch.compile`` expose generic ``**kwargs`` forward signatures,
     so inspect their wrapped base model instead.  A generic ``**kwargs`` alone
@@ -332,9 +366,17 @@ def _forward_supports_logits_to_keep(model: Module) -> bool:
         break
 
     try:
-        return "logits_to_keep" in inspect.signature(current.forward).parameters
-    except (TypeError, ValueError):
+        parameter = inspect.signature(current.forward).parameters.get(name)
+        return parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    except (AttributeError, TypeError, ValueError):
         return False
+
+
+def _forward_supports_logits_to_keep(model: Module) -> bool:
+    return _forward_supports_kwarg(model, "logits_to_keep")
 
 
 def _required_lora_rank(config: AbliterixConfig) -> int:
@@ -377,6 +419,10 @@ class SteeringEngine:
         self.response_prefix = ""
         self.needs_reload = False
         self._dequant_cache: dict[int, Tensor] = {}
+        self._dequant_cache_bytes: int = 0
+        # Cap dequant cache so large MoE expert counts cannot retain
+        # hundreds of GB of fp32 weights in RAM.
+        self._dequant_cache_max_bytes: int = DEQUANT_CACHE_MAX_BYTES
 
         # Cached metadata — populated by prepare_for_unload() before the HF
         # model is freed, so the optimizer can still query layer/component
@@ -522,7 +568,7 @@ class SteeringEngine:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
             try:
-                qconfig = self._build_quant_config(dtype)
+                qconfig = self._build_quant_config()
 
                 extra: dict[str, Any] = {}
                 if qconfig is not None:
@@ -565,7 +611,9 @@ class SteeringEngine:
                     )
 
                 self.model = resolve_model_class(
-                    model_id, config.model.revision
+                    model_id,
+                    config.model.revision,
+                    text_only=config.model.text_only,
                 ).from_pretrained(
                     model_id,
                     **{_dtype_kwarg: dtype},
@@ -622,12 +670,16 @@ class SteeringEngine:
                             "offline.[/]"
                         )
 
+                validate_quantization_state(self.model, stage="after loading")
+
                 # Smoke-test: a single forward pass catches dtype-related
                 # runtime errors (inf/nan probability tensors, etc.).
+                self._validate_int8_state()
                 self._generate(
                     [ChatMessage(system=config.system_prompt, user="What is 1+1?")],
                     max_new_tokens=1,
                 )
+                self._validate_int8_state()
             except (
                 Exception
             ) as error:  # Model loading may fail with diverse errors (OOM, dtype, CUDA)
@@ -649,6 +701,24 @@ class SteeringEngine:
 
         if self.model is None:
             raise RuntimeError("Failed to load model with all configured dtypes.")
+
+        # bnb 4-bit: non-quantized tensors (embed/norm/lm_head) may still be
+        # float16 after load (including dtype="auto" when the checkpoint is
+        # float16). When native bf16 is available, promote live float16 params
+        # so residual norms match the bf16 compute path. Skip promotion when
+        # we fell back to float16 compute (pre-Ampere CUDA). Parameters on
+        # meta (accelerate offload) may not retain this.
+        if (
+            config.model.quant_method == QuantMode.BNB_4BIT
+            and _bf16_compute_supported()
+        ):
+            n_conv = 0
+            for _n, _p in self.model.named_parameters():
+                if _p.dtype == torch.float16:
+                    _p.data = _p.data.to(torch.bfloat16)
+                    n_conv += 1
+            if n_conv:
+                print(f"  [dim]Promoted {n_conv} non-quantized params fp16→bf16[/]")
 
         # NOTE: FP8 dequant is now applied inside the dtype loop (above),
         # before the smoke-test, so we no longer need it here.
@@ -903,6 +973,7 @@ class SteeringEngine:
     def _init_adapters(self):
         """Wrap the base model in PEFT LoRA adapters targeting steerable modules."""
         assert isinstance(self.model, PreTrainedModel)
+        validate_quantization_state(self.model, stage="before adapter initialization")
 
         # Build a map from module id to its full path in the model tree.
         # We use full paths (not leaf names) to avoid collisions with identically
@@ -912,6 +983,7 @@ class SteeringEngine:
         id_to_path: dict[int, str] = {
             id(m): name for name, m in self.model.named_modules()
         }
+        self._validate_int8_state()
 
         target_paths: set[str] = set()
         for idx in range(len(self.transformer_layers)):
@@ -935,6 +1007,9 @@ class SteeringEngine:
         )
 
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
+        # Adapter insertion can redispatch offloaded weights after the load
+        # smoke test, so validate the resulting metadata as well.
+        validate_quantization_state(self.model, stage="after adapter initialization")
 
         # PEFT inherits the base layer's dtype for LoRA A/B weights.  For FP8
         # models this produces Float8_e4m3fn parameters that crash F.linear
@@ -944,6 +1019,8 @@ class SteeringEngine:
             for name, param in self.model.named_parameters():
                 if "lora_" in name and param.dtype in _fp8:
                     param.data = param.data.to(torch.bfloat16)
+
+        self._validate_int8_state()
 
         # Pre-cache references to every lora_B weight tensor for O(adapter-count)
         # resets instead of a full named_modules walk.
@@ -958,6 +1035,20 @@ class SteeringEngine:
             f"* LoRA adapters initialised "
             f"({len(targets)} modules, leaves: {', '.join(leaf_summary)})"
         )
+
+    def _validate_int8_state(self) -> None:
+        """Check int8 metadata before expensive extraction and optimization."""
+        for name, module in self.model.named_modules():
+            # The underlying module is visited separately; skip PEFT wrappers.
+            if getattr(module, "base_layer", None) is not None:
+                continue
+            if is_bnb_int8_weight(module):
+                try:
+                    validate_bnb_int8_weight(module)
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        f"Invalid bitsandbytes int8 state in {name or '<root>'}: {error}"
+                    ) from error
 
     @staticmethod
     def _patch_moe_config_for_fp8(model_id: str, revision: str | None = None) -> None:
@@ -994,11 +1085,16 @@ class SteeringEngine:
         except Exception:
             pass  # Best-effort; if this fails, the original error will surface.
 
-    def _build_quant_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _build_quant_config(self) -> BitsAndBytesConfig | None:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
-            compute_dtype = torch.bfloat16 if dtype == "auto" else getattr(torch, dtype)
+            # Prefer native bf16 compute for residual dynamic range; fall back
+            # to float16 on pre-Ampere CUDA (and CPU). Does not control which
+            # modules are quantized — only matmul compute dtype.
+            compute_dtype = (
+                torch.bfloat16 if _bf16_compute_supported() else torch.float16
+            )
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1254,6 +1350,7 @@ class SteeringEngine:
         # anything left here pins the model's VRAM after
         # ``engine.model = None`` (issue #83).
         self._dequant_cache.clear()
+        self._dequant_cache_bytes = 0
         for handle in getattr(self, "_angular_hooks", []):
             handle.remove()
         self._angular_hooks = []
@@ -1332,7 +1429,9 @@ class SteeringEngine:
     def _init_expert_routing(self):
         """Prepare bookkeeping lists for router/expert weight rollback."""
         self._router_originals: list[tuple[int, int, Tensor]] = []
-        self._expert_deltas: list[tuple[int, int, float, Tensor, Tensor]] = []
+        # ``(layer_idx, expert_idx, original_expert_slice)`` — the untouched
+        # weight slice, not a reconstructible delta.
+        self._expert_deltas: list[tuple[int, int, Tensor]] = []
 
     def identify_safety_experts(
         self,
@@ -1399,20 +1498,25 @@ class SteeringEngine:
         for idx, gate in gates.items():
             handles.append(gate.register_forward_hook(_make_hook(idx)))
 
-        print("  Profiling benign prompts...")
-        active_counts[0] = benign_counts
-        active_tokens[0] = benign_tokens
-        with torch.no_grad():
-            self.extract_hidden_states_batched(benign_msgs)
+        # The profiling passes run two full sweeps over every prompt; an OOM
+        # or dtype error there would otherwise leave every router hook
+        # registered for the rest of the process, mutating counters on every
+        # later forward pass.
+        try:
+            print("  Profiling benign prompts...")
+            active_counts[0] = benign_counts
+            active_tokens[0] = benign_tokens
+            with torch.no_grad():
+                self.extract_hidden_states_batched(benign_msgs)
 
-        print("  Profiling target prompts...")
-        active_counts[0] = target_counts
-        active_tokens[0] = target_tokens
-        with torch.no_grad():
-            self.extract_hidden_states_batched(target_msgs)
-
-        for h in handles:
-            h.remove()
+            print("  Profiling target prompts...")
+            active_counts[0] = target_counts
+            active_tokens[0] = target_tokens
+            with torch.no_grad():
+                self.extract_hidden_states_batched(target_msgs)
+        finally:
+            for h in handles:
+                h.remove()
 
         safety: dict[int, list[tuple[int, float]]] = {}
         for idx, gate in gates.items():
@@ -1456,8 +1560,16 @@ class SteeringEngine:
         if hasattr(self, "_direct_weight_originals"):
             self._direct_weight_originals.clear()
 
-        current_id = getattr(self.model.config, "name_or_path", None)
-        if current_id == self.config.model.model_id and not self.needs_reload:
+        # ``_model_config_name`` is the canonical loader identity and also
+        # falls back to the legacy ``name_or_path`` alias, which transformers
+        # >=5 may drop. Reading only ``name_or_path`` (as this did) yields
+        # ``None`` there, making the comparison always fail and forcing a full
+        # model reload on *every* trial.
+        current_id = _model_config_name(self.model.config)
+        if (
+            current_id == self.config.model.model_id.rstrip("/")
+            and not self.needs_reload
+        ):
             for w in self._lora_b_weights:
                 torch.nn.init.zeros_(w)
 
@@ -1467,12 +1579,18 @@ class SteeringEngine:
                     gate.weight.data[expert_idx] = original_row.to(gate.weight.device)  # ty:ignore[invalid-assignment,no-matching-overload]
             self._router_originals.clear()
 
-            for layer_idx, expert_idx, w, v, vTW in self._expert_deltas:
+            # Write back the exact pre-edit expert slice. Storing the original
+            # (rather than reconstructing it from the applied delta) keeps this
+            # idempotent: when the same fused tensor was also edited by EGA,
+            # the whole-tensor restore above has already undone the expert
+            # edit, and re-applying the inverse delta here would inject a
+            # spurious rank-1 term that would then be cached as the "original"
+            # for the next trial. It also avoids an fp32 round trip, which
+            # silently loses precision for fp8/packed storage dtypes.
+            for layer_idx, expert_idx, original_slice in self._expert_deltas:
                 dp = self._locate_fused_weights(self.transformer_layers[layer_idx])
                 if dp is not None:
-                    W = dp.data[expert_idx].to(torch.float32)
-                    W += (w * torch.outer(v, vTW)).to(device=W.device)
-                    dp.data[expert_idx] = W.to(dp.dtype)
+                    dp.data[expert_idx] = original_slice.to(dp.device).to(dp.dtype)
             self._expert_deltas.clear()
             return
 
@@ -1480,13 +1598,22 @@ class SteeringEngine:
         self.model = None  # ty:ignore[invalid-assignment]
         flush_memory()
 
-        qconfig = self._build_quant_config(str(dtype).split(".")[-1])
+        # The dequant cache is keyed by ``id(module)``. Once the old model is
+        # freed the freshly allocated wrappers routinely land on the same
+        # addresses, so a surviving entry would hand the next trial a stale
+        # dequantized weight tensor from a *different* model object.
+        self._dequant_cache.clear()
+        self._dequant_cache_bytes = 0
+
+        qconfig = self._build_quant_config()
         extra: dict[str, Any] = {}
         if qconfig is not None:
             extra["quantization_config"] = qconfig
 
         self.model = resolve_model_class(
-            self.config.model.model_id, self.config.model.revision
+            self.config.model.model_id,
+            self.config.model.revision,
+            text_only=self.config.model.text_only,
         ).from_pretrained(
             self.config.model.model_id,
             **{_dtype_kwarg: dtype},
@@ -1551,7 +1678,9 @@ class SteeringEngine:
 
             print("* Loading base model on CPU (this may take a while)...")
             base = resolve_model_class(
-                self.config.model.model_id, self.config.model.revision
+                self.config.model.model_id,
+                self.config.model.revision,
+                text_only=self.config.model.text_only,
             ).from_pretrained(
                 self.config.model.model_id,
                 **{_dtype_kwarg: self.model.dtype},
@@ -1573,6 +1702,15 @@ class SteeringEngine:
             merged = self.model.merge_and_unload()
             self.needs_reload = True
             return merged
+
+    def _cache_dequant(self, mid: int, weight: Tensor) -> None:
+        """Store a dequantized weight tensor if under the byte budget.
+
+        Pure performance cache: skipping an insert only costs re-dequant time.
+        """
+        if self._dequant_cache_bytes < self._dequant_cache_max_bytes:
+            self._dequant_cache[mid] = weight
+            self._dequant_cache_bytes += weight.nelement() * weight.element_size()
 
     def export_adapter(self, save_directory: str | os.PathLike[str]) -> None:
         """Save the active LoRA adapter without BF16 merge-rounding drift.
@@ -1597,6 +1735,21 @@ class SteeringEngine:
             )
         if not isinstance(self.model, PeftModel):
             raise RuntimeError("No active PEFT LoRA adapter is available to export.")
+        # `export_merged()` calls `merge_and_unload()` in place on the
+        # unquantized path: the LoRA layers are folded into the base weights
+        # and removed, but `self.model` stays a PeftModel object.  The
+        # isinstance check above therefore still passes and PEFT would happily
+        # write a zero-tensor adapter.  `needs_reload` is the engine's
+        # canonical "weights were destructively mutated" flag; the state-dict
+        # check also covers any other route to an emptied adapter.
+        if self.needs_reload or not any(
+            "lora_" in name for name, _ in self.model.named_parameters()
+        ):
+            raise RuntimeError(
+                "The in-memory LoRA adapter was consumed by a previous merged "
+                "export. Re-select the trial to reload the base model before "
+                "exporting an adapter."
+            )
 
         self.model.save_pretrained(save_directory)
 
@@ -1837,6 +1990,7 @@ class SteeringEngine:
         min_new_tokens: int | None = None,
     ) -> tuple[list[str], Tensor]:
         """Batched wrapper around :meth:`generate_and_score`."""
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
         all_resp: list[str] = []
         all_lp: list[Tensor] = []
         for batch in chunk_batches(messages, self.config.inference.batch_size):
@@ -1848,6 +2002,8 @@ class SteeringEngine:
                 min_new_tokens=min_new_tokens,
             )
             all_resp.extend(resp)
+            if offload:
+                lp = lp.cpu()
             all_lp.append(lp)
         return all_resp, torch.cat(all_lp, dim=0)
 
@@ -1961,12 +2117,23 @@ class SteeringEngine:
     # Log-probability measurement
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
     def _logprobs_forward_pass(self, messages: list[ChatMessage]) -> Tensor:
         """Next-token logprobs via a single forward pass (no generation overhead)."""
         inputs = self._tokenize(messages)
         self._reset_position_cache()
-        outputs = self.model(**inputs)
-        return F.log_softmax(outputs.logits[:, -1, :], dim=-1)
+        cache = getattr(self, "_logprobs_forward_options", None)
+        model_identity = id(self.model)
+        if cache is None or cache[0] != model_identity:
+            forward_kwargs: dict[str, Any] = {}
+            if _forward_supports_logits_to_keep(cast(Module, self.model)):
+                forward_kwargs["logits_to_keep"] = 1
+            if _forward_supports_kwarg(cast(Module, self.model), "use_cache"):
+                forward_kwargs["use_cache"] = False
+            cache = (model_identity, forward_kwargs)
+            self._logprobs_forward_options = cache
+        outputs = self.model(**inputs, **cache[1])
+        return F.log_softmax(outputs.logits[:, -1, :], dim=-1, dtype=torch.float32)
 
     def compute_logprobs(self, messages: list[ChatMessage]) -> Tensor:
         """Compute next-token log-probabilities over ``token_count`` steps.
@@ -2049,6 +2216,7 @@ class SteeringEngine:
         ordered_messages = [messages[index] for index in original_indices]
         ordered_continuations = [continuations[index] for index in original_indices]
 
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
         all_logprobs: list[Tensor] = []
         batch_size = self.config.inference.batch_size
         for start in range(0, len(ordered_messages), batch_size):
@@ -2086,7 +2254,10 @@ class SteeringEngine:
                 max_new_tokens=token_count,
                 logits_processor=[sampler, forcing],
             )
-            all_logprobs.append(_captured_logprobs(sampler, token_count))
+            logprobs = _captured_logprobs(sampler, token_count)
+            if offload:
+                logprobs = logprobs.cpu()
+            all_logprobs.append(logprobs)
 
         logprobs = torch.cat(all_logprobs, dim=0)
         if not sort_by_length:

@@ -120,6 +120,63 @@ def test_identify_skips_layers_with_size_mismatch():
     assert all(h.layer != 1 for h in heads)
 
 
+def test_heterogeneous_head_dimensions_are_resolved_per_layer():
+    """Head discovery and ablation use each layer's heterogeneous head_dim."""
+
+    class AmbiguousGlobalPerLayerAttributeError(RuntimeError):
+        pass
+
+    class HeterogeneousConfig:
+        num_attention_heads = 8
+        hidden_size = 64
+        per_layer_config = [
+            SimpleNamespace(num_attention_heads=8, head_dim=4),
+            SimpleNamespace(num_attention_heads=8, head_dim=8),
+        ]
+
+        def __getattribute__(self, name):
+            if name == "head_dim":
+                raise AmbiguousGlobalPerLayerAttributeError(
+                    "head_dim varies across layers; use per_layer_config"
+                )
+            return object.__getattribute__(self, name)
+
+    config = HeterogeneousConfig()
+
+    with pytest.raises(AmbiguousGlobalPerLayerAttributeError, match="head_dim"):
+        _ = config.head_dim
+
+    o_projs = [
+        nn.Linear(32, 64, bias=False),
+        nn.Linear(64, 64, bias=False),
+    ]
+    engine = SimpleNamespace(
+        model=SimpleNamespace(config=config),
+        get_n_layers=lambda: len(o_projs),
+        steerable_modules=lambda layer_idx: {"attn.o_proj": [o_projs[layer_idx]]},
+    )
+    refusal = F.normalize(torch.randn(3, 64), p=2, dim=1)
+
+    heads = identify_safety_heads(engine, refusal, top_k_frac=1.0)
+
+    assert len(heads) == 16
+    assert sum(head.layer == 0 for head in heads) == 8
+    assert sum(head.layer == 1 for head in heads) == 8
+
+    modified = apply_cliff_head_ablation(engine, heads)
+
+    assert modified == 16
+    for entry in heads:
+        head_dim = 4 if entry.layer == 0 else 8
+        start = entry.head * head_dim
+        assert (
+            torch.count_nonzero(
+                o_projs[entry.layer].weight[:, start : start + head_dim]
+            )
+            == 0
+        )
+
+
 def test_identify_finds_planted_head():
     """If we plant a strong refusal-aligned head, it must be at the top.
 

@@ -4,13 +4,11 @@ Tests _compute_objectives() which is pure arithmetic.
 The TrialScorer is constructed by bypassing __init__ (which requires a model).
 """
 
-import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-sys.argv = ["test", "--model.model-id", "dummy/model"]
 
 from abliterix.eval.scorer import (  # noqa: E402
     TrialScorer,
@@ -224,14 +222,13 @@ def test_length_deviation_penalty():
     assert penalised_div == pytest.approx(expected)
 
 
-def test_safe_kl_divergence_handles_nonfinite_logprobs():
+def test_safe_kl_divergence_does_not_hide_invalid_model_outputs():
     current = torch.tensor([[float("nan"), -2.0, float("-inf")]])
     baseline = torch.log_softmax(torch.tensor([[1.0, 0.0, -1.0]]), dim=-1)
 
     kl = _safe_kl_divergence(current, baseline)
 
-    assert kl >= 0
-    assert torch.isfinite(torch.tensor(kl))
+    assert kl == float("inf")
 
 
 def test_hf_damage_metric_identifies_full_distribution_kl():

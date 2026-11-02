@@ -314,6 +314,85 @@ def test_generate_and_score_normalizes_bfloat16_logits_in_float32():
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("offload", [False, True])
+def test_generate_and_score_offloads_each_batch_before_generating_next(
+    monkeypatch, offload
+):
+    engine = _make_engine(_step_logits()[:1], token_count=1)
+    engine.config.inference.offload_outputs_to_cpu = offload
+    transferred: list[torch.Tensor] = []
+    completed_batches = 0
+    original_cpu = torch.Tensor.cpu
+
+    def track_cpu(tensor, *args, **kwargs):
+        transferred.append(tensor)
+        return original_cpu(tensor, *args, **kwargs)
+
+    def generate_and_score(messages, **_kwargs):
+        nonlocal completed_batches
+        assert len(transferred) == (completed_batches if offload else 0)
+        completed_batches += 1
+        return messages, torch.tensor(messages, dtype=torch.float32).unsqueeze(1)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", track_cpu)
+    engine.generate_and_score = generate_and_score
+
+    responses, actual = engine.generate_and_score_batched(
+        [3, 1, 2], max_new_tokens=5, kl_token_count=1
+    )
+
+    assert responses == [3, 1, 2]
+    assert actual.tolist() == [[3.0], [1.0], [2.0]]
+    assert len(transferred) == (2 if offload else 0)
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_fixed_continuation_offloads_each_batch_and_preserves_sorted_row_order(
+    monkeypatch, offload
+):
+    engine = _make_teacher_forcing_engine(batch_size=1)
+    engine.config.inference.offload_outputs_to_cpu = offload
+    transfers = 0
+    completed_batches = 0
+    original_cpu = torch.Tensor.cpu
+    original_generate = engine._generate
+
+    def track_cpu(tensor, *args, **kwargs):
+        nonlocal transfers
+        transfers += 1
+        return original_cpu(tensor, *args, **kwargs)
+
+    def generate(messages, **kwargs):
+        nonlocal completed_batches
+        assert transfers == (completed_batches if offload else 0)
+        completed_batches += 1
+        return original_generate(messages, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", track_cpu)
+    engine._generate = generate
+
+    actual = engine.score_continuation_logprobs_batched(
+        [
+            ChatMessage(system="", user="prompt-b"),
+            ChatMessage(system="", user="prompt-a"),
+        ],
+        ["base-b", "base-a"],
+        token_count=3,
+        sort_by_length=True,
+    )
+
+    prefix_sums = torch.tensor([[8, 9, 12], [3, 6, 7]]).float() / 100.0
+    expected = F.log_softmax(
+        torch.stack(
+            [prefix_sums, -prefix_sums, prefix_sums / 2, torch.zeros_like(prefix_sums)],
+            dim=-1,
+        ),
+        dim=-1,
+    )
+    torch.testing.assert_close(actual, expected)
+    assert transfers == (2 if offload else 0)
+
+
 def test_safe_kl_averages_over_batch_and_token_axes():
     baseline = F.log_softmax(
         torch.tensor([[[2.0, 0.0, -1.0], [0.0, 3.0, 1.0]]]),

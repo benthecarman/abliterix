@@ -27,8 +27,18 @@
 
 It also ships **HonestAbliterationBench**, a reproducible public benchmark that resists the two failure modes (short generations + keyword-only judges) that make most abliteration leaderboards meaningless.
 
+## Safety and Responsible Use
+
+> [!WARNING]
+> Abliterix intentionally modifies model internals to reduce refusal behavior. This can weaken or remove safeguards and may cause resulting models to generate inaccurate, biased, offensive, explicit, dangerous, or illegal content.
+
+Abliterix is experimental research software. You are responsible for evaluating any resulting model, complying with applicable laws and third-party terms, and deploying appropriate safeguards. Do not rely on generated outputs for medical, legal, financial, safety-critical, or other high-stakes decisions without qualified human review.
+
+Before use or deployment, read the full **[Safety, Responsible Use, and Disclaimer Notice](SAFETY.md)**. The software is provided **"AS IS"**, without warranty, under Sections 15–17 of the [AGPL-3.0-or-later](LICENSE). The safety guidance does not add restrictions to the rights granted by the AGPL.
+
 ## Table of Contents
 
+- [Safety and Responsible Use](#safety-and-responsible-use)
 - [Quick Start](#quick-start)
 - [Stable and Reproducible by Default](#stable-and-reproducible-by-default)
 - [How It Works](#how-it-works)
@@ -207,7 +217,14 @@ For large models:
 
 ## Datasets
 
-Bilingual harm/benign evaluation datasets live in [`datasets/`](datasets/) and on Hugging Face at [wangzhang/abliterix-datasets](https://huggingface.co/datasets/wangzhang/abliterix-datasets). The 500-example sets (`harmful_500`, `good_500`) are the recommended starting point — they're also the SHA256-pinned inputs to HonestAbliterationBench.
+Default runs use the public `mlabonne/harmless_alpaca` and
+`mlabonne/harmful_behaviors` datasets. Historical recipes also reference local
+bilingual `good_*` / `harmful_*` corpora for vector extraction and trial scoring.
+Those corpora are not bundled in this repository, and their historical
+[Hugging Face location](https://huggingface.co/datasets/wangzhang/abliterix-datasets)
+was not publicly retrievable in our 2026-11-01 access check. The original
+`harmful_500` / `good_500` files are required to reproduce the SHA256-pinned
+HonestAbliterationBench protocol; substitute datasets produce different results.
 
 See [docs/datasets.md](docs/datasets.md) for the design rationale, category breakdown, and a comparison with public alternatives.
 
@@ -221,12 +238,13 @@ The deep details live in `docs/` and `benchmarks/`:
 - **[docs/method_maturity.md](docs/method_maturity.md)** — evidence levels for every method, from implementation to leading claims.
 - **[docs/evaluation.md](docs/evaluation.md)** — why most abliteration benchmarks lie, our standards, and the architecture A/B test.
 - **[docs/evidence_resources.md](docs/evidence_resources.md)** — GPU/API/storage resources needed to turn method claims into reproducible evidence.
+- **[November 2026 evaluation reliability review](docs/research/evaluation-reliability-2026-11.md)** — current research, bounded-memory KL, benchmark integrity, and measured performance tradeoffs.
 - **[docs/moe.md](docs/moe.md)** — the four independent MoE steering mechanisms and supported MoE models.
 - **[docs/fp4_repack.md](docs/fp4_repack.md)** — abliterate native FP4 (MXFP4/NVFP4) models and re-pack to 4-bit offline, no BF16 blow-up.
 - **[docs/configuration.md](docs/configuration.md)** — config loading order, the 150+ shipped configs, the Web UI, and research-mode visualization.
-- **[docs/datasets.md](docs/datasets.md)** — bilingual dataset design rationale and metadata schema.
-- **[docs/minimax-h3.md](docs/minimax-h3.md)** — MiniMax-H3 Prompt Set refinement, media manifests, and LoRA training boundary.
-- **[docs/video-dataset-audit-2026-08.md](docs/video-dataset-audit-2026-08.md)** — measured audit and v2 pairing contract for the video Prompt Sets.
+- **[docs/datasets.md](docs/datasets.md)** ? current public defaults, prompt roles, and historical bilingual corpus availability. Bilingual coverage requires supplying those datasets; it is not included automatically.
+- **[docs/minimax-h3.md](docs/minimax-h3.md)** ? MiniMax-H3 Prompt Set refinement, media manifests, and LoRA training boundary.
+- **[docs/video-dataset-audit-2026-08.md](docs/video-dataset-audit-2026-08.md)** ? measured audit and v2 pairing contract for the video Prompt Sets.
 - **[docs/references.md](docs/references.md)** — paper references and BibTeX.
 - **[docs/benchmarks/2026-05-pod-validation.md](docs/benchmarks/2026-05-pod-validation.md)** — measured 10-feature sweep on Qwen2.5-7B-Instruct with LLM judge (Blackwell GPU).
 - **[benchmarks/METHOD_MATRIX.md](benchmarks/METHOD_MATRIX.md)** — cross-model method matrix for promoting methods through the maturity ladder.
@@ -277,6 +295,7 @@ All contributions are released under the [AGPL-3.0](LICENSE) license.
 
 - **Questions & ideas**: [GitHub Discussions](https://github.com/wuwangzhang1216/abliterix/discussions)
 - **Bugs & feature requests**: [GitHub Issues](https://github.com/wuwangzhang1216/abliterix/issues)
+- **Security vulnerabilities**: follow the private reporting process in [SECURITY.md](SECURITY.md)
 - **Share your models**: tag models you publish with `abliterix` on the Hugging Face Hub so others can find them — browse the growing list at [huggingface.co/models?other=abliterix](https://huggingface.co/models?other=abliterix). Uploading through the built-in menu adds this tag (plus a `reproducible` tag and a `reproduce/` manifest) automatically.
 
 

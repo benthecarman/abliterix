@@ -45,6 +45,7 @@ from torch import Tensor
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
 from ..util import print
+from .bnb_utils import dequantize_bnb_int8_weight, is_bnb_int8_weight
 
 
 # Abliterix's ProjectionCache emits rank-1 adapters. Declaring vLLM rank 1
@@ -1366,6 +1367,25 @@ class VLLMGenerator:
         return torch.stack(nlls)
 
 
+def _cache_entry_count(info: dict[str, Any]) -> int:
+    """Number of individual module entries represented by one cache record."""
+    if "experts" in info:
+        return len(info["experts"])
+    if "companions" in info:
+        return len(info["companions"])
+    return 1
+
+
+def _cache_entry_nbytes(info: dict[str, Any]) -> int:
+    """Bytes held by one cache record, including any per-expert entries."""
+    if "vW_all" in info:
+        return info["vW_all"].nbytes
+    if "experts" in info:
+        return sum(e["vW_all"].nbytes for e in info["experts"])
+    # Zero-LoRA companions store shape metadata only.
+    return 0
+
+
 class ProjectionCache:
     """Pre-computed ``v @ W`` projections for all layer/component/vector combinations.
 
@@ -1696,21 +1716,6 @@ class ProjectionCache:
 
         cache.target_modules = sorted(target_module_names)
 
-        def _cache_entry_count(info: dict[str, Any]) -> int:
-            if "experts" in info:
-                return len(info["experts"])
-            if "companions" in info:
-                return len(info["companions"])
-            return 1
-
-        def _cache_entry_nbytes(info: dict[str, Any]) -> int:
-            if "vW_all" in info:
-                return info["vW_all"].nbytes
-            if "experts" in info:
-                return sum(e["vW_all"].nbytes for e in info["experts"])
-            # Zero-LoRA companions store shape metadata only.
-            return 0
-
         n_cached = sum(
             _cache_entry_count(info)
             for layer in cache.projections.values()
@@ -1774,6 +1779,12 @@ class ProjectionCache:
             cache.projections[layer_idx] = {}
 
             for component, modules in engine.steerable_modules(layer_idx).items():
+                # One entry per module. For MoE layers ``steerable_modules``
+                # returns a list (e.g. every per-expert ``down_proj``), so the
+                # entries are collected and stored as a list under "experts";
+                # assigning per-module would keep only the last expert.
+                entries: list[dict[str, Any]] = []
+
                 for mod in modules:
                     mod = cast(Linear, mod)
 
@@ -1798,7 +1809,6 @@ class ProjectionCache:
                     base_layer = getattr(mod, "base_layer", mod)
                     base_weight = cast(Tensor, base_layer.weight)
                     qs = getattr(base_weight, "quant_state", None)
-                    CB = getattr(base_weight, "CB", None)
 
                     if qs is not None:
                         if bnb is None:
@@ -1814,9 +1824,8 @@ class ProjectionCache:
                                 qs,
                             ).to(torch.float32),
                         )
-                    elif CB is not None:
-                        SCB = base_weight.SCB
-                        W = CB.float() * SCB.float().unsqueeze(1) / 127.0
+                    elif is_bnb_int8_weight(base_layer):
+                        W = dequantize_bnb_int8_weight(base_layer)
                     elif _FP8_DTYPES and base_weight.dtype in _FP8_DTYPES:
                         weight_scale = getattr(base_layer, "weight_scale", None)
                         if weight_scale is not None:
@@ -1864,19 +1873,34 @@ class ProjectionCache:
                         vW_all = (sv_dev @ W.t()).cpu()
                     del W  # free immediately to avoid OOM on large MoE models
 
-                    cache.projections[layer_idx][component] = {
-                        "vW_all": vW_all,
-                        "module_path": module_path,
-                        "d_out": d_out,
-                        "d_in": d_in,
-                        "direction": direction,
-                    }
+                    entries.append(
+                        {
+                            "vW_all": vW_all,
+                            "module_path": module_path,
+                            "d_out": d_out,
+                            "d_in": d_in,
+                            "direction": direction,
+                        }
+                    )
+
+                if not entries:
+                    continue
+                if len(entries) > 1:
+                    # Matches build_from_safetensors: build_lora_weights
+                    # iterates every per-expert entry.
+                    cache.projections[layer_idx][component] = {"experts": entries}
+                else:
+                    cache.projections[layer_idx][component] = entries[0]
 
         cache.target_modules = sorted(target_module_names)
-        n_cached = sum(len(v) for v in cache.projections.values())
+        n_cached = sum(
+            _cache_entry_count(info)
+            for layer in cache.projections.values()
+            for info in layer.values()
+        )
         cache_mb = (
             sum(
-                info["vW_all"].nbytes
+                _cache_entry_nbytes(info)
                 for layer in cache.projections.values()
                 for info in layer.values()
             )

@@ -11,7 +11,9 @@ creation, checkpoint management, the TPE sampler, and the per-trial
 objective evaluation.
 """
 
+import math
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 
 import optuna
@@ -34,7 +36,7 @@ from .types import (
     SteeringMode,
     SteeringProfile,
 )
-from .util import humanize_duration, print, report_memory
+from .util import flush_memory, humanize_duration, print, report_memory
 
 
 def run_search(
@@ -49,8 +51,13 @@ def run_search(
     progress_callback=None,
     *,
     steering_vector_variants: dict[str, "torch.Tensor"] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    raise_on_interrupt: bool = False,
 ) -> optuna.Study:
     """Execute the Optuna optimisation loop and return the completed study.
+
+    ``raise_on_interrupt`` lets non-interactive callers report SIGINT after
+    trial cleanup. Interactive callers retain the completed study by default.
 
     Parameters
     ----------
@@ -552,6 +559,8 @@ def run_search(
             try:
                 return _objective(trial)
             except KeyboardInterrupt:
+                if raise_on_interrupt:
+                    raise
                 trial.study.stop()
                 raise TrialPruned()
         finally:
@@ -575,6 +584,9 @@ def run_search(
                         engine._current_adapter_path = None
                     config.steering.direct_transform = original_direct_transform
                     config.steering.decay_kernel = original_decay_kernel
+            # Return freed VRAM between trials so long Optuna runs on large MoE
+            # models do not accumulate allocator fragmentation.
+            flush_memory()
 
     # ----------------------------------------------------------------
     # Study creation / resumption
@@ -587,10 +599,19 @@ def run_search(
     if _sampler_seed is not None:
         torch.manual_seed(_sampler_seed)
 
+    def _completed_trial_gamma(n: int) -> int:
+        # Optuna counts PRUNED trials toward TPE startup, but multi-objective
+        # hypervolume weights require actual objective values. Cap the default
+        # good-set size so valueless pruned trials stay in the above set. With
+        # no completed trials, TPE uses its prior for the empty good set.
+        completed = len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,)))
+        return min(math.ceil(0.1 * n), 25, completed)
+
     sampler_kw: dict = dict(
         n_startup_trials=opt.num_warmup_trials,
         n_ei_candidates=128,
         multivariate=True,
+        gamma=_completed_trial_gamma,
     )
     if _sampler_seed is not None:
         sampler_kw["seed"] = _sampler_seed
@@ -625,13 +646,25 @@ def run_search(
             study.enqueue_trial(seed, skip_if_exists=True)
             print(f"  seed {i}: {len(seed)} params pinned")
 
+    # ``should_stop`` lets a caller (the Web UI "Stop" button) end the sweep
+    # cleanly between trials. Optuna's post-trial callback is the supported
+    # hook for this: study.stop() makes optimize() return after the current
+    # trial finishes, so already-completed trials stay usable.
+    def _stop_when_requested(_study, _trial) -> None:
+        if should_stop is not None and should_stop():
+            print()
+            print("[yellow]Stop requested — ending the sweep after this trial.[/]")
+            _study.stop()
+
     try:
         study.optimize(
             _objective_safe,
             n_trials=opt.num_trials - _count_complete(),
+            callbacks=[_stop_when_requested],
         )
     except KeyboardInterrupt:
-        pass
+        if raise_on_interrupt:
+            raise
 
     if _count_complete() == opt.num_trials:
         study.set_user_attr("finished", True)

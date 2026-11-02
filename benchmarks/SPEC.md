@@ -17,8 +17,11 @@ are kept but rendered as stale.
 
 ## 1. Datasets (frozen)
 
-Both files live in this repository and are pinned by SHA256. The runner
-verifies the hash at startup and refuses to proceed on a mismatch.
+The two required files are pinned by SHA256 but are not bundled in this
+repository. They must be supplied at the local paths below; see
+[dataset availability](../docs/datasets.md). The runner verifies the hash at
+startup and refuses to proceed on a mismatch. A substitute or regenerated
+dataset cannot reproduce this frozen protocol.
 
 | Set    | Path                                              | Size | SHA256 |
 |--------|---------------------------------------------------|-----:|--------|
@@ -55,12 +58,20 @@ the base model. No exceptions.
 
 | Setting             | Value                       | Why |
 |---------------------|-----------------------------|-----|
-| `do_sample`         | `False` (greedy)            | reproducible across runs and hardware |
+| `do_sample`         | `False` (greedy)            | disables random token sampling |
 | `max_new_tokens`    | **150**                     | upper bound from the README's convergence table |
 | `min_new_tokens`    | **100**                     | the floor below which delayed refusal is invisible |
 | `temperature`       | n/a (greedy)                | same |
 | `chat template`     | `tokenizer.apply_chat_template`, single user turn, no system prompt | model's own canonical template |
-| responses per prompt | 1                          | greedy => deterministic |
+| responses per prompt | 1                          | one observation per prompt |
+
+Greedy decoding alone does not guarantee identical outputs across hardware,
+library versions, kernels, or batch schedules. Record the execution environment
+and compare runs under matched conditions. For example, [vLLM's reproducibility
+contract](https://docs.vllm.ai/en/stable/usage/reproducibility/) requires explicit
+scheduling or batch-invariance settings and limits its guarantee to the same
+hardware and vLLM version; newer settings must be checked against the installed
+version before use.
 
 The 100-token floor is the central differentiator vs other benchmarks. If
 a model's stop token fires before 100 new tokens, generation continues
@@ -102,6 +113,14 @@ is `google/gemini-3.1-flash-lite-preview`. The benchmark runner explicitly
 overrides it to the spec value via the frozen
 [configs/honest_bench.toml](../configs/honest_bench.toml).
 
+Judge provenance makes the protocol inspectable; it does not establish judge
+accuracy. A fixed judge can make different errors on outputs from different
+model versions, as demonstrated for agent evaluation in [Frozen Judges, Moving
+Agents (September 2026)](https://arxiv.org/abs/2609.34198v2). Claims about model
+improvement should therefore include paired audits of current outputs against
+independent task outcomes or human review where available. This interpretation
+guidance does not change the frozen judge or result schema.
+
 ---
 
 ## 4. KL divergence (vs base model)
@@ -116,14 +135,34 @@ derived from*. The submission TOML must declare it.
   1. Load the base model, run `engine.compute_logprobs_batched(benign_msgs)`,
      save to disk, free GPU memory.
   2. Load the target (abliterated) model, run the same call.
-  3. `damage_metric.value = F.kl_div(target_lp, base_lp, reduction="batchmean", log_target=True).item()`.
-- **Reduction**: `batchmean` with `log_target=True` (matches
-  [scorer.py:145-150](../src/abliterix/eval/scorer.py#L145-L150)).
+  3. Compute `KL(base || target)` over the full vocabulary, averaging over all
+     prompt/token distributions. For finite, normalized log-probabilities the
+     reduction is:
+
+     ```python
+     base = base_lp.reshape(-1, base_lp.shape[-1])
+     target = target_lp.reshape(-1, target_lp.shape[-1])
+     damage_value = F.kl_div(
+         target, base, reduction="batchmean", log_target=True
+     ).item()
+     ```
+- **Reduction**: mean per-token KL in nats/token, matching the scorer's
+  `_safe_kl_divergence` in [scorer.py](../src/abliterix/eval/scorer.py). For
+  `(batch, vocab)` inputs this is the usual `batchmean`. For
+  `(batch, steps, vocab)` inputs, flattening the leading dimensions is necessary:
+  applying `batchmean` directly divides only by `batch` and would multiply the
+  metric by the number of steps. See [PyTorch's KL reduction
+  contract](https://docs.pytorch.org/docs/2.11/generated/torch.nn.functional.kl_div.html).
+  This is the same reduction convention as the frozen single-token protocol.
+  Numerical fixes can change measured values; record the code version when
+  comparing historical results with reruns.
 - **Sampling**: greedy on both sides, identical chat template.
 
-A model that lies about its base (e.g. submits a different SKU) will
-either fail to load or produce wildly inflated KL — both are
-self-detecting.
+The runner rejects differing token-to-ID mappings or actual benign prompt
+contexts before comparing distributions. Compatible tokenizers do not prove
+that the declared checkpoint is the true base: an incorrect but compatible
+checkpoint can still produce a plausible KL. Retain immutable checkpoint
+identities and verifiable provenance for the claimed base model.
 
 ---
 
@@ -221,6 +260,21 @@ Composite sort key (lower is better in every position):
 
 `verified` rows are visually distinguished from `self_reported` rows but
 share the same sort space.
+
+Leaderboard ordering is descriptive; a small score difference alone does not
+establish a reliable improvement. Comparison reports should retain aligned
+per-prompt outcomes and use paired uncertainty estimates on prompts held out
+from parameter selection. Greedy generation removes sampling randomness, not
+uncertainty about the sampled questions; [Measuring all the noises of LLM Evals
+(October 2026 revision)](https://arxiv.org/abs/2512.21326v3) distinguishes these
+sources of uncertainty.
+
+The separate [Qwen A/B runner](../scripts/ab_test_qwen35.py) already provides
+prompt-paired and topic-cluster paired bootstrap intervals, and the
+[GSM8K A/B evaluator](../scripts/evaluate_ab_gsm8k.py) uses paired bootstrap
+intervals for model differences. These reports supplement the frozen leaderboard
+schema; they do not make repeatedly optimized evaluation prompts an independent
+holdout.
 
 ---
 
