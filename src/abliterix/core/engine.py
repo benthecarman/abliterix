@@ -37,6 +37,7 @@ from transformers.generation import (
 from ..settings import AbliterixConfig
 from ..types import ChatMessage, QuantMode, SteeringMode, VectorMethod, WeightNorm
 from ..util import chunk_batches, flush_memory, print
+from .bnb_utils import is_bnb_int8_weight, validate_bnb_int8_weight
 from . import fp8_utils
 
 # transformers < 5.0 uses torch_dtype=, >= 5.0 uses dtype= in from_pretrained.
@@ -662,10 +663,12 @@ class SteeringEngine:
 
                 # Smoke-test: a single forward pass catches dtype-related
                 # runtime errors (inf/nan probability tensors, etc.).
+                self._validate_int8_state()
                 self._generate(
                     [ChatMessage(system=config.system_prompt, user="What is 1+1?")],
                     max_new_tokens=1,
                 )
+                self._validate_int8_state()
             except (
                 Exception
             ) as error:  # Model loading may fail with diverse errors (OOM, dtype, CUDA)
@@ -968,6 +971,7 @@ class SteeringEngine:
         id_to_path: dict[int, str] = {
             id(m): name for name, m in self.model.named_modules()
         }
+        self._validate_int8_state()
 
         target_paths: set[str] = set()
         for idx in range(len(self.transformer_layers)):
@@ -1001,6 +1005,8 @@ class SteeringEngine:
                 if "lora_" in name and param.dtype in _fp8:
                     param.data = param.data.to(torch.bfloat16)
 
+        self._validate_int8_state()
+
         # Pre-cache references to every lora_B weight tensor for O(adapter-count)
         # resets instead of a full named_modules walk.
         self._lora_b_weights: list[Tensor] = []
@@ -1014,6 +1020,20 @@ class SteeringEngine:
             f"* LoRA adapters initialised "
             f"({len(targets)} modules, leaves: {', '.join(leaf_summary)})"
         )
+
+    def _validate_int8_state(self) -> None:
+        """Check int8 metadata before expensive extraction and optimization."""
+        for name, module in self.model.named_modules():
+            # The underlying module is visited separately; skip PEFT wrappers.
+            if getattr(module, "base_layer", None) is not None:
+                continue
+            if is_bnb_int8_weight(module):
+                try:
+                    validate_bnb_int8_weight(module)
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        f"Invalid bitsandbytes int8 state in {name or '<root>'}: {error}"
+                    ) from error
 
     @staticmethod
     def _patch_moe_config_for_fp8(model_id: str, revision: str | None = None) -> None:
