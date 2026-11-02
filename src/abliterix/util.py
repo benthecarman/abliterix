@@ -77,26 +77,51 @@ def running_in_notebook() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _stdin_is_tty() -> bool:
+    """True when interactive prompts can render (stdin and stdout are TTYs).
+
+    Under pipelines such as ``abliterix | tee``, stdout is not a TTY and
+    prompt_toolkit/questionary often misbehaves; fall back to a numeric menu.
+    """
+    import sys
+
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _print_choices(message: str, choices: list[Any]) -> list[Any]:
+    real: list[Any] = []
+    print()
+    print(message)
+    for i, c in enumerate(choices, 1):
+        if isinstance(c, Choice):
+            print(f"  [{i}] {c.title}")
+            real.append(c.value)
+        else:
+            print(f"  [{i}] {c}")
+            real.append(c)
+    return real
+
+
 def ask_choice(message: str, choices: list[Any]) -> Any:
-    if running_in_notebook():
-        print()
-        print(message)
-        real = []
-        for i, c in enumerate(choices, 1):
-            if isinstance(c, Choice):
-                print(f"[{i}] {c.title}")
-                real.append(c.value)
-            else:
-                print(f"[{i}] {c}")
-                real.append(c)
+    if running_in_notebook() or not _stdin_is_tty():
+        real = _print_choices(message, choices)
         while True:
             try:
-                idx = int(input("Enter number: ")) - 1
+                idx = int(input(f"Choice (1-{len(real)}): ").strip()) - 1
                 if 0 <= idx < len(real):
                     return real[idx]
                 print(f"[red]Please enter a number between 1 and {len(real)}[/]")
             except ValueError:
                 print("[red]Invalid input. Please enter a number.[/]")
+            except (KeyboardInterrupt, EOFError):
+                # questionary's .ask() returns None when the user aborts;
+                # callers treat that as "go back one menu". Match it here so
+                # a redirected stdout does not turn Ctrl-C into a hard exit.
+                print()
+                return None
     else:
         return questionary.select(
             message,
@@ -111,9 +136,19 @@ def ask_text(
     qmark: str = "?",
     unsafe: bool = False,
 ) -> str:
-    if running_in_notebook():
+    if running_in_notebook() or not _stdin_is_tty():
         print()
-        result = input(f"{message} [{default}]: " if default else f"{message}: ")
+        prompt = f"{message} [{default}]: " if default else f"{message}: "
+        try:
+            result = input(prompt)
+        except (KeyboardInterrupt, EOFError):
+            # `unsafe=True` callers (the chat loop) expect the interrupt to
+            # propagate, exactly like questionary's unsafe_ask(); everyone
+            # else expects the None that .ask() returns on abort.
+            if unsafe:
+                raise
+            print()
+            return None  # ty:ignore[invalid-return-type]
         return result if result else default
     else:
         q = questionary.text(message, default=default, qmark=qmark)
@@ -121,16 +156,20 @@ def ask_text(
 
 
 def ask_path(message: str) -> str:
-    if running_in_notebook():
+    if running_in_notebook() or not _stdin_is_tty():
         return ask_text(message)
     else:
         return questionary.path(message, only_directories=True).ask()
 
 
 def ask_secret(message: str) -> str:
-    if running_in_notebook():
+    if running_in_notebook() or not _stdin_is_tty():
         print()
-        return getpass.getpass(message)
+        try:
+            return getpass.getpass(message)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None  # ty:ignore[invalid-return-type]
     else:
         return questionary.password(message).ask()
 
@@ -161,17 +200,17 @@ def chunk_batches(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
-def flush_memory():
-    """Release cached GPU / accelerator memory and run garbage collection.
-
-    gc.collect() is called both before and after clearing the backend cache
-    because Python's cycle collector must break reference loops before the
-    backend allocator can actually reclaim the underlying buffers.
-    """
-    gc.collect()
-
+def _empty_backend_cache():
+    """Return freed cached blocks from the accelerator allocator to the driver."""
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        # Never touch context-creating CUDA APIs (synchronize etc.) here: in
+        # a process that hasn't initialized CUDA (the fast vLLM-native
+        # extraction path keeps the driver process CPU-only), they would
+        # create a ~0.3-1 GB primary context on every GPU that the spawned
+        # TP workers then see as used.  empty_cache() itself no-ops when
+        # CUDA is uninitialized.
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
     elif is_xpu_available():
         torch.xpu.empty_cache()
     elif is_mlu_available():
@@ -183,7 +222,42 @@ def flush_memory():
     elif torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
-    gc.collect()
+
+def flush_memory(max_passes: int = 4):
+    """Release cached GPU / accelerator memory and run garbage collection.
+
+    Runs up to *max_passes* rounds of ``gc.collect()`` each followed by a
+    backend cache flush, stopping once a pass finds nothing to collect.
+
+    Python's cycle collector must break reference loops before the backend
+    allocator can reclaim the underlying buffers, and a single pass is not
+    always enough: finalizers and weakref callbacks that run during one
+    pass can drop the last reference to a tensor only after that pass, so
+    the tensor is reclaimed on a *later* pass.  The cache flush must then
+    run again — otherwise the freed VRAM stays *reserved* by the caching
+    allocator instead of being returned to the driver.  A multi-GPU HF
+    model unloaded that way kept ~148 GB reserved across the HF → vLLM
+    phase transition and the spawned vLLM TP workers refused to start
+    (issue #83).
+    """
+    for _ in range(max_passes):
+        collected = gc.collect()
+        _empty_backend_cache()
+        if not collected:
+            break
+
+
+def reserved_unallocated_vram() -> int:
+    """Bytes of VRAM this process's CUDA caching allocator holds beyond
+    live allocations, summed across devices.  Returns 0 on non-CUDA
+    backends.  Memory stuck here is invisible garbage to freshly spawned
+    processes (e.g. vLLM TP workers), which see it as used."""
+    if not torch.cuda.is_available():
+        return 0
+    n = torch.cuda.device_count()
+    reserved = sum(torch.cuda.memory_reserved(d) for d in range(n))
+    allocated = sum(torch.cuda.memory_allocated(d) for d in range(n))
+    return max(0, reserved - allocated)
 
 
 def slugify_model_name(model_name: str) -> str:

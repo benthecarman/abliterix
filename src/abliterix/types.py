@@ -26,6 +26,7 @@ class VectorMethod(str, Enum):
     SRA = "sra"
     SOM = "som"
     SAE = "sae"
+    RDO = "rdo"
 
 
 class DecayKernel(str, Enum):
@@ -67,6 +68,14 @@ class DirectTransform(str, Enum):
 class PromptSource(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset identifier or local directory path."
+    )
+
+    revision: str | None = Field(
+        default=None,
+        description=(
+            "Hugging Face dataset revision. Reproducible runs resolve this to "
+            "an immutable 40-character commit SHA before loading."
+        ),
     )
 
     split: str = Field(description="Dataset split expression (e.g. 'train[:400]').")

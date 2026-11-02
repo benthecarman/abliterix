@@ -351,8 +351,8 @@ def profile_safety_experts_vllm(
 
     Requires the LLM to have been constructed with
     ``enable_return_routed_experts=True`` (abliterix's
-    ``[model].vllm_return_routed_experts`` defaults to True; flip it off
-    to skip this path). The function runs ``llm.generate`` once over the
+    ``[model].vllm_return_routed_experts`` auto-enables this for MoE; set it
+    to False to skip this path). The function runs ``llm.generate`` once over the
     benign prompt set and once over the target prompt set with
     ``max_tokens=1`` (prefill-only, gives full prompt-token routing),
     aggregates per-(layer, expert) counts driver-side, and computes risk
@@ -1044,11 +1044,22 @@ class VLLMExpertEditor:
             entry.setdefault("hidden_dim", self.hidden_dim)
             entry.setdefault("transposed", self.transposed)
 
-        results = self._rpc(
-            _worker_apply_ega_batch,
-            args=(plan, bool(norm_preserve)),
-        )
+        # The worker kernel mutates w2 layer by layer with no transaction, so
+        # a raise partway through (CUDA OOM on the fp32 upcast is the
+        # realistic case) leaves earlier layers already edited. Set the flag
+        # optimistically and roll back on failure: a pristine CPU backup
+        # exists for every touched layer, and leaving the model
+        # half-abliterated would corrupt the KL baseline for every
+        # subsequent trial.
         self._applied = True
+        try:
+            results = self._rpc(
+                _worker_apply_ega_batch,
+                args=(plan, bool(norm_preserve)),
+            )
+        except BaseException:
+            self.restore()
+            raise
         if not results:
             return {"applied": 0, "errors": ["no workers"], "per_layer": []}
         # All workers run the same plan (TP replicated), return the first.
@@ -1412,8 +1423,16 @@ class VLLMAttentionEditor:
         needed = sorted({int(p["layer_idx"]) for p in plan})
         self.backup(needed)
 
-        results = self._rpc(_worker_apply_attn_batch, args=(plan, bool(norm_preserve)))
+        # Same optimistic-flag reasoning as the EGA editor: the worker writes
+        # layer by layer, so a mid-batch raise leaves part of the plan applied.
         self._applied = True
+        try:
+            results = self._rpc(
+                _worker_apply_attn_batch, args=(plan, bool(norm_preserve))
+            )
+        except BaseException:
+            self.restore()
+            raise
         if not results:
             return {"applied": 0, "errors": ["no workers"], "per_layer": []}
         return results[0]

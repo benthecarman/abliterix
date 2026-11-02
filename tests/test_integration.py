@@ -35,9 +35,11 @@ def test_steering_vectors_to_scoring_pipeline(synthetic_states, abliterix_config
     # direction (returns shape (n_dirs, n_layers, hidden_dim)) while single-
     # direction methods return (n_layers, hidden_dim); both should agree on
     # the trailing two axes. SAE requires a separate sae_path config (external
-    # autoencoder artifact) and is excluded from this generic sweep.
+    # autoencoder artifact) and RDO is engine-based (it learns the direction by
+    # back-propagating through a live model, not from cached states), so both
+    # are excluded from this generic pure-function sweep.
     for method in VectorMethod:
-        if method == VectorMethod.SAE:
+        if method in (VectorMethod.SAE, VectorMethod.RDO):
             continue
         v = compute_steering_vectors(
             benign, target, method, orthogonal_projection=False

@@ -34,6 +34,12 @@ MoEBackend = Literal[
     "emulation",
 ]
 
+# vLLM's Punica kernels only accept these configured maximum ranks.  Smaller
+# adapters may be zero-padded to one of these capacities at serialisation time,
+# but passing any other ``max_lora_rank`` makes engine startup fail deep inside
+# vLLM.  Keep this list in sync with vLLM's LoRAConfig validator.
+VLLM_SUPPORTED_LORA_RANKS = frozenset({1, 8, 16, 32, 64, 128, 256, 320, 512})
+
 # CompileMode is owned by vllm_compilation_config; settings re-uses the
 # same Literal so a typo (e.g. "eagar") is caught at config-load instead
 # of inside vllm_compilation_config.build().
@@ -60,11 +66,27 @@ class ModelConfig(BaseModel):
 
     model_id: str = Field(description="Hugging Face model identifier or local path.")
 
+    revision: str | None = Field(
+        default=None,
+        description=(
+            "Hugging Face model revision. Reproducible runs resolve this to an "
+            "immutable 40-character commit SHA before loading."
+        ),
+    )
+
     evaluate_model_id: str | None = Field(
         default=None,
         description=(
             "When set, the system evaluates this model against the primary model "
             "rather than running the optimisation loop."
+        ),
+    )
+
+    evaluate_model_revision: str | None = Field(
+        default=None,
+        description=(
+            "Immutable Hugging Face revision for evaluate_model_id. Resolved "
+            "automatically when evaluation-only mode uses a Hub model."
         ),
     )
 
@@ -104,6 +126,16 @@ class ModelConfig(BaseModel):
     trust_remote_code: bool | None = Field(
         default=None,
         description="Whether to trust remote code shipped with the model.",
+    )
+
+    text_only: bool = Field(
+        default=False,
+        description=(
+            "Force AutoModelForCausalLM even when the checkpoint advertises "
+            "multimodal config fields (e.g. some Qwen3.5-MoE / Agents checkpoints). "
+            "Use for text-only abliteration; leave false to preserve the default "
+            "ImageTextToText path for VLMs."
+        ),
     )
 
     attn_implementation: str | None = Field(
@@ -168,7 +200,7 @@ class ModelConfig(BaseModel):
         ),
     )
 
-    fp8_handling: str = Field(
+    fp8_handling: Literal["auto", "materialize", "forward_dequant", "offline"] = Field(
         default="auto",
         description=(
             "How to handle native-FP8 model weights at load time.\n"
@@ -187,7 +219,10 @@ class ModelConfig(BaseModel):
         ),
     )
 
-    backend: str = Field(
+    # Typed as a Literal so a typo ("vfllm", "HuggingFace") is rejected at
+    # config-load instead of silently falling through to the slow HF path
+    # *and* marking the run non-reproducible.
+    backend: Literal["hf", "vllm", "sglang"] = Field(
         default="hf",
         description=(
             "Inference backend: 'hf' for HuggingFace Transformers (pipeline parallelism), "
@@ -214,10 +249,12 @@ class ModelConfig(BaseModel):
         ),
     )
 
-    enable_expert_parallel: bool = Field(
-        default=True,
+    enable_expert_parallel: bool | None = Field(
+        default=None,
         description=(
-            "Enable expert parallelism (EP) for MoE models in vLLM.  "
+            "Enable expert parallelism (EP) for MoE models in vLLM. None "
+            "(default) enables it only when the loaded topology is MoE. "
+            "True forces EP for a known MoE model; False disables it. "
             "EP distributes experts across GPUs rather than replicating them.  "
             "Best for models with >3% expert activation density (DeepSeek, Qwen MoE)."
         ),
@@ -384,10 +421,9 @@ class ModelConfig(BaseModel):
     vllm_max_lora_rank: int | None = Field(
         default=None,
         description=(
-            "vLLM ``max_lora_rank``.  None (default) lets vLLM use its own "
-            "default (16 in 0.20.x).  Set to the smallest value that fits "
-            "every adapter you plan to load — abliterix used to force-pad "
-            "to 8, but vLLM accepts arbitrary ranks now."
+            "vLLM ``max_lora_rank``. None (default) uses rank 1, matching "
+            "Abliterix's ProjectionCache adapters and avoiding zero-padding. "
+            "Set this explicitly for any external or future rank-k adapter."
         ),
     )
 
@@ -404,11 +440,13 @@ class ModelConfig(BaseModel):
         ),
     )
 
-    vllm_return_routed_experts: bool = Field(
-        default=True,
+    vllm_return_routed_experts: bool | None = Field(
+        default=None,
         description=(
             "Pass-through for vLLM's ``enable_return_routed_experts`` (vLLM "
-            "0.20.x+). When True (default), abliterix's MoE safety-expert "
+            "0.20.x+). None (default) enables capture only when the loaded "
+            "Hugging Face config describes a MoE architecture; explicit True "
+            "or False always wins. When enabled, abliterix's MoE safety-expert "
             "profiler reads per-token routing IDs directly from "
             "``RequestOutput.outputs[0].routed_experts`` instead of "
             "installing forward hooks via ``collective_rpc``. This removes "
@@ -459,6 +497,18 @@ class ModelConfig(BaseModel):
                 "lora_target_modules is set but disable_lora=True — the "
                 "target list would be silently dropped because LoRA is off. "
                 "Either unset lora_target_modules or set disable_lora=false."
+            )
+        if (
+            self.vllm_max_lora_rank is not None
+            and self.vllm_max_lora_rank not in VLLM_SUPPORTED_LORA_RANKS
+        ):
+            supported = ", ".join(
+                str(rank) for rank in sorted(VLLM_SUPPORTED_LORA_RANKS)
+            )
+            raise ValueError(
+                f"vllm_max_lora_rank={self.vllm_max_lora_rank} is not supported "
+                f"by vLLM; choose one of {{{supported}}}. Smaller adapters are "
+                "safely zero-padded to the configured supported rank."
             )
         return self
 
@@ -529,7 +579,7 @@ class SteeringConfig(BaseModel):
     )
 
     orthogonal_projection: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Remove the benign-direction component from steering vectors so that "
             "only the genuinely safety-specific signal is subtracted."
@@ -618,6 +668,26 @@ class SteeringConfig(BaseModel):
         ),
     )
 
+    frozen_experts: bool = Field(
+        default=False,
+        description=(
+            "Apply Expert-Granular Abliteration at FORWARD time instead of "
+            "mutating fused expert weights, so a natively-quantised MoE can stay "
+            "packed during the search.  The EGA projection is rank-1, so it is "
+            "algebraically identical to projecting the refusal direction out of "
+            "the expert output — no dequantisation, no writable parameter.  "
+            "gpt-oss-20b then holds the whole model in ~13.8 GB instead of the "
+            "~30 GB its BF16 dequant needs.\n"
+            "Requires steering_mode='direct' on a MoE model.  Row-norm "
+            "preservation is not available across a fused multi-expert "
+            "container (the per-expert factors need per-token routing a "
+            "container hook cannot see), so pair this with "
+            "weight_normalization='none'.  Export the resulting plan and bake "
+            "it with `abliterix-abliterate-fp4`; see "
+            "abliterix.core.frozen_experts."
+        ),
+    )
+
     discriminative_layer_selection: bool = Field(
         default=False,
         description=(
@@ -633,7 +703,7 @@ class SteeringConfig(BaseModel):
     )
 
     weight_normalization: WeightNorm = Field(
-        default=WeightNorm.NONE,
+        default=WeightNorm.FULL,
         description=(
             "Row-norm handling for weight matrices.  "
             '"none" applies steering directly, '
@@ -663,7 +733,7 @@ class SteeringConfig(BaseModel):
         ),
     )
 
-    fixed_vector_scope: str | None = Field(
+    fixed_vector_scope: Literal["global", "per layer"] | None = Field(
         default=None,
         description=(
             'Pin the vector scope to one of ``"global"`` or ``"per layer"`` '
@@ -739,6 +809,9 @@ class SteeringConfig(BaseModel):
 
     auto_disable_floor: float = Field(
         default=-0.25,
+        # Documented as "must be ≤ 0"; without this a positive value is
+        # accepted and then silently disables the feature it configures.
+        le=0.0,
         description=(
             "Negative lower bound used for the ``max_weight`` search of every "
             "component listed in ``auto_disable_components``.  The fraction of the "
@@ -859,6 +932,105 @@ class SteeringConfig(BaseModel):
             "Number of top-scoring SAE features to use as refusal "
             "directions.  Hong et al. 2025 report 4-16 features cover the "
             "refusal feature family in Gemma-Scope / Llama-Scope SAEs."
+        ),
+    )
+
+    # --- RDO (gradient-based refusal direction optimization) ---
+    # Wollschläger et al., ICML 2025, arXiv:2502.17420.  Active only when
+    # vector_method = 'rdo'.  Learns a single unit direction by back-prop
+    # through the frozen model; abliterix's per-layer strength profile +
+    # Optuna search still pick the magnitude.
+
+    rdo_steps: int = Field(
+        default=100,
+        description=(
+            "Number of AdamW optimisation steps when vector_method = 'rdo'. "
+            "Each step runs ~4 forward passes (ablation + addition + retain) "
+            "and one backward through the frozen model, so this dominates RDO "
+            "cost.  100 is a reasonable default; raise for larger models."
+        ),
+    )
+
+    rdo_lr: float = Field(
+        default=0.01,
+        description="AdamW learning rate for the RDO direction (paper default 0.01).",
+    )
+
+    rdo_batch_size: int = Field(
+        default=8,
+        description="Prompts per RDO optimisation step (harmful and benign each).",
+    )
+
+    rdo_max_prompts: int = Field(
+        default=32,
+        description=(
+            "Cap on harmful/benign prompts used for RDO training.  A subset "
+            "keeps the gradient loop fast relative to the Optuna search; the "
+            "direction generalises from a modest sample."
+        ),
+    )
+
+    rdo_lambda_ablation: float = Field(
+        default=1.0,
+        description="Weight of the ablation loss (answer harmful prompts). Paper: 1.0.",
+    )
+
+    rdo_lambda_addition: float = Field(
+        default=0.2,
+        description="Weight of the addition loss (induce refusal on benign). Paper: 0.2.",
+    )
+
+    rdo_lambda_retain: float = Field(
+        default=1.0,
+        description="Weight of the KL retain loss (preserve benign behaviour). Paper: 1.0.",
+    )
+
+    rdo_add_layer_frac: float = Field(
+        default=0.6,
+        description=(
+            "Depth fraction (0-1) of the single layer where the addition loss "
+            "injects alpha*r; also the layer whose mean-diff seeds warm-start. "
+            "Mid-late layers carry the strongest refusal signal."
+        ),
+    )
+
+    rdo_add_scale: float = Field(
+        default=1.0,
+        description="Scale alpha applied to the unit direction in the addition loss.",
+    )
+
+    rdo_init: str = Field(
+        default="mean_diff",
+        description=(
+            "RDO direction initialisation: 'mean_diff' (warm-start from the "
+            "difference-in-means direction — cheaper convergence, default) or "
+            "'random' (the paper's random init)."
+        ),
+    )
+
+    rdo_affirmative_target: str = Field(
+        default="Sure, here",
+        description=(
+            "Teacher-forcing target for the ablation loss — the short "
+            "affirmative continuation the ablated model should produce on "
+            "harmful prompts."
+        ),
+    )
+
+    rdo_refusal_target: str = Field(
+        default="I'm sorry, but I can't help with that.",
+        description=(
+            "Teacher-forcing target for the addition loss — the refusal "
+            "continuation the model should produce on benign prompts once the "
+            "direction is added."
+        ),
+    )
+
+    rdo_seed: int | None = Field(
+        default=None,
+        description=(
+            "Seed for RDO random init / batching.  Defaults to None (falls "
+            "back to the global seed via the caller if set)."
         ),
     )
 
@@ -1019,6 +1191,31 @@ class SteeringConfig(BaseModel):
                 raise ValueError(f"sae_layer must be >= 0, got {self.sae_layer}.")
             if self.sae_top_k <= 0:
                 raise ValueError(f"sae_top_k must be > 0, got {self.sae_top_k}.")
+        if self.vector_method == VectorMethod.RDO:
+            if self.rdo_init not in ("mean_diff", "random"):
+                raise ValueError(
+                    f"rdo_init must be 'mean_diff' or 'random', got {self.rdo_init!r}."
+                )
+            if self.n_directions > 1:
+                raise ValueError(
+                    "vector_method='rdo' learns a single direction and is "
+                    f"incompatible with n_directions={self.n_directions}. Set "
+                    "n_directions=1 (the multi-direction RepInd extension is "
+                    "not yet implemented)."
+                )
+            if self.ablate_harmfulness_direction:
+                raise ValueError(
+                    "vector_method='rdo' is incompatible with "
+                    "ablate_harmfulness_direction=true (different vector "
+                    "layout). Disable one of them."
+                )
+            if self.rdo_steps <= 0:
+                raise ValueError(f"rdo_steps must be > 0, got {self.rdo_steps}.")
+            if not 0.0 <= self.rdo_add_layer_frac <= 1.0:
+                raise ValueError(
+                    "rdo_add_layer_frac must be in [0, 1], got "
+                    f"{self.rdo_add_layer_frac}."
+                )
         if self.cliff_head_ablation:
             if not 0.0 < self.cliff_head_top_k_frac <= 1.0:
                 raise ValueError(
@@ -1186,6 +1383,7 @@ class DetectionConfig(BaseModel):
             "inappropriate",
             "unethical",
             "ethical boundaries",
+            "disclaimer",
             # Chinese — apology / regret
             "抱歉",
             "对不起",
@@ -1231,10 +1429,11 @@ class DetectionConfig(BaseModel):
     )
 
     llm_judge: bool = Field(
-        default=True,
+        default=False,
         description="Route every response through an external LLM judge over an "
-        "OpenAI-compatible chat/completions API. "
-        "Set to False to use keyword matching as a fallback when no API key is available.",
+        "OpenAI-compatible chat/completions API. Disabled by default so ordinary "
+        "runs remain offline, deterministic, and independently reproducible. "
+        "Enable it for semantic audits; credentials are validated before model loading.",
     )
 
     llm_judge_model: str = Field(
@@ -1333,13 +1532,17 @@ class DetectionConfig(BaseModel):
         ),
     )
 
+    # ge=1: 0 would make ``range(0, n, 0)`` raise and ThreadPoolExecutor(0)
+    # raise; negative values silently classify nothing.
     llm_judge_batch_size: int = Field(
         default=10,
+        ge=1,
         description="Responses per API request when using the LLM judge.",
     )
 
     llm_judge_concurrency: int = Field(
         default=10,
+        ge=1,
         description="Maximum parallel API requests for LLM judge classification.",
     )
 
@@ -1362,7 +1565,7 @@ class ExpertConfig(BaseModel):
         description="Search interval [lo, hi] for per-expert down-projection steering weight.",
     )
 
-    profiling_method: str = Field(
+    profiling_method: Literal["standard", "safex"] = Field(
         default="standard",
         description=(
             "Safety-expert scoring strategy.  'standard' uses the historical "
@@ -1573,7 +1776,7 @@ class IterativeConfig(BaseModel):
         ),
     )
 
-    accumulation_method: str = Field(
+    accumulation_method: Literal["subspace", "stack"] = Field(
         default="subspace",
         description=(
             "How to combine directions across iterations.  "
@@ -1633,6 +1836,15 @@ class AbliterixConfig(BaseSettings):
     non_interactive: bool = Field(
         default=False,
         description="Batch mode — skip interactive prompts and exit after the search loop.",
+    )
+
+    non_interactive_output_dir: str | None = Field(
+        default=None,
+        description=(
+            "Optional empty output directory for batch mode. The best completed "
+            "trial is replayed exactly, exported, hashed, and accompanied by a "
+            "reproduce/ manifest suitable for independent CI verification."
+        ),
     )
 
     overwrite_checkpoint: bool = Field(
@@ -1767,6 +1979,18 @@ class AbliterixConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_cross_section_combos(self) -> "AbliterixConfig":
+        # HF can materialize the stability-first FULL row-norm default. The
+        # vLLM projection cache cannot; when the user did not explicitly pick
+        # a mode, use PRE (the strongest supported normalization) instead.
+        # An explicit vLLM+FULL request still fails below rather than silently
+        # changing the requested algorithm.
+        if (
+            self.model.backend == "vllm"
+            and self.steering.weight_normalization == WeightNorm.FULL
+            and "weight_normalization" not in self.steering.model_fields_set
+        ):
+            self.steering.weight_normalization = WeightNorm.PRE
+
         # Iterative path passes its own n_directions and does not forward the
         # harmfulness flag — combining them would silently drop the harmfulness
         # signal. Reject explicitly so the misconfiguration surfaces at config
@@ -1779,6 +2003,120 @@ class AbliterixConfig(BaseSettings):
                 "iterative.per_iteration_directions for its own multi-vector "
                 "extraction and ignores the harmfulness flag. Choose one."
             )
+
+        rank_k_recipe = bool(
+            self.steering.n_directions > 1
+            or self.steering.ablate_harmfulness_direction
+            or self.steering.search_harmfulness_direction
+            or self.steering.vector_method in (VectorMethod.SOM, VectorMethod.SAE)
+            or self.iterative.enabled
+        )
+        runtime_hook_modes = {
+            SteeringMode.ANGULAR,
+            SteeringMode.ADAPTIVE_ANGULAR,
+            SteeringMode.SPHERICAL,
+            SteeringMode.VECTOR_FIELD,
+        }
+        if rank_k_recipe and self.steering.steering_mode in runtime_hook_modes:
+            raise ValueError(
+                "Rank-k steering recipes are not implemented for runtime hook "
+                f"mode {self.steering.steering_mode.value!r}; use steering_mode="
+                "'lora' or dense steering_mode='direct'."
+            )
+        if rank_k_recipe and self.steering.steering_mode == SteeringMode.DIRECT:
+            if (
+                self.steering.direct_transform != DirectTransform.STANDARD
+                or self.steering.search_direct_transform
+            ):
+                raise ValueError(
+                    "Rank-k direct steering currently implements the standard "
+                    "QR subspace projection only. A non-standard or searched "
+                    "direct_transform would be ignored; use direct_transform="
+                    "'standard' or steering_mode='lora'."
+                )
+
+        # Forward-time EGA replaces the weight mutation, so it only makes sense
+        # in direct mode, and its row-norm factors are per expert — which a
+        # fused-container hook cannot apply, since it never sees which expert a
+        # token was routed to. Reject both up front rather than surprising the
+        # user mid-search.
+        if self.steering.frozen_experts:
+            if self.steering.steering_mode != SteeringMode.DIRECT:
+                raise ValueError(
+                    "steering.frozen_experts applies the EGA edit at forward "
+                    "time in place of the direct-mode weight edit, so it "
+                    f"requires steering_mode='direct' (got "
+                    f"{self.steering.steering_mode.value!r})."
+                )
+            if self.steering.weight_normalization != WeightNorm.NONE:
+                raise ValueError(
+                    "steering.frozen_experts cannot preserve row norms across a "
+                    "fused multi-expert container: the rescale factors are per "
+                    "expert and a container-level hook cannot see per-token "
+                    "routing. Set weight_normalization='none', or drop "
+                    "frozen_experts to edit weights directly."
+                )
+
+        # Direct / EGA steering edits base weights in place, which requires
+        # writable BF16 (or full-precision) ``nn.Parameter`` tensors. A
+        # bitsandbytes-quantised base weight is a packed 4-bit ``Params4bit``
+        # (or int8 ``CB``) blob: ``weight.data.to(float32)`` does NOT dequant
+        # it (it reinterprets the packed bytes) and there is no in-place
+        # requant path, so the edit would silently corrupt every steerable
+        # weight during the search. LoRA mode handles bnb correctly (it keeps
+        # the quantised base frozen and carries the ablation in a BF16
+        # adapter). For a *native* 4-bit checkpoint, edit offline with
+        # ``abliterix-abliterate-fp4`` (dequant → project → repack).
+        if (
+            self.model.quant_method
+            in (
+                QuantMode.BNB_4BIT,
+                QuantMode.BNB_8BIT,
+            )
+            and self.steering.steering_mode == SteeringMode.DIRECT
+        ):
+            raise ValueError(
+                f"steering_mode='direct' cannot edit bitsandbytes "
+                f"{self.model.quant_method.value!r} base weights in place — the "
+                "packed 4-bit/int8 storage is not writable and would be "
+                "silently corrupted. Use steering_mode='lora' (keeps the "
+                "quantised base frozen, ablates via a BF16 adapter), load the "
+                "model unquantized (quant_method='none'), or, for a native-FP4 "
+                "checkpoint, bake offline with `abliterix-abliterate-fp4`."
+            )
+
+        # The current vLLM fast path materialises one rank-1 adapter from a
+        # ProjectionCache.  Feeding it a stacked ``(rank, layers, hidden)``
+        # tensor either indexes the layer axis as the rank axis or silently
+        # reuses the cache built for the single vector.  Reject every known
+        # producer of that layout until ProjectionCache itself is rank-k aware.
+        if self.model.backend == "vllm":
+            unsupported: list[str] = []
+            if self.steering.n_directions > 1:
+                unsupported.append(f"n_directions={self.steering.n_directions}")
+            if self.steering.ablate_harmfulness_direction:
+                unsupported.append("ablate_harmfulness_direction=true")
+            if self.steering.search_harmfulness_direction:
+                unsupported.append("search_harmfulness_direction=true")
+            if self.steering.vector_method == VectorMethod.SOM:
+                unsupported.append("vector_method='som'")
+            if self.steering.vector_method == VectorMethod.SAE:
+                unsupported.append("vector_method='sae'")
+            if self.steering.weight_normalization == WeightNorm.FULL:
+                unsupported.append("weight_normalization='full'")
+            if self.iterative.enabled:
+                unsupported.append("iterative.enabled=true")
+
+            if unsupported:
+                details = ", ".join(unsupported)
+                raise ValueError(
+                    "backend='vllm' currently uses ProjectionCache, which "
+                    "supports only a 2-D single-direction rank-1 steering "
+                    f"tensor. Unsupported rank-k recipe settings: {details}. "
+                    "Use backend='hf' for this recipe. Setting "
+                    "vllm_max_lora_rank only changes vLLM kernel capacity; it "
+                    "does not make ProjectionCache rank-k aware."
+                )
         return self
 
     @classmethod
@@ -1791,10 +2129,16 @@ class AbliterixConfig(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         # Determine TOML path: --config flag > AX_CONFIG env > default.
+        # Both ``--config path`` and ``--config=path`` are accepted —
+        # CliSettingsSource itself parses the equals form, so ignoring it here
+        # silently loaded the default file instead of the user's.
         config_path = os.environ.get("AX_CONFIG", "abliterix.toml")
         for i, arg in enumerate(sys.argv):
             if arg == "--config" and i + 1 < len(sys.argv):
                 config_path = sys.argv[i + 1]
+                break
+            if arg.startswith("--config="):
+                config_path = arg.split("=", 1)[1]
                 break
 
         return (

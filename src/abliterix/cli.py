@@ -34,24 +34,25 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analysis import ResidualAnalyzer
-from .core.engine import SteeringEngine, load_tokenizer
+from .core.engine import DEQUANT_CACHE_MAX_BYTES, SteeringEngine, load_tokenizer
 from .data import load_prompt_dataset
-from .eval.detector import RefusalDetector
+from .eval.detector import RefusalDetector, validate_judge_credentials
 from .eval.scorer import TrialScorer
-from .interactive import show_interactive_results
+from .interactive import _restore_selected_trial, show_interactive_results
 from .optimizer import run_search
 from .settings import AbliterixConfig
-from .types import ChatMessage
+from .types import ChatMessage, VectorMethod
 from .util import (
     ask_choice,
     flush_memory,
     print,
     report_memory,
+    reserved_unallocated_vram,
     set_seed,
     slugify_model_name,
 )
 from .types import SteeringMode
-from .vectors import compute_steering_vectors
+from .vectors import compute_configured_steering_vectors
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +76,7 @@ def _load_reproduce_config(repro_path: str) -> "AbliterixConfig | None":
 
     Returns the reconstructed config, or None if the manifest is unusable.
     """
-    from .reproducibility import check_environment, load_manifest
+    from .reproducibility import check_environment, load_manifest, validate_manifest
 
     try:
         manifest = load_manifest(repro_path)
@@ -89,6 +90,12 @@ def _load_reproduce_config(repro_path: str) -> "AbliterixConfig | None":
         f"Reproducing from [bold]{repro_path}[/] "
         f"(abliterix v{manifest.get('abliterix_version')})"
     )
+
+    try:
+        validate_manifest(manifest)
+    except ValueError as error:
+        print(f"[red]Invalid reproduce manifest: {error}[/]")
+        return None
 
     findings = check_environment(manifest)
     if findings:
@@ -297,7 +304,15 @@ def _speculators_available() -> bool:
         from speculators.data_generation import VllmHiddenStatesGenerator  # noqa: F401
 
         return True
-    except (ImportError, Exception):
+    except ImportError:
+        return False
+    except Exception as error:
+        # ImportError is a subclass of Exception, so the previous
+        # ``except (ImportError, Exception)`` was just ``except Exception``:
+        # a genuine bug in a partially-broken install silently downgraded to
+        # the 10-15x slower HF path with no indication why.
+        print(f"[yellow]speculators detected but unusable ({error}); [/]")
+        print("[yellow]falling back to HuggingFace hidden-state extraction.[/]")
         return False
 
 
@@ -318,7 +333,13 @@ def _vllm_hidden_states_available() -> bool:
         )
 
         return True
-    except (ImportError, Exception):
+    except ImportError:
+        return False
+    except Exception as error:
+        print(
+            f"[yellow]vLLM hidden-states connector detected but unusable ({error}); [/]"
+        )
+        print("[yellow]falling back to HuggingFace hidden-state extraction.[/]")
         return False
 
 
@@ -472,14 +493,19 @@ def _detect_response_prefix(
 # ---------------------------------------------------------------------------
 
 
-def run():
+def run() -> int:
+    """Run the CLI and return a process exit code (0 = success).
+
+    Every abort path returns non-zero so ``--non-interactive`` runs (the
+    documented CI-verification entry point) cannot turn a red build green.
+    """
     # Launch the Gradio Web UI if requested (before config parsing).
     if "--ui" in sys.argv:
         sys.argv.remove("--ui")
         from .webui import launch_ui
 
         launch_ui()
-        return
+        return 0
 
     # Reduce memory fragmentation on multi-GPU setups.
     if (
@@ -498,7 +524,7 @@ def run():
         idx = sys.argv.index("--reproduce")
         if idx + 1 >= len(sys.argv):
             print("[red]--reproduce requires a path to a reproduce.json file.[/]")
-            return
+            return 1
         repro_path = sys.argv[idx + 1]
         del sys.argv[idx : idx + 2]
 
@@ -511,18 +537,24 @@ def run():
                 if arg == short:
                     sys.argv[i] = full
 
-        # Infer --model.model-id flag if the last argument looks like a model identifier.
+        # Support the unambiguous shorthand ``abliterix owner/model``. Do not
+        # reinterpret an arbitrary final option value as a model ID (for
+        # example the path after ``--optimization.checkpoint-dir``).
         if (
-            len(sys.argv) > 1
+            len(sys.argv) == 2
             and "--model.model-id" not in sys.argv
             and not sys.argv[-1].startswith("-")
         ):
             sys.argv.insert(-1, "--model.model-id")
 
+    reproduce_manifest = None
     if repro_path is not None:
         config = _load_reproduce_config(repro_path)
         if config is None:
-            return
+            return 1
+        from .reproducibility import load_manifest
+
+        reproduce_manifest = load_manifest(repro_path)
     else:
         try:
             config = AbliterixConfig()  # ty:ignore[missing-argument]
@@ -537,7 +569,12 @@ def run():
                 "Run [bold]abliterix --help[/] or see [bold]abliterix.toml[/] for details "
                 "about configuration parameters."
             )
-            return
+            return 1
+
+    # Validate the default external evaluator before downloading datasets or
+    # loading a potentially enormous model. This turns a late multi-hour
+    # failure into an immediate actionable error.
+    validate_judge_credentials(config)
 
     _detect_devices()
     _configure_libraries()
@@ -552,6 +589,15 @@ def run():
         f"Global seed: [bold]{config.seed}[/]"
         + (" [grey50](randomly chosen)[/]" if _seed_was_random else "")
     )
+
+    # Resolve every Hub input once and load by immutable commit thereafter.
+    from .reproducibility import pin_remote_sources
+
+    resolved_sources = pin_remote_sources(config)
+    if resolved_sources:
+        print("Pinned remote inputs to immutable Hub commits:")
+        for resolved_source in resolved_sources:
+            print(f"* [dim]{resolved_source}[/]")
 
     os.makedirs(config.optimization.checkpoint_dir, exist_ok=True)
 
@@ -578,7 +624,8 @@ def run():
             storage,
         )
         if result is None:
-            return
+            # Existing checkpoint could not be resumed or restarted.
+            return 1
         config, storage = result
 
     # Load steering-vector source datasets (needed early for speculators path).
@@ -695,12 +742,15 @@ def run():
         engine.response_prefix = ""
         engine.needs_reload = False
         engine._dequant_cache = {}
+        engine._dequant_cache_bytes = 0
+        engine._dequant_cache_max_bytes = DEQUANT_CACHE_MAX_BYTES
         engine._cached_n_layers = None
         engine._cached_components = None
         engine._is_native_fp8 = False
         engine.tokenizer = load_tokenizer(
             config.model.model_id,
             trust_remote_code=config.model.trust_remote_code,
+            revision=config.model.revision,
         )
         if engine.tokenizer.pad_token is None:
             engine.tokenizer.pad_token = engine.tokenizer.eos_token
@@ -764,10 +814,11 @@ def run():
             print()
             print(f"Loading model [bold]{config.model.evaluate_model_id}[/]...")
             config.model.model_id = config.model.evaluate_model_id
+            config.model.revision = config.model.evaluate_model_revision
             engine.restore_baseline()
             print("* Evaluating...")
             scorer.score_trial(engine)
-            return
+            return 0
 
         # Compute steering vectors from residual streams.
         print()
@@ -786,6 +837,13 @@ def run():
         print(f"* Vector method: [bold]{config.steering.vector_method.value}[/]")
 
         if config.iterative.enabled:
+            if config.steering.vector_method == VectorMethod.RDO:
+                raise ValueError(
+                    "vector_method='rdo' is incompatible with iterative "
+                    "abliteration (the iterative loop re-extracts directions "
+                    "from cached states each round and has no RDO wiring). "
+                    "Disable iterative.enabled to use RDO."
+                )
             from .iterative import iterative_abliterate
 
             vectors, iter_stats = iterative_abliterate(
@@ -804,30 +862,20 @@ def run():
                 )
                 benign_states = engine.extract_hidden_states_batched(benign_msgs)
                 target_states = engine.extract_hidden_states_batched(target_msgs)
+        elif config.steering.vector_method == VectorMethod.RDO:
+            from .rdo import optimize_rdo_direction
+
+            vectors = optimize_rdo_direction(
+                engine,
+                target_msgs,
+                benign_msgs,
+                config,
+                benign_states=benign_states,
+                target_states=target_states,
+            )
         else:
-            vectors = compute_steering_vectors(
-                benign_states,
-                target_states,
-                config.steering.vector_method,
-                config.steering.orthogonal_projection,
-                winsorize=config.steering.winsorize_vectors,
-                winsorize_quantile=config.steering.winsorize_quantile,
-                projected_abliteration=config.steering.projected_abliteration,
-                ot_components=config.steering.ot_components,
-                n_directions=config.steering.n_directions,
-                sra_base_method=config.steering.sra_base_method,
-                sra_n_atoms=config.steering.sra_n_atoms,
-                sra_ridge_alpha=config.steering.sra_ridge_alpha,
-                ablate_harmfulness_direction=config.steering.ablate_harmfulness_direction,
-                harmfulness_layer_band=tuple(config.steering.harmfulness_layer_band),
-                som_grid_h=config.steering.som_grid_h,
-                som_grid_w=config.steering.som_grid_w,
-                som_n_iters=config.steering.som_n_iters,
-                som_initial_lr=config.steering.som_initial_lr,
-                som_seed=config.steering.som_seed,
-                sae_path=config.steering.sae_path,
-                sae_layer=config.steering.sae_layer,
-                sae_top_k=config.steering.sae_top_k,
+            vectors = compute_configured_steering_vectors(
+                benign_states, target_states, config
             )
 
         analyzer = ResidualAnalyzer(config, engine, benign_states, target_states)
@@ -959,6 +1007,15 @@ def run():
             print()
             print(f"[bold]Phase transition: HF → {backend_name}[/]")
 
+            # Hidden-state stacks kept for later use (discriminative layer
+            # selection / non-LoRA steering) may still be GPU-resident when
+            # inference.offload_outputs_to_cpu=false; move them to CPU so the
+            # TP workers spawned below don't see that VRAM as used (issue #83).
+            if benign_states is not None:
+                benign_states = benign_states.cpu()
+            if target_states is not None:
+                target_states = target_states.cpu()
+
             # Build projection cache.  If the HF model is loaded (needed for
             # non-speculators path), use it.  Otherwise read weights directly
             # from safetensors on disk — avoids the 3+ min HF model load.
@@ -1008,6 +1065,21 @@ def run():
                     vectors,
                 )
             flush_memory()
+            # VRAM still reserved by this (HF-phase) process is invisible
+            # garbage to the TP workers spawned below — they count it as
+            # used memory and refuse to start ("Free memory on device ...
+            # is less than desired GPU memory utilization", issue #83).
+            _stuck = reserved_unallocated_vram()
+            if _stuck > 2 * 1024**3:
+                print(
+                    f"[yellow]Warning: {_stuck / 1024**3:.1f} GB of VRAM "
+                    f"is still reserved after unloading the HF model — "
+                    f"something is pinning the freed weights.  The "
+                    f"{backend_name} workers may fail to start with 'Free "
+                    f"memory on device' errors; if they do, please report "
+                    f"this at "
+                    f"https://github.com/wuwangzhang1216/abliterix/issues.[/]"
+                )
             report_memory()
 
             # Load model with tensor parallelism.
@@ -1283,6 +1355,42 @@ def run():
                 "harmfulness_pair": pair_vectors,
             }
 
+        if reproduce_manifest is not None:
+            from .reproducibility import (
+                compare_reproduction_metrics,
+                manifest_trial,
+            )
+
+            print()
+            print("[bold]Replaying the published winning trial exactly...[/]")
+            replay_trial = manifest_trial(reproduce_manifest)
+            _restore_selected_trial(
+                replay_trial,
+                config,
+                engine,
+                vectors,
+                safety_experts,
+                benign_states=benign_states,
+                target_states=target_states,
+                steering_vector_variants=_vector_variants,
+            )
+            _, replay_kl, replay_refusals, _ = scorer.score_trial(engine)
+            drift = compare_reproduction_metrics(
+                reproduce_manifest,
+                kl_divergence=replay_kl,
+                refusals=replay_refusals,
+            )
+            if drift:
+                details = "; ".join(drift)
+                raise RuntimeError(
+                    "Independent reproduction verification failed: " + details
+                )
+            print(
+                "[bold green]Independent reproduction verified:[/] "
+                f"KL={replay_kl:.6g}, refusals={replay_refusals}."
+            )
+            return 0
+
         study = run_search(
             config,
             engine,
@@ -1293,6 +1401,7 @@ def run():
             benign_states=benign_states,
             target_states=target_states,
             steering_vector_variants=_vector_variants,
+            raise_on_interrupt=config.non_interactive,
         )
 
         if config.non_interactive:
@@ -1302,7 +1411,67 @@ def run():
                 f"[bold green]Non-interactive mode: optimization finished with "
                 f"{completed} completed trials.[/]"
             )
-            return
+            if config.non_interactive_output_dir:
+                from pathlib import Path
+
+                from .reproducibility import (
+                    build_manifest,
+                    local_weight_shas,
+                    write_reproduce_artifacts,
+                )
+
+                complete_trials = [
+                    trial
+                    for trial in study.trials
+                    if trial.state == TrialState.COMPLETE
+                ]
+                if not complete_trials:
+                    raise RuntimeError("No completed trial is available for export.")
+                selected = min(
+                    complete_trials,
+                    key=lambda trial: (
+                        trial.user_attrs["refusals"],
+                        trial.user_attrs["kl_divergence"],
+                    ),
+                )
+                output_dir = Path(config.non_interactive_output_dir).expanduser()
+                if output_dir.exists() and any(output_dir.iterdir()):
+                    raise RuntimeError(
+                        f"Non-interactive output directory is not empty: {output_dir}"
+                    )
+                output_dir.mkdir(parents=True, exist_ok=True)
+                trial_config = _restore_selected_trial(
+                    selected,
+                    config,
+                    engine,
+                    vectors,
+                    safety_experts,
+                    benign_states=benign_states,
+                    target_states=target_states,
+                    steering_vector_variants=_vector_variants,
+                )
+                print(f"Exporting verified trial to [bold]{output_dir}[/]...")
+                merged = engine.export_merged()
+                merged.save_pretrained(output_dir)
+                del merged
+                flush_memory()
+                engine.tokenizer.save_pretrained(output_dir)
+                weight_shas = local_weight_shas(output_dir)
+                if not weight_shas:
+                    raise RuntimeError("Export produced no hashable model weights.")
+                manifest = build_manifest(
+                    trial_config,
+                    selected,
+                    weight_shas=weight_shas,
+                    baseline_refusal_count=scorer.baseline_refusal_count,
+                    n_target_prompts=len(scorer.target_msgs),
+                )
+                write_reproduce_artifacts(output_dir / "reproduce", manifest)
+                print(
+                    f"[bold green]Export verified:[/] {len(weight_shas)} weight "
+                    "file(s) hashed with SHA256."
+                )
+            return 0
 
         show_interactive_results(
             study,
@@ -1312,16 +1481,21 @@ def run():
             vectors,
             safety_experts,
             storage,
+            benign_states=benign_states,
+            target_states=target_states,
+            steering_vector_variants=_vector_variants,
         )
     finally:
         detector.close()
+
+    return 0
 
 
 def main():
     install()  # Rich traceback handler.
 
     try:
-        run()
+        code = run()
     except BaseException as error:
         if isinstance(error, KeyboardInterrupt) or isinstance(
             error.__context__,
@@ -1329,5 +1503,7 @@ def main():
         ):
             print()
             print("[red]Shutting down...[/]")
-        else:
-            raise
+            # 130 is the conventional "terminated by SIGINT" status.
+            sys.exit(130)
+        raise
+    sys.exit(code)

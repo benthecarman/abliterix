@@ -63,6 +63,30 @@ See [vllm.md](vllm.md) for the full runbook and the trial-40 lessons learned.
 | [`lfm2_24b.toml`](../configs/lfm2_24b.toml) | LiquidAI LFM2-24B hybrid conv+GQA MoE |
 | [`noslop.toml`](../configs/noslop.toml) | Anti-slop tuning |
 
+## Troubleshooting 4-bit loading with CPU or disk offload
+
+A `Cannot copy out of meta tensor; no data!` error inside
+`bitsandbytes.QuantState.to` means that quantization metadata has lost its
+backing data. This is different from an ordinary offloaded model parameter:
+Accelerate can materialize a weight from its backing store, but cannot recover
+missing quantization scales or codebooks from a meta tensor.
+
+Check the devices actually reported at startup and the model's `hf_device_map`.
+For example, `CUDA_VISIBLE_DEVICES=0` exposes only one GPU even on a four-GPU
+machine. `model.max_memory` uses the visible device indices; it should describe
+the devices intended for the run and leave room for activations. Increasing the
+generation batch size does not make missing devices available or repair missing
+metadata.
+
+If this error occurs, reload the original checkpoint with a device map that keeps
+the quantized layers resident on the intended devices. Do not replace missing
+scales with zeros or use `to_empty()` as a repair: neither restores the original
+weights. If it persists with resident weights, include the resolved device map,
+the failing parameter path, and the Transformers, Accelerate, PEFT, PyTorch and
+bitsandbytes versions in the report. The loader checks quantization metadata
+before its first smoke test and around adapter insertion so this failure is
+reported before optimization starts.
+
 ## Web UI
 
 Launch the Gradio-based Web UI for a browser-based steering experience:

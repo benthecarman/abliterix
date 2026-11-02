@@ -26,15 +26,19 @@ Three pieces:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import platform
 import subprocess
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPRODUCE_TAG = "reproducible"
+_PIN_LENGTH = 40
 
 # Packages whose versions materially affect the produced weights / behaviour.
 # Ordered roughly by how load-bearing they are for reproduction.
@@ -99,6 +103,11 @@ def _git_commit() -> dict[str, Any] | None:
             text=True,
             timeout=5,
         )
+        # Unknown must not be recorded as clean: a failed `git status`
+        # (corrupt index, dubious-ownership, timeout) would otherwise be
+        # published as a clean checkout and skip the dirty-tree check.
+        if status.returncode != 0:
+            return None
         return {
             "commit": rev.stdout.strip(),
             "dirty": bool(status.stdout.strip()),
@@ -144,10 +153,161 @@ def _dataset_sources(config) -> dict[str, Any]:
             continue
         out[key] = {
             "dataset": src.dataset,
+            "revision": getattr(src, "revision", None),
             "split": src.split,
             "column": src.column,
+            "prefix": src.prefix,
+            "suffix": src.suffix,
+            "system_prompt": src.system_prompt,
         }
     return out
+
+
+def _is_commit_pin(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == _PIN_LENGTH
+        and all(char in "0123456789abcdefABCDEF" for char in value)
+    )
+
+
+def _is_local_source(value: str) -> bool:
+    return Path(value).expanduser().exists()
+
+
+def pin_remote_sources(config, *, api=None) -> list[str]:
+    """Resolve every unpinned Hub input to its immutable commit SHA.
+
+    The resolved revisions are written back to the config so model and dataset
+    loading use the same snapshot that is later recorded in ``reproduce.json``.
+    Local inputs are left untouched and are subsequently classified as not
+    independently reproducible.
+    """
+    if api is None:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+
+    resolved: list[str] = []
+    model = config.model
+    if not _is_local_source(model.model_id) and not _is_commit_pin(model.revision):
+        try:
+            info = api.model_info(model.model_id, revision=model.revision)
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not resolve immutable revision for model {model.model_id!r}: {error}"
+            ) from error
+        if not _is_commit_pin(getattr(info, "sha", None)):
+            raise RuntimeError(
+                f"Hub returned no immutable commit for model {model.model_id!r}."
+            )
+        model.revision = info.sha
+        resolved.append(f"model {model.model_id}@{model.revision}")
+
+    if (
+        model.evaluate_model_id
+        and not _is_local_source(model.evaluate_model_id)
+        and not _is_commit_pin(model.evaluate_model_revision)
+    ):
+        try:
+            info = api.model_info(
+                model.evaluate_model_id,
+                revision=model.evaluate_model_revision,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "Could not resolve immutable revision for evaluation model "
+                f"{model.evaluate_model_id!r}: {error}"
+            ) from error
+        if not _is_commit_pin(getattr(info, "sha", None)):
+            raise RuntimeError(
+                "Hub returned no immutable commit for evaluation model "
+                f"{model.evaluate_model_id!r}."
+            )
+        model.evaluate_model_revision = info.sha
+        resolved.append(
+            f"evaluation model {model.evaluate_model_id}@{model.evaluate_model_revision}"
+        )
+
+    for name in (
+        "benign_prompts",
+        "target_prompts",
+        "benign_eval_prompts",
+        "target_eval_prompts",
+    ):
+        source = getattr(config, name)
+        if _is_local_source(source.dataset) or _is_commit_pin(source.revision):
+            continue
+        try:
+            info = api.dataset_info(source.dataset, revision=source.revision)
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not resolve immutable revision for {name} "
+                f"dataset {source.dataset!r}: {error}"
+            ) from error
+        if not _is_commit_pin(getattr(info, "sha", None)):
+            raise RuntimeError(
+                f"Hub returned no immutable commit for {name} dataset "
+                f"{source.dataset!r}."
+            )
+        source.revision = info.sha
+        resolved.append(f"{name} {source.dataset}@{source.revision}")
+    return resolved
+
+
+def assess_reproducibility(config) -> tuple[bool, list[str]]:
+    """Return whether a run can be independently replayed, with exact reasons."""
+    reasons: list[str] = []
+    if getattr(config, "seed", None) is None:
+        reasons.append("the global seed is unresolved")
+
+    model = config.model
+    if _is_local_source(model.model_id):
+        reasons.append("the base model is a local path")
+    elif not _is_commit_pin(getattr(model, "revision", None)):
+        reasons.append("the base model is not pinned to a Hub commit")
+    if model.evaluate_model_id:
+        if _is_local_source(model.evaluate_model_id):
+            reasons.append("the evaluation model is a local path")
+        elif not _is_commit_pin(model.evaluate_model_revision):
+            reasons.append("the evaluation model is not pinned to a Hub commit")
+
+    for name in (
+        "benign_prompts",
+        "target_prompts",
+        "benign_eval_prompts",
+        "target_eval_prompts",
+    ):
+        source = getattr(config, name)
+        if _is_local_source(source.dataset):
+            reasons.append(f"{name} is a local dataset")
+        elif not _is_commit_pin(getattr(source, "revision", None)):
+            reasons.append(f"{name} is not pinned to a Hub commit")
+
+    if config.detection.llm_judge:
+        reasons.append("the external LLM judge is not independently reproducible")
+    if config.model.backend != "hf":
+        reasons.append("exact trial materialization currently requires backend='hf'")
+
+    source = _git_commit()
+    if source and source.get("dirty"):
+        reasons.append("the Abliterix source checkout has uncommitted changes")
+    return not reasons, reasons
+
+
+def _canonical_payload(manifest: dict[str, Any]) -> bytes:
+    payload = {key: value for key, value in manifest.items() if key != "integrity"}
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def canonical_manifest_sha256(manifest: dict[str, Any]) -> str:
+    """Hash the semantic manifest payload, excluding its integrity envelope."""
+    return hashlib.sha256(_canonical_payload(manifest)).hexdigest()
 
 
 def build_manifest(
@@ -187,6 +347,8 @@ def build_manifest(
         "config": config.model_dump(mode="json"),
     }
 
+    reproducible, reasons = assess_reproducibility(config)
+
     if trial is not None:
         manifest["trial"] = {
             "index": trial.user_attrs.get("index"),
@@ -196,6 +358,7 @@ def build_manifest(
             "decay_kernel": trial.user_attrs.get("decay_kernel"),
             "direct_transform": trial.user_attrs.get("direct_transform"),
             "steering_variant": trial.user_attrs.get("steering_variant"),
+            "steering_recipe": trial.user_attrs.get("steering_recipe"),
         }
         manifest["metrics"] = {
             "kl_divergence": trial.user_attrs.get("kl_divergence"),
@@ -203,11 +366,114 @@ def build_manifest(
             "baseline_refusals": baseline_refusal_count,
             "n_target_prompts": n_target_prompts,
         }
+        if not trial.user_attrs.get("steering_recipe"):
+            reproducible = False
+            reasons.append("the winning trial has no exact steering recipe")
+    else:
+        reproducible = False
+        reasons.append("the manifest has no winning trial")
 
     if weight_shas:
         manifest["weights"] = dict(sorted(weight_shas.items()))
+    else:
+        reproducible = False
+        reasons.append("no weight-shard SHA256 checksums could be computed")
+
+    manifest["reproducible"] = reproducible
+    manifest["reproducibility_reasons"] = reasons
+    manifest["integrity"] = {
+        "algorithm": "sha256",
+        "canonical_manifest": canonical_manifest_sha256(manifest),
+    }
 
     return manifest
+
+
+def validate_manifest(manifest: dict[str, Any]) -> None:
+    """Validate schema, exact-trial data, and the manifest integrity envelope."""
+    version_value = manifest.get("schema_version")
+    if version_value != SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported reproduce schema {version_value!r}; expected {SCHEMA_VERSION}. "
+            "Legacy schema v1 can restore configuration but cannot prove exact replay."
+        )
+    integrity = manifest.get("integrity") or {}
+    expected = integrity.get("canonical_manifest")
+    actual = canonical_manifest_sha256(manifest)
+    if not expected or expected != actual:
+        raise ValueError("Reproduce manifest integrity check failed.")
+    trial = manifest.get("trial")
+    if not isinstance(trial, dict):
+        raise ValueError("Reproduce manifest has no exact winning-trial artifact.")
+    if "vector_index" not in trial:
+        raise ValueError("Reproduce manifest trial is missing 'vector_index'.")
+    for field in ("parameters", "steering_recipe"):
+        if field not in trial or trial[field] is None:
+            raise ValueError(f"Reproduce manifest trial is missing {field!r}.")
+    recipe = trial["steering_recipe"]
+    steering = recipe.get("steering") if isinstance(recipe, dict) else None
+    scope = steering.get("fixed_vector_scope") if isinstance(steering, dict) else None
+    vector_index = trial["vector_index"]
+    if scope == "per layer":
+        if vector_index is not None:
+            raise ValueError("Saved per-layer vector scope requires vector_index=None.")
+    elif scope == "global":
+        if (
+            isinstance(vector_index, bool)
+            or not isinstance(vector_index, (int, float))
+            or not math.isfinite(vector_index)
+        ):
+            raise ValueError(
+                "Saved global vector scope requires a finite numeric vector_index."
+            )
+    else:
+        raise ValueError(
+            "Reproduce manifest steering recipe must specify fixed_vector_scope "
+            "as 'global' or 'per layer'."
+        )
+    # Without weight hashes the SHA256SUMS half of the guarantee is
+    # unverifiable, so such a manifest must not be accepted for exact replay.
+    if not isinstance(manifest.get("weights"), dict) or not manifest["weights"]:
+        raise ValueError(
+            "Reproduce manifest has no weight SHA256 checksums; exact replay "
+            "cannot be verified."
+        )
+
+
+def manifest_trial(manifest: dict[str, Any]) -> SimpleNamespace:
+    """Return a trial-shaped immutable replay proxy from a validated manifest."""
+    validate_manifest(manifest)
+    trial = dict(manifest["trial"])
+    return SimpleNamespace(user_attrs=trial)
+
+
+def compare_reproduction_metrics(
+    manifest: dict[str, Any],
+    *,
+    kl_divergence: float,
+    refusals: int,
+    kl_abs_tol: float = 1e-6,
+    kl_rel_tol: float = 1e-3,
+) -> list[str]:
+    """Compare independently re-measured results with the published metrics."""
+    findings: list[str] = []
+    metrics = manifest.get("metrics") or {}
+    expected_kl = metrics.get("kl_divergence")
+    if not isinstance(expected_kl, (int, float)) or not math.isclose(
+        float(expected_kl),
+        kl_divergence,
+        rel_tol=kl_rel_tol,
+        abs_tol=kl_abs_tol,
+    ):
+        findings.append(
+            f"kl_divergence: recorded {expected_kl!r}, reproduced {kl_divergence!r}"
+        )
+    expected_refusals = metrics.get("refusals")
+    if expected_refusals != refusals:
+        findings.append(
+            f"refusals: recorded {expected_refusals!r}, reproduced {refusals!r}"
+        )
+    return findings
 
 
 def repo_weight_shas(repo_id: str, token: str | None) -> dict[str, str]:
@@ -238,6 +504,24 @@ def repo_weight_shas(repo_id: str, token: str | None) -> dict[str, str]:
     return shas
 
 
+def local_weight_shas(model_dir: str | Path) -> dict[str, str]:
+    """Compute deterministic SHA256 checksums for exported model weight files."""
+    root = Path(model_dir)
+    shas: dict[str, str] = {}
+    # rglob: sharded exports nest shards in subdirectories, and a
+    # partially-hashed export would silently pass the non-empty check.
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or not path.name.endswith((".safetensors", ".bin")):
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        rel_path = path.relative_to(root).as_posix()
+        shas[rel_path] = digest.hexdigest()
+    return shas
+
+
 def write_reproduce_artifacts(
     out_dir: str | Path, manifest: dict[str, Any]
 ) -> list[Path]:
@@ -246,19 +530,24 @@ def write_reproduce_artifacts(
     out.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
+    # Explicit utf-8: Path.write_text defaults to the locale encoding
+    # (cp1252 on many Windows hosts), which raises UnicodeEncodeError for a
+    # non-ASCII model id or GPU driver string.
     reproduce_json = out / "reproduce.json"
-    reproduce_json.write_text(json.dumps(manifest, indent=2, sort_keys=False))
+    reproduce_json.write_text(
+        json.dumps(manifest, indent=2, sort_keys=False), encoding="utf-8"
+    )
     written.append(reproduce_json)
 
     weights = manifest.get("weights") or {}
     if weights:
         sha_lines = [f"{sha}  {name}" for name, sha in weights.items()]
         sha_file = out / "SHA256SUMS"
-        sha_file.write_text("\n".join(sha_lines) + "\n")
+        sha_file.write_text("\n".join(sha_lines) + "\n", encoding="utf-8")
         written.append(sha_file)
 
     readme = out / "README.md"
-    readme.write_text(_render_readme(manifest))
+    readme.write_text(_render_readme(manifest), encoding="utf-8")
     written.append(readme)
 
     return written
@@ -291,15 +580,18 @@ pip install -U abliterix
 abliterix --reproduce reproduce.json
 ```
 
-Abliterix will diff your environment against the one recorded below (flagging
-differences by severity) and then re-run the search with the recorded seed and
-configuration.
+Abliterix will verify the manifest integrity, diff your environment against the
+one recorded below, apply the exact published winning trial without searching,
+and independently re-measure KL divergence and refusal count. Metric drift is a
+hard verification failure.
 
 ## Key facts
 
 | Field | Value |
 | :---- | :---- |
 | Base model | `{model.get("model_id")}` |
+| Base revision | `{model.get("revision")}` |
+| Independently reproducible | `{manifest.get("reproducible")}` |
 | Seed | `{seed}` |
 | KL divergence | `{metrics.get("kl_divergence")}` |
 | Refusals | `{metrics.get("refusals")}` / `{metrics.get("n_target_prompts")}` |

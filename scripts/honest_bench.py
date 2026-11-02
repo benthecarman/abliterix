@@ -3,7 +3,7 @@
 """HonestAbliterationBench runner.
 
 Reproducible benchmark for abliterated language models. Implements the
-contract defined in benchmarks/SPEC.md (spec_version 1.0).
+contract defined in benchmarks/SPEC.md (spec_version 1.1).
 
 Usage:
     python scripts/honest_bench.py \
@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,9 +38,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Spec constants — DO NOT change without bumping benchmarks/SPEC.md.
 # ---------------------------------------------------------------------------
 
-SPEC_VERSION = "1.0"
+SPEC_VERSION = "1.1"
 SPEC_MIN_NEW_TOKENS = 100
 SPEC_MAX_NEW_TOKENS = 150
+SPEC_KL_TOKEN_COUNT = 1
 SPEC_JUDGE_MODEL = "google/gemini-3-flash-preview"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -117,6 +119,7 @@ def _make_engine(model_id: str, device_map: str, trust_remote_code: bool):
         from abliterix.settings import AbliterixConfig  # noqa: WPS433
 
         config = AbliterixConfig()
+        _validate_frozen_config(config)
         # The frozen spec sets batch_size = 0 ("auto-tune") because abliterix's
         # normal CLI flow runs _auto_batch_size() right after engine load. The
         # bench flow doesn't call that helper, so we'd end up with a 0 that
@@ -143,22 +146,85 @@ def _make_engine(model_id: str, device_map: str, trust_remote_code: bool):
             else:
                 config.inference.batch_size = 1
 
-        if config.inference.max_gen_tokens != SPEC_MAX_NEW_TOKENS:
-            raise SystemExit(
-                "Frozen bench config drifted: "
-                f"max_gen_tokens={config.inference.max_gen_tokens}, "
-                f"expected {SPEC_MAX_NEW_TOKENS}"
-            )
-        if config.inference.min_gen_tokens != SPEC_MIN_NEW_TOKENS:
-            raise SystemExit(
-                "Frozen bench config drifted: "
-                f"min_gen_tokens={config.inference.min_gen_tokens}, "
-                f"expected {SPEC_MIN_NEW_TOKENS}"
-            )
         engine = SteeringEngine(config)
     finally:
         sys.argv = saved_argv
     return engine, config, cfg_path
+
+
+def _validate_frozen_config(config) -> None:
+    for name, actual, expected in (
+        ("max_gen_tokens", config.inference.max_gen_tokens, SPEC_MAX_NEW_TOKENS),
+        ("min_gen_tokens", config.inference.min_gen_tokens, SPEC_MIN_NEW_TOKENS),
+        ("kl.token_count", config.kl.token_count, SPEC_KL_TOKEN_COUNT),
+    ):
+        if actual != expected:
+            raise SystemExit(
+                f"Frozen bench config drifted: {name}={actual}, expected {expected} "
+                f"for spec {SPEC_VERSION}. Multi-token KL requires shared fixed "
+                "continuations and is not supported by this frozen benchmark."
+            )
+
+
+@dataclass(frozen=True)
+class _KLContext:
+    vocabulary_sha256: str
+    rendered_prompts: tuple[str, ...]
+    input_ids: tuple[tuple[int, ...], ...]
+
+
+def _capture_kl_context(engine, messages) -> _KLContext:
+    """Retain CPU-only evidence of token meanings and scored prompt contexts."""
+    get_vocab = getattr(engine.tokenizer, "get_vocab", None)
+    if not callable(get_vocab):
+        raise SystemExit(
+            "Unsupported benchmark comparison: tokenizer must expose get_vocab() "
+            "to verify the meaning of each token ID."
+        )
+    vocabulary = json.dumps(
+        get_vocab(), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    rendered = tuple(engine._render_messages(messages))
+    input_rows: list[tuple[int, ...]] = []
+    batch_size = engine.config.inference.batch_size
+    for start in range(0, len(messages), batch_size):
+        # Use the exact model-facing path, including its chat template,
+        # response prefix and tokenizer defaults. Discard padding so differing
+        # batch schedules do not change the underlying prompt comparison.
+        inputs = engine._tokenize(messages[start : start + batch_size])
+        rows = inputs["input_ids"].tolist()
+        mask = inputs.get("attention_mask")
+        masks = mask.tolist() if mask is not None else [[1] * len(row) for row in rows]
+        input_rows.extend(
+            tuple(token for token, visible in zip(row, mask_row) if visible)
+            for row, mask_row in zip(rows, masks)
+        )
+    if len(rendered) != len(messages) or len(input_rows) != len(messages):
+        raise SystemExit(
+            "Unsupported benchmark comparison: tokenizer returned an unexpected "
+            "number of benign prompt contexts."
+        )
+    return _KLContext(
+        hashlib.sha256(vocabulary).hexdigest(), rendered, tuple(input_rows)
+    )
+
+
+def _require_matching_kl_context(target: _KLContext, base: _KLContext) -> None:
+    prefix = "Unsupported benchmark comparison: target and base "
+    if target.vocabulary_sha256 != base.vocabulary_sha256:
+        raise SystemExit(
+            prefix + "token-to-ID vocabularies differ; full-distribution KL "
+            "requires identical token meanings, not just equal vocabulary sizes."
+        )
+    if target.rendered_prompts != base.rendered_prompts:
+        raise SystemExit(
+            prefix + "render different benign prompt contexts (chat template "
+            "or response prefix differs)."
+        )
+    if target.input_ids != base.input_ids:
+        raise SystemExit(
+            prefix + "tokenize the benign prompt contexts into different input IDs."
+        )
 
 
 def _free_engine(engine, cfg_path: str | None):
@@ -345,15 +411,19 @@ def main() -> int:  # noqa: PLR0915 — top-level orchestration is intentionally
         args.device_map,
         args.trust_remote_code,
     )
-    print("[bench] generating harmful responses...")
-    target_resp_harmful = _generate_responses(target_engine, harmful_msgs)
-    print("[bench] generating benign responses...")
-    target_resp_benign = _generate_responses(target_engine, benign_msgs)
-    print("[bench] computing target logprobs on benign set...")
-    target_logprobs = target_engine.compute_logprobs_batched(benign_msgs).detach().cpu()
-
-    checkpoint_dir = target_config.optimization.checkpoint_dir
-    _free_engine(target_engine, target_cfg_path)
+    try:
+        target_kl_context = _capture_kl_context(target_engine, benign_msgs)
+        print("[bench] generating harmful responses...")
+        target_resp_harmful = _generate_responses(target_engine, harmful_msgs)
+        print("[bench] generating benign responses...")
+        target_resp_benign = _generate_responses(target_engine, benign_msgs)
+        print("[bench] computing target logprobs on benign set...")
+        target_logprobs = (
+            target_engine.compute_logprobs_batched(benign_msgs).detach().cpu()
+        )
+        checkpoint_dir = target_config.optimization.checkpoint_dir
+    finally:
+        _free_engine(target_engine, target_cfg_path)
 
     # 3. Load BASE model — generate benign responses (for length z-score) + logprobs.
     print(f"\n[bench] === BASE MODEL: {args.base_model} ===")
@@ -362,23 +432,21 @@ def main() -> int:  # noqa: PLR0915 — top-level orchestration is intentionally
         args.device_map,
         args.trust_remote_code,
     )
-    print("[bench] generating base benign responses (for length baseline)...")
-    base_resp_benign = _generate_responses(base_engine, benign_msgs)
-    print("[bench] computing base logprobs on benign set...")
-    base_logprobs = base_engine.compute_logprobs_batched(benign_msgs).detach().cpu()
-    _free_engine(base_engine, base_cfg_path)
+    try:
+        _require_matching_kl_context(
+            target_kl_context, _capture_kl_context(base_engine, benign_msgs)
+        )
+        print("[bench] generating base benign responses (for length baseline)...")
+        base_resp_benign = _generate_responses(base_engine, benign_msgs)
+        print("[bench] computing base logprobs on benign set...")
+        base_logprobs = base_engine.compute_logprobs_batched(benign_msgs).detach().cpu()
+    finally:
+        _free_engine(base_engine, base_cfg_path)
 
-    # 4. KL divergence (target || base).
-    import torch.nn.functional as F  # noqa: WPS433
+    # 4. KL(base || target), averaged over prompt/token distributions.
+    from abliterix.eval.kl import mean_token_kl  # noqa: WPS433
 
-    kl_vs_base = float(
-        F.kl_div(
-            target_logprobs,
-            base_logprobs,
-            reduction="batchmean",
-            log_target=True,
-        ).item()
-    )
+    kl_vs_base = mean_token_kl(target_logprobs, base_logprobs)
     print(f"[bench] kl_vs_base = {kl_vs_base:.6f}")
 
     # 5. Length z-score and degenerate-rate on benign set.
@@ -474,14 +542,23 @@ def main() -> int:  # noqa: PLR0915 — top-level orchestration is intentionally
         "over_refusal_rate_by_category": _bucket_rates(
             benign_entries, over_refusal_labels, "category"
         ),
-        "kl_vs_base": round(kl_vs_base, 6),
+        "damage_metric": {
+            "name": "full_distribution_kl",
+            "estimator": "mean_per_token_kl",
+            "units": "nats/token",
+            "value": round(kl_vs_base, 6),
+        },
         "degenerate_rate": round(degenerate_rate, 6),
         "mean_response_length": round(mean_len, 3),
         "length_z_score": round(length_z, 3),
         "n_harmful": len(harmful_entries),
         "n_benign": len(benign_entries),
         "judge_model": SPEC_JUDGE_MODEL,
+        "judge_prompt_sha256": detector._judge_prompt_hash,  # noqa: SLF001
         "judge_cache_sha256": judge_cache_sha,
+        "judge_max_attempts": 3,
+        "judge_unknown_harmful": 0,
+        "judge_unknown_benign": 0,
         "dataset_sha256_harmful": harmful_sha,
         "dataset_sha256_benign": benign_sha,
         "commit": _git_commit(),
