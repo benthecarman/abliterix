@@ -23,6 +23,7 @@ from transformers import (
     AutoTokenizer,
     BatchEncoding,
     BitsAndBytesConfig,
+    GenerationConfig,
     PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -155,14 +156,55 @@ def resolve_model_class(
     of dual-registered MoE VLMs such as some Qwen3.5-MoE checkpoints).
     """
     configs = PretrainedConfig.get_config_dict(model_id, revision=revision)
+    config_dicts = configs if isinstance(configs, tuple) else (configs,)
+    for cfg in config_dicts:
+        if isinstance(cfg, dict):
+            _validate_transformers_architecture(cfg)
     if text_only:
         return AutoModelForCausalLM
-
-    config_dicts = configs if isinstance(configs, tuple) else (configs,)
 
     if any(isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
+
+
+def _validate_transformers_architecture(config: dict[str, Any]) -> None:
+    """Explain missing upstream registrations without changing dependencies."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    auto_map = config.get("auto_map")
+    if isinstance(auto_map, dict) and auto_map.get("AutoConfig"):
+        return
+    for cfg in (config, config.get("text_config")):
+        if not isinstance(cfg, dict):
+            continue
+        model_type = cfg.get("model_type")
+        if model_type not in {"deepseek_v4", "glm5_next", "glm5_next_text"}:
+            continue
+        # A checkpoint with its own configuration class follows the existing
+        # trust_remote_code flow rather than requiring a native registration.
+        auto_map = cfg.get("auto_map")
+        if isinstance(auto_map, dict) and auto_map.get("AutoConfig"):
+            continue
+        if model_type not in CONFIG_MAPPING:
+            raise RuntimeError(
+                f"Installed Transformers {_tf.__version__} does not register "
+                f"the {model_type!r} architecture. Official model code is present "
+                "in Transformers 5.20.2; evaluate a compatible release in an "
+                "isolated environment rather than changing the shared lock. "
+                "This only addresses the upstream loader: multi-stream hidden "
+                "state extraction remains unsupported. See "
+                "docs/model-compatibility.md and issue #19."
+            )
+        streams = cfg.get("hc_mult")
+        if isinstance(streams, int) and streams > 1:
+            raise RuntimeError(
+                f"The {model_type!r} architecture declares {streams} residual "
+                "streams. Multi-stream hidden-state extraction is unsupported; "
+                "upgrading Transformers alone does not validate this "
+                "representation. Stopping before model weights are loaded. "
+                "See docs/model-compatibility.md and issue #19."
+            )
 
 
 def _bf16_compute_supported() -> bool:
@@ -202,7 +244,17 @@ def _register_mtp_layer_types_adapter(
             trust_remote_code=trust_remote_code,
             revision=revision,
         )
-        cfg_dict = cfgs[0] if isinstance(cfgs, tuple) else cfgs
+    except Exception:
+        return
+
+    cfg_dict = cfgs[0] if isinstance(cfgs, tuple) else cfgs
+    if not isinstance(cfg_dict, dict):
+        return
+    # Reuse the metadata already fetched by this preflight, before tokenizer
+    # or model loading. Unsupported native architectures need an actionable
+    # error, not an implicit global Transformers upgrade.
+    _validate_transformers_architecture(cfg_dict)
+    try:
         layer_types = cfg_dict.get("layer_types")
         n_hidden = cfg_dict.get("num_hidden_layers")
         if not (layer_types and n_hidden and len(layer_types) > n_hidden):
@@ -336,12 +388,12 @@ def _captured_logprobs(sampler: _LogitsSampler, expected_steps: int) -> Tensor:
 
 
 def _make_generation_config_savable(model: Module) -> None:
-    """Enable sampling in a generation config that sets sampling parameters.
+    """Normalize inactive sampling parameters without changing decoding mode.
 
-    Transformers refuses to save a generation config that sets sampling
-    parameters without ``do_sample`` (GLM-5.3 ships ``top_p`` alone), which
-    aborts the whole export. Such parameters show the model's authors intended
-    sampling, so enable it, unless the config is invalid for other reasons.
+    Model defaults can retain sampling parameters after the caller selects
+    greedy or beam decoding. Transformers rejects those settings on save,
+    even though generation ignores them. Repair a copy, preserving the
+    caller's selected mode and leaving unrelated validation errors visible.
     """
     import copy
 
@@ -353,15 +405,34 @@ def _make_generation_config_savable(model: Module) -> None:
         return
     except ValueError:
         pass
+    if generation_config.do_sample is True:
+        return
+
     repaired = copy.deepcopy(generation_config)
-    repaired.do_sample = True
+    defaults = GenerationConfig()
+    for name in (
+        "temperature",
+        "top_p",
+        "min_p",
+        "top_h",
+        "typical_p",
+        "top_k",
+        "epsilon_cutoff",
+        "eta_cutoff",
+    ):
+        if hasattr(repaired, name) and hasattr(defaults, name):
+            setattr(repaired, name, getattr(defaults, name))
+    # top_k also selects contrastive search in older Transformers releases.
+    # Never silently change that mode to greedy decoding during export.
+    if repaired.get_generation_mode() != generation_config.get_generation_mode():
+        return
     try:
         repaired.validate(strict=True)
     except ValueError:
         return
     print(
-        "* [yellow]Enabling sampling in the generation config, which sets "
-        "sampling parameters without it[/]"
+        "* [yellow]Resetting inactive sampling parameters in the exported "
+        "generation config; the selected decoding mode is unchanged[/]"
     )
     model.generation_config = repaired
 
@@ -835,19 +906,52 @@ class SteeringEngine:
         # DeepSeek-V4's official encoder has no add_generation_prompt: it ends a
         # conversation whose last message is from the user with the assistant
         # prefix itself. Only pass the flag to encoders that accept it.
-        params = inspect.signature(encode_fn).parameters.values()
-        takes_generation_prompt = any(
-            p.name == "add_generation_prompt" or p.kind is p.VAR_KEYWORD for p in params
+        signature = inspect.signature(encode_fn)
+        params = signature.parameters
+        prompt_param = params.get("add_generation_prompt")
+        if prompt_param is not None and prompt_param.kind in (
+            prompt_param.VAR_POSITIONAL,
+            prompt_param.VAR_KEYWORD,
+        ):
+            prompt_param = None
+        takes_generation_prompt = prompt_param is not None or any(
+            p.kind is p.VAR_KEYWORD for p in params.values()
         )
+        # Bind once so required options and misspelled encoder_kwargs fail at
+        # installation. BoundArguments also handles positional-only flags.
+        call_kwargs = dict(encoder_kwargs)
+        if takes_generation_prompt:
+            call_kwargs["add_generation_prompt"] = False
+        positional_args: list[Any] = [[]]
+        for p in list(params.values())[1:]:
+            if p.kind is not p.POSITIONAL_ONLY:
+                break
+            if p.name in call_kwargs:
+                positional_args.append(call_kwargs.pop(p.name))
+            elif p.default is not p.empty:
+                positional_args.append(p.default)
+            else:
+                raise TypeError(f"Custom encoder {path} requires option {p.name!r}")
+        try:
+            signature.bind(*positional_args, **call_kwargs)
+        except TypeError as exc:
+            raise TypeError(
+                f"Invalid options for custom encoder {path}: {exc}"
+            ) from exc
 
         def _encode(messages, add_generation_prompt: bool) -> str:
+            bound = signature.bind(messages, *positional_args[1:], **call_kwargs)
             if takes_generation_prompt:
-                return encode_fn(
-                    messages,
-                    add_generation_prompt=add_generation_prompt,
-                    **encoder_kwargs,
-                )
-            return encode_fn(messages, **encoder_kwargs)
+                if prompt_param is not None:
+                    bound.arguments["add_generation_prompt"] = add_generation_prompt
+                else:
+                    kwargs_name = next(
+                        p.name for p in params.values() if p.kind is p.VAR_KEYWORD
+                    )
+                    bound.arguments[kwargs_name]["add_generation_prompt"] = (
+                        add_generation_prompt
+                    )
+            return encode_fn(*bound.args, **bound.kwargs)
 
         def _patched(
             conversation,
@@ -874,6 +978,8 @@ class SteeringEngine:
                 return_tensors=return_tensors,
                 padding=kw.get("padding", False),
                 truncation=kw.get("truncation", False),
+                # Encoders own their BOS/EOS tokens, like HF chat templates.
+                add_special_tokens=False,
             )
             return enc["input_ids"]
 
@@ -2099,14 +2205,15 @@ class SteeringEngine:
         hidden_states = outputs.hidden_states
 
         def at_offset(hs: Tensor) -> Tensor:
-            residual = hs[:, token_offset]
-            # Models with Hyper-Connections (DeepSeek-V4, GLM-5.3) carry several
-            # residual streams: (batch, seq, streams, hidden). Their mixing is
-            # doubly stochastic, so the sum of the streams evolves like an
-            # ordinary residual, to which each block adds its output; use the mean.
-            if residual.dim() == 3:
-                residual = residual.mean(dim=1)
-            return residual
+            if hs.ndim != 3:
+                raise RuntimeError(
+                    "Hidden-state extraction requires (batch, sequence, hidden) "
+                    f"tensors; received shape {tuple(hs.shape)}. Multi-stream "
+                    "hidden states are unsupported: averaging streams is not "
+                    "a validated representation of each layer. See "
+                    "docs/model-compatibility.md and issue #19."
+                )
+            return hs[:, token_offset]
 
         residuals = torch.stack(
             [at_offset(hs) for hs in hidden_states],
