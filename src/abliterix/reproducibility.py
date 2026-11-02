@@ -405,9 +405,32 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     trial = manifest.get("trial")
     if not isinstance(trial, dict):
         raise ValueError("Reproduce manifest has no exact winning-trial artifact.")
-    for field in ("vector_index", "parameters", "steering_recipe"):
+    if "vector_index" not in trial:
+        raise ValueError("Reproduce manifest trial is missing 'vector_index'.")
+    for field in ("parameters", "steering_recipe"):
         if field not in trial or trial[field] is None:
             raise ValueError(f"Reproduce manifest trial is missing {field!r}.")
+    recipe = trial["steering_recipe"]
+    steering = recipe.get("steering") if isinstance(recipe, dict) else None
+    scope = steering.get("fixed_vector_scope") if isinstance(steering, dict) else None
+    vector_index = trial["vector_index"]
+    if scope == "per layer":
+        if vector_index is not None:
+            raise ValueError("Saved per-layer vector scope requires vector_index=None.")
+    elif scope == "global":
+        if (
+            isinstance(vector_index, bool)
+            or not isinstance(vector_index, (int, float))
+            or not math.isfinite(vector_index)
+        ):
+            raise ValueError(
+                "Saved global vector scope requires a finite numeric vector_index."
+            )
+    else:
+        raise ValueError(
+            "Reproduce manifest steering recipe must specify fixed_vector_scope "
+            "as 'global' or 'per layer'."
+        )
     # Without weight hashes the SHA256SUMS half of the guarantee is
     # unverifiable, so such a manifest must not be accepted for exact replay.
     if not isinstance(manifest.get("weights"), dict) or not manifest["weights"]:
