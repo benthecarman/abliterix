@@ -86,13 +86,18 @@ class TensorEdit:
       (unnormalised, not norm-preserving) projection of expert ``expert``'s
       slice of a fused expert tensor, or of a whole per-expert 2-D tensor when
       ``expert`` is ``None``.
+    * ``"low_rank"`` — an additive update ``W + left @ right`` of a 2-D
+      weight (``left`` is out x r, ``right`` r x in), or of expert
+      ``expert``'s slice of a fused 3-D expert tensor. Not produced by the
+      engine: other tools (key-value fact editors) write these plans so they
+      replay and bake like abliteration's.
 
     Several edits may name the same tensor; they apply in plan order, the
     order the engine applies them in.
     """
 
     logical_name: str
-    kind: str  # "ega" | "direct" | "row_scale" | "expert_project"
+    kind: str  # "ega" | "direct" | "row_scale" | "expert_project" | "low_rank"
     direction: Tensor | None  # 1-D float refusal direction (None for row_scale)
     strength: float
     preserve_row_norm: bool
@@ -108,6 +113,9 @@ class TensorEdit:
     scale: float | None = None
     # expert_project (one expert's slice):
     expert: int | None = None
+    # low_rank (W + left @ right):
+    left: Tensor | None = None
+    right: Tensor | None = None
 
 
 def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
@@ -135,6 +143,8 @@ def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
         return out
     if edit.kind == "expert_project":
         return _apply_expert_project(W32, edit)
+    if edit.kind == "low_rank":
+        return _apply_low_rank(W32, edit)
     if edit.kind == "ega":
         # Producers differ in how experts are stored: gpt-oss fuses them into a
         # 3-D (E, d0, d1) parameter, DeepSeek-V4 keeps one 2-D (out, in) tensor
@@ -260,6 +270,40 @@ def _apply_expert_project(W32: Tensor, edit: TensorEdit) -> Tensor:
         return W_new
     out = W32.clone()
     out[edit.expert] = W_new
+    return out
+
+
+def _apply_low_rank(W32: Tensor, edit: TensorEdit) -> Tensor:
+    """``W + left @ right`` on a 2-D weight, or on one expert's slice of a
+    fused 3-D tensor (``edit.expert``)."""
+    if edit.left is None or edit.right is None:
+        raise ValueError(f"low_rank edit '{edit.logical_name}' has no factors")
+    left = edit.left.to(device=W32.device, dtype=torch.float32)
+    right = edit.right.to(device=W32.device, dtype=torch.float32)
+    if W32.dim() == 3:
+        if edit.expert is None or not 0 <= edit.expert < W32.shape[0]:
+            raise ValueError(
+                f"low_rank edit '{edit.logical_name}': expert {edit.expert} "
+                f"not in a fused tensor of {W32.shape[0]} experts"
+            )
+        target = W32[edit.expert]
+    elif W32.dim() == 2:
+        target = W32
+    else:
+        raise ValueError(
+            f"low_rank edit '{edit.logical_name}' expects a 2-D weight or a "
+            f"fused 3-D expert tensor, got shape {tuple(W32.shape)}"
+        )
+    if (left.shape[0], right.shape[1]) != tuple(target.shape) or left.shape[1] != right.shape[0]:
+        raise ValueError(
+            f"low_rank edit '{edit.logical_name}': factors {tuple(left.shape)} @ "
+            f"{tuple(right.shape)} do not fit a weight of shape {tuple(target.shape)}"
+        )
+    updated = target + left @ right
+    if W32.dim() == 2:
+        return updated
+    out = W32.clone()
+    out[edit.expert] = updated
     return out
 
 
@@ -1570,8 +1614,8 @@ def map_plan_to_checkpoint(
     Edits whose name already resolves are kept. Others go through
     :func:`checkpoint_name_map`: a renamed tensor takes its checkpoint name;
     an EGA edit on a fused expert parameter stored one tensor per expert
-    becomes one edit per expert; an ``expert_project`` edit goes to its
-    expert's tensor. Edits that still match nothing are returned unchanged for
+    becomes one edit per expert; an ``expert_project`` edit, or a
+    ``low_rank`` edit of one expert, goes to its expert's tensor. Edits that still match nothing are returned unchanged for
     the bake to report. Plan order is kept for every tensor.
     """
     src_dir = Path(src_dir)
@@ -1600,7 +1644,9 @@ def map_plan_to_checkpoint(
         elif per_expert and not whole and e.kind == "ega":
             for expert in sorted(per_expert):
                 mapped.append(replace(e, logical_name=per_expert[expert]))
-        elif per_expert and not whole and e.kind == "expert_project":
+        elif per_expert and not whole and (
+            e.kind == "expert_project" or (e.kind == "low_rank" and e.expert is not None)
+        ):
             if e.expert not in per_expert:
                 raise ValueError(
                     f"'{e.logical_name}': expert {e.expert} has no tensor in {src_dir}"
@@ -1661,6 +1707,13 @@ def save_plan(
                 "rows": None if e.rows is None else list(e.rows),
                 "scale": e.scale,
                 "expert": e.expert,
+                # Only low_rank edits carry factors, so other plans stay
+                # readable by abliterix versions without the low_rank kind.
+                **(
+                    {"left": cpu(e.left), "right": cpu(e.right)}
+                    if e.kind == "low_rank"
+                    else {}
+                ),
             }
             for e in edits
         ],

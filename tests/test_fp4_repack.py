@@ -1479,3 +1479,77 @@ def test_bake_cli_maps_plan_names_from_plan_meta(tmp_path):
     assert torch.allclose(
         out[key], rp.apply_tensor_edits(stored[key], [edit]), atol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# low_rank: additive updates written by other tools (key-value fact editors)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_tensor_edit_low_rank_adds_the_product():
+    torch.manual_seed(0)
+    W = torch.randn(6, 10)
+    left, right = torch.randn(6, 2), torch.randn(2, 10)
+    edit = rp.TensorEdit("w", "low_rank", None, 1.0, False, left=left, right=right)
+    assert torch.allclose(rp.apply_tensor_edit(W, edit), W + left @ right)
+
+
+def test_apply_tensor_edit_low_rank_on_one_expert_of_a_fused_tensor():
+    torch.manual_seed(0)
+    W = torch.randn(3, 6, 10)
+    left, right = torch.randn(6, 2), torch.randn(2, 10)
+    edit = rp.TensorEdit("w", "low_rank", None, 1.0, False, left=left, right=right, expert=1)
+    out = rp.apply_tensor_edit(W, edit)
+    assert torch.allclose(out[1], W[1] + left @ right)
+    assert torch.equal(out[0], W[0]) and torch.equal(out[2], W[2])
+    with pytest.raises(ValueError):
+        rp.apply_tensor_edit(W, rp.TensorEdit("w", "low_rank", None, 1.0, False, left=left, right=right))
+
+
+def test_apply_tensor_edit_low_rank_rejects_factors_that_do_not_fit():
+    edit = rp.TensorEdit("w", "low_rank", None, 1.0, False, left=torch.randn(5, 2), right=torch.randn(2, 10))
+    with pytest.raises(ValueError):
+        rp.apply_tensor_edit(torch.randn(6, 10), edit)
+    with pytest.raises(ValueError):
+        rp.apply_tensor_edit(torch.randn(6, 10), rp.TensorEdit("w", "low_rank", None, 1.0, False))
+
+
+def test_low_rank_plan_roundtrip_and_other_plans_keep_their_keys(tmp_path):
+    left, right = torch.randn(6, 2), torch.randn(2, 10)
+    edits = [
+        rp.TensorEdit("b", "direct", torch.randn(8), 0.5, False, projection_side="output"),
+        rp.TensorEdit("w", "low_rank", None, 1.0, False, left=left, right=right, expert=3),
+    ]
+    p = tmp_path / "plan.pt"
+    rp.save_plan(edits, p, meta={"model_class": "Qwen3ForCausalLM"})
+    back, meta = rp.load_plan_with_meta(p)
+    assert meta == {"model_class": "Qwen3ForCausalLM"}
+    assert torch.equal(back[1].left, left) and torch.equal(back[1].right, right)
+    assert back[1].expert == 3 and back[0].left is None
+    # A plan without low_rank edits is written as before, so older abliterix reads it.
+    payload = torch.load(p, weights_only=False)
+    assert "left" not in payload["edits"][0] and "left" in payload["edits"][1]
+
+
+def test_streaming_bake_applies_low_rank_edits(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    E, hidden, inter = 4, 8, 64
+    src_down = _build_mxfp4_checkpoint(src, E, hidden, inter)
+    torch.manual_seed(1)
+    o_left, o_right = torch.randn(hidden, 1) * 0.1, torch.randn(1, hidden) * 0.1
+    edits = [
+        rp.TensorEdit("model.layers.0.self_attn.o_proj.weight", "low_rank", None, 1.0, False,
+                      left=o_left, right=o_right),
+    ]
+    stats = rp.abliterate_fp4_to_disk(src, dst, edits, use_cuda=False, verbose=False)
+    assert stats.dense_edited == 1 and not stats.skipped_edits
+    out, _ = _read_all(dst)
+    stored = _read_all(src)[0]["model.layers.0.self_attn.o_proj.weight"]
+    expected = (stored.float() + o_left @ o_right).to(torch.bfloat16)
+    assert torch.equal(out["model.layers.0.self_attn.o_proj.weight"], expected)
+    # The FP4 experts were not edited, so they are copied through untouched.
+    assert torch.equal(
+        f4.dequantize_mxfp4(out["model.layers.0.mlp.experts.down_proj_blocks"],
+                            out["model.layers.0.mlp.experts.down_proj_scales"], 32, out_dtype=torch.float32),
+        src_down,
+    )
