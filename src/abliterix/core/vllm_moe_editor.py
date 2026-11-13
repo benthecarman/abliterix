@@ -345,6 +345,7 @@ def profile_safety_experts_vllm(
     target_msgs: list,
     tokenizer,
     top_k: int = 4,  # noqa: ARG001 — kept for API stability; top_k is now baked in by vLLM
+    chat_template_kwargs: dict | None = None,
 ) -> dict[int, list[tuple[int, float]]]:
     """Compute per-layer expert risk scores by reading vLLM's per-token
     routed-expert IDs directly off the ``RequestOutput``.
@@ -389,6 +390,7 @@ def profile_safety_experts_vllm(
                     tokenizer.apply_chat_template(
                         chat,
                         enable_thinking=False,
+                        **(chat_template_kwargs or {}),
                         add_generation_prompt=True,
                         tokenize=False,
                     )

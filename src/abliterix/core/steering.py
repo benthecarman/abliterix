@@ -33,6 +33,7 @@ from ..types import (
 from ..weight_transforms import (
     apply_direct_transform,
     apply_ega_projection,
+    apply_subspace_projection,
     resolve_ega_axis,
 )
 
@@ -776,6 +777,22 @@ def _apply_direct_steering(
             if strength == 0:
                 continue
 
+            # Conv-span edit (Inkling 2): the writer's output passes through a
+            # per-channel short conv, so project off the direction's span
+            # under the conv taps, not the direction alone.
+            basis = None
+            if steering_vectors.ndim == 2:
+                from .fp4_repack import conv_span_basis_for
+
+                layer_vector = (
+                    steering_vectors[layer_idx + 1]
+                    if global_vector is None
+                    else global_vector
+                )
+                basis = conv_span_basis_for(
+                    engine, config, layer_idx, component, layer_vector
+                )
+
             for mod in modules:
                 # Navigate to the base weight — through PEFT wrapper if present.
                 base_mod = mod
@@ -842,6 +859,16 @@ def _apply_direct_steering(
                     else:
                         v = global_vector.to(device)
                     vf = v.to(torch.float32)
+
+                    if basis is not None and vf.shape[0] == out_f:
+                        weight.data = apply_subspace_projection(
+                            W,
+                            basis,
+                            strength=strength,
+                            preserve_row_norm=config.steering.weight_normalization
+                            != WeightNorm.NONE,
+                        ).to(weight.dtype)
+                        continue
 
                     # Advanced grimjim transforms (ORBA / biprojected /
                     # Householder) accept either input-side or output-side
@@ -1001,15 +1028,27 @@ def _apply_ega_steering(
         if axis_is_in is None:
             continue
 
-        # Vectorised over the expert dimension: single GPU kernel batch
-        # instead of a 128-iter Python loop with per-expert dtype conversions.
-        W_new = apply_ega_projection(
-            fused.data,
-            vf,
-            strength=strength,
-            axis_is_in=axis_is_in,
-            preserve_row_norm=norm_preserve,
+        from .fp4_repack import conv_span_basis_for
+
+        basis = (
+            None
+            if axis_is_in
+            else conv_span_basis_for(engine, config, layer_idx, "mlp.down_proj", v)
         )
+        if basis is not None:
+            W_new = apply_subspace_projection(
+                fused.data, basis, strength=strength, preserve_row_norm=norm_preserve
+            )
+        else:
+            # Vectorised over the expert dimension: single GPU kernel batch
+            # instead of a 128-iter Python loop with per-expert dtype conversions.
+            W_new = apply_ega_projection(
+                fused.data,
+                vf,
+                strength=strength,
+                axis_is_in=axis_is_in,
+                preserve_row_norm=norm_preserve,
+            )
         fused.data.copy_(W_new.to(fused.dtype))
         del W_new
 

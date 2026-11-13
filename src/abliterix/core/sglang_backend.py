@@ -35,7 +35,7 @@ from torch import Tensor
 
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
-from ..util import print
+from ..util import print, chat_template_kwargs
 
 
 # Minimum LoRA rank supported by SGLang (same as vLLM).
@@ -172,6 +172,7 @@ class SGLangGenerator:
             return self.tokenizer.apply_chat_template(
                 messages,
                 enable_thinking=False,
+                **chat_template_kwargs(getattr(self, "config", None)),
                 **kwargs,
             )
         except TypeError:

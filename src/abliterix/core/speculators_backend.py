@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
-from ..util import flush_memory, print
+from ..util import flush_memory, print, chat_template_kwargs
 
 
 def extract_hidden_states_speculators(
@@ -105,6 +105,7 @@ def extract_hidden_states_speculators(
                     add_generation_prompt=True,
                     tokenize=False,
                     enable_thinking=False,
+                    **chat_template_kwargs(config),
                 )
             except TypeError:
                 text = tokenizer.apply_chat_template(

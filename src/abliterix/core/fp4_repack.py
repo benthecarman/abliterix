@@ -59,6 +59,8 @@ from ..types import DecayKernel, DirectTransform, WeightNorm
 from ..weight_transforms import (
     apply_direct_transform,
     apply_ega_projection,
+    apply_subspace_projection,
+    conv_span_basis,
     resolve_ega_axis,
 )
 
@@ -86,6 +88,11 @@ class TensorEdit:
       (unnormalised, not norm-preserving) projection of expert ``expert``'s
       slice of a fused expert tensor, or of a whole per-expert 2-D tensor when
       ``expert`` is ``None``.
+    * ``"direct"`` and ``"ega"`` with a ``basis`` — the conv-span edit
+      (``steering.conv_span_projection``): the output side projected off the
+      span ``basis`` (hidden x k, orthonormal) holds instead of off
+      ``direction`` alone. ``direction`` is still the refusal direction the
+      span was built from.
     * ``"low_rank"`` — an additive update ``W + left @ right`` of a 2-D
       weight (``left`` is out x r, ``right`` r x in), or of expert
       ``expert``'s slice of a fused 3-D expert tensor. Not produced by the
@@ -116,6 +123,8 @@ class TensorEdit:
     # low_rank (W + left @ right):
     left: Tensor | None = None
     right: Tensor | None = None
+    # conv-span (direct / ega): orthonormal (hidden, k) basis projected off.
+    basis: Tensor | None = None
 
 
 def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
@@ -145,6 +154,22 @@ def apply_tensor_edit(W: Tensor, edit: TensorEdit) -> Tensor:
         return _apply_expert_project(W32, edit)
     if edit.kind == "low_rank":
         return _apply_low_rank(W32, edit)
+    if edit.basis is not None:
+        if edit.kind not in ("direct", "ega"):
+            raise ValueError(f"{edit.kind} edit '{edit.logical_name}' cannot carry a basis")
+        per_expert_2d = edit.kind == "ega" and W32.dim() == 2
+        if W32.dim() not in (2, 3) or (edit.kind == "direct" and W32.dim() != 2):
+            raise ValueError(
+                f"conv-span edit '{edit.logical_name}' does not fit a weight "
+                f"of shape {tuple(W.shape)}"
+            )
+        out = apply_subspace_projection(
+            W32.unsqueeze(0) if per_expert_2d else W32,
+            edit.basis,
+            strength=edit.strength,
+            preserve_row_norm=edit.preserve_row_norm,
+        )
+        return out.squeeze(0) if per_expert_2d else out
     if edit.kind == "ega":
         # Producers differ in how experts are stored: gpt-oss fuses them into a
         # 3-D (E, d0, d1) parameter, DeepSeek-V4 keeps one 2-D (out, in) tensor
@@ -328,6 +353,20 @@ def _normalise(v: Tensor, eps: float = 1e-8) -> Tensor:
     return v / torch.linalg.vector_norm(v).clamp(min=eps)
 
 
+def conv_span_basis_for(engine, config, layer_idx: int, component: str, direction: Tensor):
+    """The conv-span basis for ``component``'s writes in layer ``layer_idx``, or
+    None where the edit stays rank 1: conv_span_projection off, or no short
+    convolution after that writer. Shared by the engine and the plan recorder
+    so both use the same basis."""
+    if not getattr(config.steering, "conv_span_projection", False):
+        return None
+    taps_of = getattr(engine, "output_conv_taps", None)
+    taps = taps_of(layer_idx, component) if taps_of is not None else None
+    if taps is None or taps.shape[0] != direction.shape[0]:
+        return None
+    return conv_span_basis(direction, taps)
+
+
 # ---------------------------------------------------------------------------
 # Plan recording (engine → list[TensorEdit])
 # ---------------------------------------------------------------------------
@@ -432,6 +471,7 @@ def record_steering_plan(
                 # by a single TensorEdit; skip (caller handles rank-k elsewhere).
                 continue
             vf = v.to(torch.float32)
+            basis = conv_span_basis_for(engine, config, layer_idx, component, vf)
             for mod in modules:
                 base_mod = getattr(mod, "base_layer", mod)
                 weight = getattr(base_mod, "weight", None)
@@ -457,6 +497,7 @@ def record_steering_plan(
                         preserve_row_norm=preserve,
                         projection_side=side,
                         direct_transform=DirectTransform(direct_transform).value,
+                        basis=basis if side == "output" else None,
                     )
                 )
 
@@ -488,6 +529,13 @@ def record_steering_plan(
                 )
                 if axis_is_in is None:
                     continue
+                basis = (
+                    None
+                    if axis_is_in
+                    else conv_span_basis_for(
+                        engine, config, layer_idx, "mlp.down_proj", v
+                    )
+                )
                 edits.append(
                     TensorEdit(
                         logical_name=normalize_param_name(raw_name),
@@ -497,6 +545,7 @@ def record_steering_plan(
                         preserve_row_norm=preserve,
                         hidden_dim=int(v.shape[0]),
                         transposed=transposed,
+                        basis=basis,
                     )
                 )
 
@@ -1714,6 +1763,9 @@ def save_plan(
                     if e.kind == "low_rank"
                     else {}
                 ),
+                # Likewise only conv-span edits carry a basis; an abliterix
+                # without it refuses such a plan rather than replaying rank 1.
+                **({"basis": cpu(e.basis)} if e.basis is not None else {}),
             }
             for e in edits
         ],

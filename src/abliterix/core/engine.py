@@ -36,7 +36,7 @@ from transformers.generation import (
 
 from ..settings import AbliterixConfig
 from ..types import ChatMessage, QuantMode, SteeringMode, VectorMethod, WeightNorm
-from ..util import chunk_batches, flush_memory, print
+from ..util import chunk_batches, flush_memory, print, chat_template_kwargs
 from . import fp8_utils
 
 # transformers < 5.0 uses torch_dtype=, >= 5.0 uses dtype= in from_pretrained.
@@ -1303,6 +1303,24 @@ class SteeringEngine:
         assert total > 0, "No steerable modules found in layer"
         return modules
 
+    def output_conv_taps(self, layer_index: int, component: str) -> Tensor | None:
+        """Per-channel taps ``(hidden, K)`` of the short convolution that
+        ``component``'s output passes through before joining the stream, or
+        None if it has none. Inkling 2 convolves each sublayer's output
+        (``post_attention_convolution`` after ``attn.o_proj``,
+        ``post_mlp_convolution`` after the routed experts' ``down_proj``);
+        the conv-span edit (``steering.conv_span_projection``) needs them."""
+        layer = self.transformer_layers[layer_index]
+        attr = {
+            "attn.o_proj": "post_attention_convolution",
+            "mlp.down_proj": "post_mlp_convolution",
+        }.get(component)
+        conv = getattr(getattr(layer, attr, None), "conv1d", None) if attr else None
+        weight = getattr(conv, "weight", None)
+        if weight is None or weight.dim() != 3 or weight.shape[1] != 1:
+            return None
+        return weight[:, 0, :].detach()
+
     def list_steerable_components(self) -> list[str]:
         """Return sorted component names across all layers (handles hybrid architectures).
 
@@ -1801,6 +1819,7 @@ class SteeringEngine:
                 add_generation_prompt=True,
                 tokenize=False,
                 enable_thinking=False,
+                **chat_template_kwargs(getattr(self, "config", None)),
             ),
         )
 
@@ -2278,6 +2297,7 @@ class SteeringEngine:
                 add_generation_prompt=True,
                 tokenize=False,
                 enable_thinking=False,
+                **chat_template_kwargs(getattr(self, "config", None)),
             ),
         )
 

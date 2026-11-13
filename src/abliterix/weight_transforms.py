@@ -215,6 +215,64 @@ def apply_ega_projection(
     return W_new
 
 
+def conv_span_basis(refusal: Tensor, taps: Tensor, *, rtol: float = 1e-6) -> Tensor:
+    """Orthonormal basis ``(hidden, k)`` of ``span{d, D_0 d, ..., D_{K-1} d}``.
+
+    For a sublayer whose output passes through a causal depthwise short
+    convolution with a skip before it joins the stream (Inkling 2:
+    ``y = (conv(x) + x) / sqrt(K + 1)``, ``conv`` with per-channel taps
+    ``D_k = diag(taps[:, k])``), projecting ``d`` alone out of the writer
+    does not remove it from ``y``: ``d · D_k x = (D_k d) · x``, and the
+    per-channel taps turn ``d`` into other directions. Projecting the
+    writer's output off this span makes ``d · y`` exactly zero (at
+    strength 1, without row-norm preservation); at strength ``s`` every
+    component of ``y`` along ``d`` is scaled by ``1 - s``, as rank-1
+    ablation does without a conv.
+
+    ``taps`` is ``(hidden, K)``. Computed in float64 on the CPU, so the
+    engine, the plan and its replay all use the same basis. Columns whose
+    singular value is below ``rtol`` of the largest are dropped (taps
+    proportional to a constant leave fewer independent directions).
+    """
+    d = refusal.detach().to("cpu", torch.float64)
+    d = d / torch.linalg.vector_norm(d).clamp(min=1e-12)
+    D = taps.detach().to("cpu", torch.float64)
+    V = torch.cat([d.unsqueeze(1), D * d.unsqueeze(1)], dim=1)
+    U, S, _ = torch.linalg.svd(V, full_matrices=False)
+    return U[:, S > S[0] * rtol].to(torch.float32).contiguous()
+
+
+def apply_subspace_projection(
+    W: Tensor,
+    basis: Tensor,
+    *,
+    strength: float,
+    preserve_row_norm: bool = True,
+) -> Tensor:
+    """Output-side projection off ``basis`` of a 2-D ``(out, in)`` weight or a
+    fused 3-D ``(E, out, in)`` expert weight: ``W - s · Q Qᵀ W`` per expert,
+    then (optionally) every output row rescaled to its original norm, as the
+    rank-1 paths do. ``basis`` is ``(out, k)`` with orthonormal columns.
+    Returns a new float32 tensor.
+
+    This is the exact math of the engine's conv-span edits and their plan
+    replay; do not diverge it.
+    """
+    W32 = W.to(torch.float32)
+    Q = basis.to(device=W32.device, dtype=torch.float32)
+    if W32.shape[-2] != Q.shape[0]:
+        raise ValueError(
+            f"subspace basis of size {Q.shape[0]} does not match the output "
+            f"axis of a weight of shape {tuple(W32.shape)}"
+        )
+    W_new = W32 - strength * torch.matmul(Q, torch.matmul(Q.T, W32))
+    if preserve_row_norm:
+        orig = torch.linalg.vector_norm(W32, dim=-1, keepdim=True)
+        new = torch.linalg.vector_norm(W_new, dim=-1, keepdim=True).clamp(min=1e-8)
+        W_new = W_new * (orig / new)
+    return W_new
+
+
 def apply_orba_transform(
     W: Tensor,
     refusal: Tensor,

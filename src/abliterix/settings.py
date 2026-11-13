@@ -123,6 +123,17 @@ class ModelConfig(BaseModel):
         description="Apply torch.compile() to the loaded model for faster inference.",
     )
 
+    chat_template_kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Extra chat-template variables for every prompt the model sees "
+            "(search, direction capture, KL), on top of enable_thinking=False. "
+            "For templates that turn thinking off another way, e.g. Inkling 2: "
+            '{reasoning_effort = "none"} (it ignores enable_thinking and '
+            "otherwise thinks at effort 0.9)."
+        ),
+    )
+
     trust_remote_code: bool | None = Field(
         default=None,
         description="Whether to trust remote code shipped with the model.",
@@ -1125,6 +1136,19 @@ class SteeringConfig(BaseModel):
         ),
     )
 
+    conv_span_projection: bool = Field(
+        default=False,
+        description=(
+            "For writers whose output passes through a per-channel short "
+            "convolution before it joins the stream (Inkling 2's "
+            "post-attention and post-MLP convs), project the output off "
+            "span{d, D_0 d, ..., D_{K-1} d} (the direction and its image under "
+            "each conv tap) instead of d alone, so the direction is removed "
+            "after the conv too. A rank up to K+1 edit per writer; writers "
+            "with no conv keep the rank-1 edit. Standard direct_transform only."
+        ),
+    )
+
     # --- Optuna search-space extensions ---
 
     search_direct_transform: bool = Field(
@@ -2112,6 +2136,15 @@ class AbliterixConfig(BaseSettings):
                 "checkpoint, bake offline with `abliterix-abliterate-fp4`."
             )
 
+        if (
+            self.steering.conv_span_projection
+            and self.steering.direct_transform != DirectTransform.STANDARD
+        ):
+            raise ValueError(
+                "conv_span_projection works with direct_transform='standard' "
+                f"only, not {self.steering.direct_transform.value!r}."
+            )
+
         # The current vLLM fast path materialises one rank-1 adapter from a
         # ProjectionCache.  Feeding it a stacked ``(rank, layers, hidden)``
         # tensor either indexes the layer axis as the rank axis or silently
@@ -2133,6 +2166,8 @@ class AbliterixConfig(BaseSettings):
                 unsupported.append("weight_normalization='full'")
             if self.iterative.enabled:
                 unsupported.append("iterative.enabled=true")
+            if self.steering.conv_span_projection:
+                unsupported.append("conv_span_projection=true")
 
             if unsupported:
                 details = ", ".join(unsupported)

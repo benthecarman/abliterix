@@ -1145,6 +1145,7 @@ def run() -> int:
                             target_msgs,
                             tp_gen.tokenizer,
                             top_k=_top_k,
+                            chat_template_kwargs=config.model.chat_template_kwargs,
                         )
 
                     # Fallback: vLLM's fused TRITON MxFP4 MoE kernel bypasses

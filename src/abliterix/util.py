@@ -302,3 +302,8 @@ def set_seed(seed: int) -> None:
         np.random.seed(seed % (2**32))
     except ImportError:
         pass
+
+
+def chat_template_kwargs(config) -> dict:
+    """``config.model.chat_template_kwargs``, or nothing for configs without it."""
+    return dict(getattr(getattr(config, "model", None), "chat_template_kwargs", None) or {})

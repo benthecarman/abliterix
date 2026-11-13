@@ -29,7 +29,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
-from ..util import flush_memory, print
+from ..util import flush_memory, print, chat_template_kwargs
 
 
 _SUPPORTED_MODEL_TYPES = {
@@ -258,6 +258,7 @@ def extract_hidden_states_vllm(
                         add_generation_prompt=True,
                         tokenize=False,
                         enable_thinking=False,
+                        **chat_template_kwargs(config),
                     )
                 except TypeError:
                     text = tokenizer.apply_chat_template(
