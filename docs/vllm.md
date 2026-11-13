@@ -319,6 +319,19 @@ This removed one of the two reasons abliterix needed
 the env var auto-set logic in `vllm_compat.ensure_vllm_env(needs_collective_rpc=True)`
 is unchanged.
 
+### Routing hooks for MoEs outside FusedMoE
+
+Some vLLM MoEs route in their own kernel and never fill `routed_experts`
+(Inkling 2's `Inkling2MoE` routes from `gate.weight` / `gate.bias` without
+FusedMoE). When `routed_experts` comes back empty, the profiler hooks each
+layer's MoE module through `collective_rpc` and recomputes HF's selection
+(fp32 `x @ W.T`, `scoring_func`, top-k of scores plus the correction
+bias), then scores experts as `SteeringEngine.identify_safety_experts`
+does. Hooks do not run in CUDA graphs or compiled graphs: set
+`enforce_eager = true`. A pass whose hooks did not count every prompt
+token is discarded, and the router-weight heuristic is used instead.
+Grouped routing (`n_group > 1`) is not modelled.
+
 ### Expert parallelism is topology-aware
 
 ```toml

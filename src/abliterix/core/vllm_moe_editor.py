@@ -339,6 +339,36 @@ def _worker_get_router_weights(worker: Any) -> dict[int, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _format_prompts(msgs: list, tokenizer, chat_template_kwargs: dict | None = None) -> list[str]:
+    """Chat-template formatting, as VLLMGenerator._format_prompt does it, so
+    profiling prompts match what trial generation sees."""
+    out = []
+    for m in msgs:
+        chat = []
+        if getattr(m, "system", None):
+            chat.append({"role": "system", "content": m.system})
+        chat.append({"role": "user", "content": m.user})
+        try:
+            out.append(
+                tokenizer.apply_chat_template(
+                    chat,
+                    enable_thinking=False,
+                    **(chat_template_kwargs or {}),
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            )
+        except TypeError:
+            out.append(
+                tokenizer.apply_chat_template(
+                    chat,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            )
+    return out
+
+
 def profile_safety_experts_vllm(
     llm: "LLM",
     benign_msgs: list,
@@ -376,34 +406,8 @@ def profile_safety_experts_vllm(
 
     from vllm import SamplingParams
 
-    # Chat-template formatting — mirror VLLMGenerator._format_prompt so the
-    # profiling prompts match what trial generation will see.
     def _fmt(msgs):
-        out = []
-        for m in msgs:
-            chat = []
-            if getattr(m, "system", None):
-                chat.append({"role": "system", "content": m.system})
-            chat.append({"role": "user", "content": m.user})
-            try:
-                out.append(
-                    tokenizer.apply_chat_template(
-                        chat,
-                        enable_thinking=False,
-                        **(chat_template_kwargs or {}),
-                        add_generation_prompt=True,
-                        tokenize=False,
-                    )
-                )
-            except TypeError:
-                out.append(
-                    tokenizer.apply_chat_template(
-                        chat,
-                        add_generation_prompt=True,
-                        tokenize=False,
-                    )
-                )
-        return out
+        return _format_prompts(msgs, tokenizer, chat_template_kwargs)
 
     params = SamplingParams(temperature=0.0, max_tokens=1)
 
@@ -481,6 +485,248 @@ def profile_safety_experts_vllm(
         print(
             f"  Profiled {len(safety)} MoE layers via vLLM routed_experts, "
             f"avg top risk diff: {avg:.4f}"
+        )
+    return safety
+
+
+# ---------------------------------------------------------------------------
+# Routing capture by hooks, for MoEs that route outside FusedMoE
+# ---------------------------------------------------------------------------
+#
+# Inkling 2's vLLM MoE (``Inkling2MoE``) routes with its own kernel from
+# ``gate.weight`` / ``gate.bias`` and never calls the gate module or FusedMoE,
+# so ``enable_return_routed_experts`` gives nothing. A forward pre-hook on
+# each layer's MoE module sees its input and recomputes HF's selection
+# (transformers ``Inkling2TopKRouter``): fp32 logits ``x @ W.T``, scores
+# ``score_fn(logits)``, experts ``topk(scores + bias, top_k)``. The counts
+# then give the same risk scores ``SteeringEngine.identify_safety_experts``
+# computes. Hooks do not run inside CUDA graphs or compiled graphs, so this
+# needs ``enforce_eager``; a pass whose counted tokens differ from the
+# prompts' is refused.
+
+_ROUTING_STATE = "_abliterix_routing"
+
+
+def _worker_find_moe_gates(worker: Any) -> list[tuple[int, Any, Any]]:
+    """``(layer_idx, moe_module, gate)`` for every layer whose ``mlp`` has a
+    gate with a 2-D ``weight`` (no grouped routing is modelled)."""
+    decoder = _worker_resolve_model(worker)
+    found = []
+    for idx, layer in enumerate(decoder.layers):
+        moe = getattr(layer, "mlp", None)
+        gate = getattr(moe, "gate", None)
+        weight = getattr(gate, "weight", None)
+        if weight is None or getattr(weight, "dim", lambda: 0)() != 2:
+            continue
+        found.append((idx, moe, gate))
+    return found
+
+
+def _gate_bias(gate: Any):
+    for name in ("bias", "e_score_correction_bias"):
+        b = getattr(gate, name, None)
+        if b is not None and getattr(b, "dim", lambda: 0)() == 1:
+            return b
+    return None
+
+
+def _padding_mask(n_tokens: int):
+    """Rows of the current forward that are padding, or None."""
+    try:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+    except Exception:  # noqa: BLE001 - no vLLM (CPU tests)
+        return None
+    if not is_forward_context_available():
+        return None
+    pad = getattr(get_forward_context(), "is_padding", None)
+    if pad is None or pad.shape[0] != n_tokens:
+        return None
+    return pad
+
+
+def _worker_install_routing_counter(worker: Any, top_k: int, scoring_func: str) -> int:
+    """Hook every MoE layer to count the experts HF's router would pick.
+    Idempotent; returns the number of hooked layers."""
+    import torch
+    import torch.nn.functional as F
+
+    state = getattr(worker, _ROUTING_STATE, None)
+    if state is not None:
+        return len(state["handles"])
+    score_fn = {"sigmoid": torch.sigmoid, "softmax": lambda x: x.softmax(dim=-1)}.get(scoring_func)
+    if score_fn is None:
+        raise ValueError(f"unsupported router scoring_func {scoring_func!r}")
+    state = {"handles": [], "active": False, "counts": {}, "tokens": {}}
+
+    def make_hook(idx: int, gate: Any):
+        def hook(module, args, kwargs=None):
+            if not state["active"]:
+                return None
+            x = args[0] if args else (kwargs or {}).get("hidden_states", (kwargs or {}).get("x"))
+            if x is None:
+                return None
+            with torch.no_grad():
+                flat = x.reshape(-1, x.shape[-1])
+                pad = _padding_mask(flat.shape[0])
+                if pad is not None:
+                    flat = flat[~pad]
+                logits = F.linear(flat.float(), gate.weight.float())
+                scores = score_fn(logits)
+                bias = _gate_bias(gate)
+                if bias is not None:
+                    scores = scores + bias.float()
+                k = int(getattr(gate, "topk", None) or getattr(gate, "top_k", None) or top_k)
+                picked = torch.topk(scores, k, dim=-1, sorted=False).indices
+                n_experts = gate.weight.shape[0]
+                counts = torch.bincount(picked.reshape(-1), minlength=n_experts)
+                if idx in state["counts"]:
+                    state["counts"][idx] += counts
+                else:
+                    state["counts"][idx] = counts
+                state["tokens"][idx] = state["tokens"].get(idx, 0) + flat.shape[0]
+            return None  # never replace the MoE's input
+
+        return hook
+
+    for idx, moe, gate in _worker_find_moe_gates(worker):
+        state["handles"].append(moe.register_forward_pre_hook(make_hook(idx, gate), with_kwargs=True))
+    setattr(worker, _ROUTING_STATE, state)
+    return len(state["handles"])
+
+
+def _worker_routing_counter(worker: Any, command: str):
+    """``start`` zeroes and arms the counters, ``stop`` disarms them and
+    returns ``{"counts": {layer: [per expert]}, "tokens": {layer: n}}``,
+    ``remove`` removes the hooks."""
+    state = getattr(worker, _ROUTING_STATE, None)
+    if state is None:
+        return None
+    if command == "start":
+        state["counts"], state["tokens"], state["active"] = {}, {}, True
+        return None
+    if command == "stop":
+        state["active"] = False
+        return {
+            "counts": {i: c.cpu().tolist() for i, c in state["counts"].items()},
+            "tokens": dict(state["tokens"]),
+        }
+    if command == "remove":
+        for h in state["handles"]:
+            h.remove()
+        delattr(worker, _ROUTING_STATE)
+        return None
+    raise ValueError(f"unknown routing counter command {command!r}")
+
+
+def merge_rank_routing(per_rank: list[dict | None], expected_tokens: int) -> dict | None:
+    """One count from every rank's, or None when they do not add up to the
+    ``expected_tokens`` of the prompts on every layer.
+
+    A rank's MoE input is normally the whole batch (all-reduced under TP;
+    all-gathered under Inkling 2's sequence parallelism): every rank then
+    counted ``expected_tokens`` per layer and rank 0's count is the count.
+    Ranks that each saw a shard of the tokens add up to ``expected_tokens``:
+    their counts are summed."""
+    ranks = [r for r in per_rank if r is not None]
+    if not ranks or not ranks[0]["tokens"]:
+        return None
+    layers = set(ranks[0]["tokens"])
+    if any(set(r["tokens"]) != layers for r in ranks):
+        return None
+    if all(r["tokens"][i] == expected_tokens for r in ranks for i in layers):
+        return ranks[0]
+    if not all(sum(r["tokens"][i] for r in ranks) == expected_tokens for i in layers):
+        return None
+    counts = {
+        i: [sum(col) for col in zip(*(r["counts"][i] for r in ranks))] for i in layers
+    }
+    return {"counts": counts, "tokens": {i: expected_tokens for i in layers}}
+
+
+def risk_scores(
+    benign: dict, target: dict, n_experts: dict[int, int]
+) -> dict[int, list[tuple[int, float]]]:
+    """``SteeringEngine.identify_safety_experts``'s ranking from counts:
+    for every expert of every counted layer ``p_t - p_b``, where ``p`` is
+    the expert's picks over the layer's tokens (at least 1), sorted
+    descending (ties in expert order)."""
+    safety: dict[int, list[tuple[int, float]]] = {}
+    for idx in sorted(n_experts):
+        bc, tc = benign["counts"].get(idx), target["counts"].get(idx)
+        if bc is None and tc is None:
+            continue
+        bt = max(benign["tokens"].get(idx, 0), 1)
+        tt = max(target["tokens"].get(idx, 0), 1)
+        scores = []
+        for eid in range(n_experts[idx]):
+            p_b = (bc[eid] if bc is not None else 0) / bt
+            p_t = (tc[eid] if tc is not None else 0) / tt
+            scores.append((eid, p_t - p_b))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        safety[idx] = scores
+    return safety
+
+
+def _worker_gate_sizes(worker: Any) -> dict[int, int]:
+    return {idx: int(gate.weight.shape[0]) for idx, _, gate in _worker_find_moe_gates(worker)}
+
+
+def profile_safety_experts_vllm_hooks(
+    llm: "LLM",
+    benign_msgs: list,
+    target_msgs: list,
+    tokenizer,
+    *,
+    top_k: int,
+    scoring_func: str = "sigmoid",
+    chat_template_kwargs: dict | None = None,
+) -> dict[int, list[tuple[int, float]]]:
+    """Safety-expert ranking from routing recomputed in forward pre-hooks on
+    each layer's MoE module (see the section comment above). Returns ``{}``
+    when no layer has a gate, or when the hooks did not see every prompt
+    token (CUDA graphs or torch.compile: needs ``enforce_eager``; or prefix
+    caching, which skips cached tokens)."""
+    from vllm import SamplingParams
+
+    rpc = llm.llm_engine.collective_rpc
+    hooked = rpc(_worker_install_routing_counter, args=(top_k, scoring_func))
+    if not hooked or not hooked[0]:
+        return {}
+    n_experts = rpc(_worker_gate_sizes)[0]
+    params = SamplingParams(temperature=0.0, max_tokens=1)
+
+    def count(msgs: list) -> dict | None:
+        rpc(_worker_routing_counter, args=("start",))
+        try:
+            outs = llm.generate(_format_prompts(msgs, tokenizer, chat_template_kwargs), params, use_tqdm=False)
+        finally:
+            per_rank = rpc(_worker_routing_counter, args=("stop",))
+        expected = sum(len(o.prompt_token_ids) for o in outs)
+        merged = merge_rank_routing(per_rank, expected)
+        if merged is None:
+            seen = sorted({n for r in per_rank if r for n in r["tokens"].values()})
+            print(
+                f"  [yellow]Routing hooks counted {seen} tokens per layer and rank, "
+                f"the prompts have {expected}: the MoE did not run eagerly on every "
+                "token (needs enforce_eager and no prefix caching). Not using them.[/]"
+            )
+        return merged
+
+    try:
+        print("  Profiling benign prompts via routing hooks...")
+        benign = count(benign_msgs)
+        print("  Profiling target prompts via routing hooks...")
+        target = count(target_msgs) if benign is not None else None
+    finally:
+        rpc(_worker_routing_counter, args=("remove",))
+    if benign is None or target is None:
+        return {}
+    safety = risk_scores(benign, target, n_experts)
+    if safety:
+        top = [safety[i][0][1] for i in safety if safety[i]]
+        print(
+            f"  Profiled {len(safety)} MoE layers via routing hooks, "
+            f"avg top risk diff: {sum(top) / len(top):.4f}"
         )
     return safety
 
