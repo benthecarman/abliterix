@@ -205,3 +205,53 @@ def test_merge_rank_routing():
     assert me.merge_rank_routing([a, c], 5) is None       # neither
     assert me.merge_rank_routing([None], 3) is None
 
+
+# --- the cli's profiling chain ---------------------------------------------
+
+
+@pytest.mark.parametrize("routed, hooks, want", [
+    ({0: [(1, 0.5)]}, {0: [(2, 0.5)]}, "routed_experts"),
+    ({}, {0: [(2, 0.5)]}, "routing_hooks"),
+    ({}, {}, "router_weight"),
+])
+def test_cli_profiles_routed_then_hooks_then_weights(monkeypatch, routed, hooks, want):
+    from abliterix import cli
+    from abliterix.core import vllm_hidden_states as vhs
+    from abliterix.settings import AbliterixConfig
+
+    class Probe:
+        def __init__(self, llm, safety):
+            self._router_layers = [0]
+
+        def probe(self):
+            pass
+
+    calls = []
+    monkeypatch.setattr(me, "VLLMMoEEditor", Probe)
+    monkeypatch.setattr(vhs, "_load_text_config_data", lambda *a: {"num_experts_per_tok": 8})
+    monkeypatch.setattr(me, "profile_safety_experts_vllm", lambda *a, **k: calls.append("routed") or routed)
+
+    def by_hooks(*a, **k):
+        calls.append(("hooks", k["top_k"], k["scoring_func"]))
+        return hooks
+
+    monkeypatch.setattr(me, "profile_safety_experts_vllm_hooks", by_hooks)
+    monkeypatch.setattr(me, "profile_safety_experts_by_weight", lambda *a: {0: [(3, 0.1)]})
+    tp_gen = SimpleNamespace(llm=None, tokenizer=_Tok())
+    safety, method = cli._profile_safety_experts_on_vllm(AbliterixConfig(), tp_gen, BENIGN, TARGET, torch.zeros(2, H))
+    assert method == want
+    assert safety == {"routed_experts": routed, "routing_hooks": hooks, "router_weight": {0: [(3, 0.1)]}}[want]
+    if want != "routed_experts":
+        assert calls[1] == ("hooks", 8, "sigmoid")
+
+
+def test_plans_without_hf_model_is_opt_in():
+    from abliterix import cli
+    from abliterix.settings import AbliterixConfig
+
+    on = {"backend": "vllm", "use_in_place_editing": True, "plans_without_hf_model": True}
+    assert cli._wants_plans_without_hf_model(AbliterixConfig(model=on, steering={"steering_mode": "direct"}))
+    assert not cli._wants_plans_without_hf_model(
+        AbliterixConfig(model={**on, "plans_without_hf_model": False}, steering={"steering_mode": "direct"}))
+    assert not cli._wants_plans_without_hf_model(
+        AbliterixConfig(model={**on, "backend": "hf"}, steering={"steering_mode": "direct"}))

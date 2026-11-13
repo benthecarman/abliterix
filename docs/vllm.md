@@ -208,6 +208,33 @@ the README explicitly from the prior model card style and include:
 - safe over-refusal probe JSON
 - continuation-NLL KL mode for vLLM in-place runs
 
+### Checkpoints transformers cannot load
+
+A checkpoint that only vLLM can load (Inkling 2's NVFP4/MXFP8 release) is
+searched and exported without the HF model:
+
+```toml
+[model]
+backend = "vllm"
+use_in_place_editing = true
+plans_without_hf_model = true
+enforce_eager = true
+
+[steering]
+steering_mode = "direct"
+```
+
+vLLM extracts the hidden states. Each trial records its steering plan on a
+weightless model built from the checkpoint's config, with conv taps read
+from its safetensors, and the workers apply the plan. The search saves the
+hidden states and the safety-expert ranking to
+`<checkpoint_dir>/<model>.search-state.pt`. A resumed search reuses them.
+`abliterix.core.plan_export.export_plan_without_model(config, trial, out)`
+records a trial's plan from that file the same way, saves it
+(`plan_file=`), and bakes it onto the checkpoint at its own precision
+(`out=None` records the plan only). No model is loaded, so the plan is not
+checked against one (`verify_plan_against_engine`).
+
 ## vLLM 0.18 — 0.20.x Integration Knobs
 
 PRD #20 added a small set of `[model]` config fields for the modernised

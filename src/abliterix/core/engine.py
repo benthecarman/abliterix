@@ -1328,6 +1328,12 @@ class SteeringEngine:
         (``post_attention_convolution`` after ``attn.o_proj``,
         ``post_mlp_convolution`` after the routed experts' ``down_proj``);
         the conv-span edit (``steering.conv_span_projection``) needs them."""
+        weight = self.output_conv_weight(layer_index, component)
+        return None if weight is None else weight[:, 0, :].detach()
+
+    def output_conv_weight(self, layer_index: int, component: str) -> Parameter | None:
+        """The depthwise conv weight ``(hidden, 1, K)`` behind
+        :meth:`output_conv_taps`, or None."""
         layer = self.transformer_layers[layer_index]
         attr = {
             "attn.o_proj": "post_attention_convolution",
@@ -1337,7 +1343,7 @@ class SteeringEngine:
         weight = getattr(conv, "weight", None)
         if weight is None or weight.dim() != 3 or weight.shape[1] != 1:
             return None
-        return weight[:, 0, :].detach()
+        return weight
 
     def list_steerable_components(self) -> list[str]:
         """Return sorted component names across all layers (handles hybrid architectures).
@@ -1378,6 +1384,36 @@ class SteeringEngine:
         if self._cached_n_layers is not None:
             return self._cached_n_layers
         return len(self.transformer_layers)
+
+    @classmethod
+    def without_model(cls, config: AbliterixConfig, *, tokenizer: bool = True):
+        """An engine with no model loaded (``model`` is None): the TP fast
+        path, where vLLM extracted the hidden states, and the base of a
+        skeleton built from the config (:mod:`.plan_export`)."""
+        engine = cls.__new__(cls)
+        engine.config = config
+        engine.response_prefix = ""
+        engine.needs_reload = False
+        engine._dequant_cache = {}
+        engine._dequant_cache_bytes = 0
+        engine._dequant_cache_max_bytes = DEQUANT_CACHE_MAX_BYTES
+        engine._cached_n_layers = None
+        engine._cached_components = None
+        engine._is_native_fp8 = False
+        engine.tokenizer = None
+        if tokenizer:
+            engine.tokenizer = load_tokenizer(
+                config.model.model_id,
+                trust_remote_code=config.model.trust_remote_code,
+                revision=config.model.revision,
+            )
+            if engine.tokenizer.pad_token is None:
+                engine.tokenizer.pad_token = engine.tokenizer.eos_token
+            engine.tokenizer.padding_side = "left"
+        engine.model = None
+        engine.max_memory = None
+        engine.trusted_models = {}
+        return engine
 
     def plan_skeleton(self):
         """A copy of this engine whose model keeps its structure but not its

@@ -197,9 +197,12 @@ def extract_trial_artifact(trial) -> TrialArtifact:
     )
 
 
-def apply_trial_artifact(config, artifact: TrialArtifact):
-    """Apply saved steering semantics to a config before replay/export."""
-    if config.model.backend != "hf":
+def apply_trial_artifact(config, artifact: TrialArtifact, *, require_hf_backend: bool = True):
+    """Apply saved steering semantics to a config before replay/export.
+
+    The HF replay needs ``backend='hf'``; an export that records the plan
+    without a model (``core.plan_export``) passes ``require_hf_backend=False``."""
+    if require_hf_backend and config.model.backend != "hf":
         raise ValueError(
             "Trial materialization currently requires backend='hf'. A vLLM "
             "optimization config cannot be passed directly to the HF replay "

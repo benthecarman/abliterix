@@ -34,7 +34,7 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analysis import ResidualAnalyzer
-from .core.engine import DEQUANT_CACHE_MAX_BYTES, SteeringEngine, load_tokenizer
+from .core.engine import SteeringEngine
 from .data import load_prompt_dataset
 from .eval.detector import RefusalDetector, validate_judge_credentials
 from .eval.scorer import TrialScorer
@@ -343,6 +343,94 @@ def _vllm_hidden_states_available() -> bool:
         return False
 
 
+def _wants_plans_without_hf_model(config: AbliterixConfig) -> bool:
+    """Whether trials record their steering plans on a skeleton built from
+    the config when the HF model is not loaded (see
+    ``model.plans_without_hf_model``)."""
+    return bool(
+        config.model.backend == "vllm"
+        and config.model.use_in_place_editing
+        and config.steering.steering_mode == SteeringMode.DIRECT
+        and getattr(config.model, "plans_without_hf_model", False)
+    )
+
+
+def _profile_safety_experts_on_vllm(
+    config: AbliterixConfig, tp_gen, benign_msgs, target_msgs, vectors
+) -> tuple[dict[int, list[tuple[int, float]]] | None, str | None]:
+    """Safety experts profiled on the TP vLLM instance, and how: vLLM's
+    ``routed_experts``, else routing hooks (MoEs that route outside FusedMoE,
+    such as Inkling 2's), else the router-weight alignment heuristic."""
+    from .core.vllm_hidden_states import _load_text_config_data
+    from .core.vllm_moe_editor import (
+        VLLMMoEEditor,
+        profile_safety_experts_by_weight,
+        profile_safety_experts_vllm,
+        profile_safety_experts_vllm_hooks,
+    )
+
+    # Cheap probe: construct editor with empty safety_experts just to
+    # discover whether any layer exposes a router.
+    probe = VLLMMoEEditor(tp_gen.llm, {})
+    probe.probe()
+    if not probe._router_layers:
+        return None, None
+    try:
+        text_cfg = _load_text_config_data(
+            config.model.model_id,
+            config.model.trust_remote_code or False,
+            config.model.revision,
+        )
+    except Exception:
+        text_cfg = {}
+    top_k = int(text_cfg.get("num_experts_per_tok") or 4)
+    print(
+        f"* Profiling MoE safety experts via vLLM (top_k={top_k}, "
+        f"{len(probe._router_layers)} router layers)..."
+    )
+    safety = profile_safety_experts_vllm(
+        tp_gen.llm,
+        benign_msgs,
+        target_msgs,
+        tp_gen.tokenizer,
+        top_k=top_k,
+        chat_template_kwargs=config.model.chat_template_kwargs,
+    )
+    if safety:
+        return safety, "routed_experts"
+
+    # MoEs that route in their own kernel (Inkling 2) never fill
+    # routed_experts: recompute HF's routing in hooks on the MoE modules.
+    # Grouped routing (n_group > 1) is not modelled.
+    if int(text_cfg.get("n_group") or 1) <= 1:
+        print("* routed_experts was empty — recomputing the routing in hooks...")
+        safety = profile_safety_experts_vllm_hooks(
+            tp_gen.llm,
+            benign_msgs,
+            target_msgs,
+            tp_gen.tokenizer,
+            top_k=top_k,
+            # Without a correction bias any monotone score picks the same
+            # experts; with one, sigmoid is DeepSeek's and Inkling 2's default.
+            scoring_func=str(text_cfg.get("scoring_func") or "sigmoid"),
+            chat_template_kwargs=config.model.chat_template_kwargs,
+        )
+        if safety:
+            return safety, "routing_hooks"
+
+    # Fallback: vLLM's fused TRITON MxFP4 MoE kernel bypasses the router
+    # nn.Module's forward, so hook-based profiling returns empty counts.
+    # Rank experts by router-weight alignment with the per-layer refusal
+    # direction instead.
+    if vectors is not None:
+        print(
+            "* Hook-based profiling returned empty — falling back to "
+            "router-weight alignment heuristic..."
+        )
+        return profile_safety_experts_by_weight(tp_gen.llm, vectors), "router_weight"
+    return None, None
+
+
 def _auto_batch_size(
     engine: SteeringEngine, benign_msgs: list[ChatMessage], config: AbliterixConfig
 ) -> int:
@@ -645,7 +733,26 @@ def run() -> int:
     #           3) Fall back to HF pipeline parallelism (slow)
     _precomputed_benign_states = None
     _precomputed_target_states = None
-    if config.model.backend in ("vllm", "sglang") and _vllm_hidden_states_available():
+    # Plans recorded without the HF model (model.plans_without_hf_model):
+    # a resumed search reuses the hidden states and safety experts it saved,
+    # so every trial of the study, and its export, has the same vectors.
+    _plans_without_hf = _wants_plans_without_hf_model(config)
+    _saved_search_state = None
+    if _plans_without_hf:
+        from .core.plan_export import load_search_state, search_state_path
+
+        _saved_search_state = load_search_state(config)
+        if _saved_search_state is not None:
+            print()
+            print(
+                f"[bold]Reusing the saved search state[/] "
+                f"({search_state_path(config)})"
+            )
+            _precomputed_benign_states = _saved_search_state["benign_states"]
+            _precomputed_target_states = _saved_search_state["target_states"]
+    if _precomputed_benign_states is not None:
+        _vllm_hs_ok = False
+    elif config.model.backend in ("vllm", "sglang") and _vllm_hidden_states_available():
         from .core.vllm_hidden_states import (
             extract_hidden_states_vllm,
             is_model_supported,
@@ -737,27 +844,7 @@ def run() -> int:
             "(speculators handled hidden states, projections from safetensors)"
         )
         # Create a lightweight engine with only tokenizer (no model weights).
-        engine = SteeringEngine.__new__(SteeringEngine)
-        engine.config = config
-        engine.response_prefix = ""
-        engine.needs_reload = False
-        engine._dequant_cache = {}
-        engine._dequant_cache_bytes = 0
-        engine._dequant_cache_max_bytes = DEQUANT_CACHE_MAX_BYTES
-        engine._cached_n_layers = None
-        engine._cached_components = None
-        engine._is_native_fp8 = False
-        engine.tokenizer = load_tokenizer(
-            config.model.model_id,
-            trust_remote_code=config.model.trust_remote_code,
-            revision=config.model.revision,
-        )
-        if engine.tokenizer.pad_token is None:
-            engine.tokenizer.pad_token = engine.tokenizer.eos_token
-        engine.tokenizer.padding_side = "left"
-        engine.model = None
-        engine.max_memory = None
-        engine.trusted_models = {}
+        engine = SteeringEngine.without_model(config)
     else:
         engine = SteeringEngine(config)
 
@@ -1044,6 +1131,16 @@ def run() -> int:
                 plan_engine = engine.plan_skeleton()
                 engine.prepare_for_unload()
                 engine.model = None
+            elif _plans_without_hf and engine.model is None:
+                from .core.plan_export import config_skeleton
+
+                print(
+                    "* Building the model's structure from its config for "
+                    "steering plans (no HF model)..."
+                )
+                plan_engine = config_skeleton(config)
+                engine._cached_n_layers = len(plan_engine.transformer_layers)
+                engine._cached_components = plan_engine.list_steerable_components()
             if plan_engine is not None:
                 pass
             elif skip_projection_cache:
@@ -1119,6 +1216,24 @@ def run() -> int:
             engine._projection_cache = projection_cache
             engine._current_adapter_path = None  # baseline = no adapter
 
+            # Without the HF model (fast vLLM-native extraction path) the
+            # safety experts are profiled on the TP vLLM instance: for the
+            # MoE router editor, or for the steering plans, which suppress
+            # and project them themselves. A resumed plan search reuses the
+            # ranking it saved.
+            _safety_method = "hf" if safety_experts is not None else None
+            if _saved_search_state is not None and plan_engine is not None:
+                safety_experts = _saved_search_state["safety_experts"]
+                _safety_method = _saved_search_state.get("safety_experts_method")
+            elif (
+                config.model.backend == "vllm"
+                and safety_experts is None
+                and (plan_engine is not None or hasattr(tp_gen, "set_moe_editor"))
+            ):
+                safety_experts, _safety_method = _profile_safety_experts_on_vllm(
+                    config, tp_gen, benign_msgs, target_msgs, vectors
+                )
+
             # Attach MoE router editor so the optimizer can apply router
             # suppression per trial via collective_rpc.  Only on vLLM
             # backend (SGLang has no equivalent editor yet).
@@ -1126,74 +1241,33 @@ def run() -> int:
                 config.model.backend == "vllm"
                 and hasattr(tp_gen, "set_moe_editor")
                 and plan_engine is None  # the plan scales router rows itself
+                and safety_experts
             ):
-                # If HF profiling was skipped (fast vLLM-native extraction
-                # path → no HF model loaded), profile directly on the TP
-                # vLLM instance via collective_rpc-attached router hooks.
-                if safety_experts is None:
-                    from .core.vllm_moe_editor import (
-                        VLLMMoEEditor,
-                        profile_safety_experts_by_weight,
-                        profile_safety_experts_vllm,
-                    )
+                print(
+                    f"* Attaching MoE router editor ({len(safety_experts)} "
+                    f"MoE layers)..."
+                )
+                tp_gen.set_moe_editor(safety_experts)  # ty:ignore[call-non-callable]
 
-                    # Cheap probe: construct editor with empty safety_experts
-                    # just to discover whether any layer exposes a router.
-                    _probe_ed = VLLMMoEEditor(tp_gen.llm, {})
-                    _probe_ed.probe()
-                    if _probe_ed._router_layers:
-                        # Derive top_k from the model config (num_experts_per_tok).
-                        try:
-                            from transformers import AutoConfig
+            # What an export without the model needs: the hidden states and
+            # safety experts this search records its plans from.
+            if (
+                _plans_without_hf
+                and plan_engine is not None
+                and _saved_search_state is None
+                and benign_states is not None
+                and target_states is not None
+            ):
+                from .core.plan_export import save_search_state
 
-                            _auto_cfg = AutoConfig.from_pretrained(
-                                config.model.model_id,
-                                trust_remote_code=config.model.trust_remote_code
-                                or False,
-                            )
-                            _text_cfg = getattr(_auto_cfg, "text_config", _auto_cfg)
-                            _top_k = int(getattr(_text_cfg, "num_experts_per_tok", 4))
-                        except Exception:
-                            _top_k = 4
-
-                        print(
-                            f"* Profiling MoE safety experts via vLLM "
-                            f"(top_k={_top_k}, {len(_probe_ed._router_layers)} "
-                            f"router layers)..."
-                        )
-                        safety_experts = profile_safety_experts_vllm(
-                            tp_gen.llm,
-                            benign_msgs,
-                            target_msgs,
-                            tp_gen.tokenizer,
-                            top_k=_top_k,
-                            chat_template_kwargs=config.model.chat_template_kwargs,
-                        )
-
-                    # Fallback: vLLM's fused TRITON MxFP4 MoE kernel bypasses
-                    # the router nn.Module's forward, so hook-based profiling
-                    # returns empty counts.  Rank experts by router-weight
-                    # alignment with the per-layer refusal direction instead.
-                    if (
-                        _probe_ed._router_layers
-                        and not safety_experts
-                        and vectors is not None
-                    ):
-                        print(
-                            "* Hook-based profiling returned empty — falling "
-                            "back to router-weight alignment heuristic..."
-                        )
-                        safety_experts = profile_safety_experts_by_weight(
-                            tp_gen.llm,
-                            vectors,
-                        )
-
-                if safety_experts:
-                    print(
-                        f"* Attaching MoE router editor ({len(safety_experts)} "
-                        f"MoE layers)..."
-                    )
-                    tp_gen.set_moe_editor(safety_experts)  # ty:ignore[call-non-callable]
+                _path = save_search_state(
+                    config,
+                    benign_states,
+                    target_states,
+                    safety_experts,
+                    safety_experts_method=_safety_method,
+                )
+                print(f"* Saved the search state for exports: {_path}")
 
             # In-place editing path: attach attention and, when requested,
             # expert editors so the optimizer trial loop edits vLLM weights

@@ -337,6 +337,23 @@ class ModelConfig(BaseModel):
         ),
     )
 
+    plans_without_hf_model: bool = Field(
+        default=False,
+        description=(
+            "With backend='vllm', use_in_place_editing and steering_mode="
+            "'direct': when vLLM extracted the hidden states and the HF model "
+            "was not loaded, record each trial's steering plan on a weightless "
+            "model built from the checkpoint's config (conv taps read from its "
+            "safetensors) instead of using the legacy in-place editors. For "
+            "checkpoints transformers cannot load, such as Inkling 2's NVFP4 "
+            "release. The search saves its hidden states and safety-expert "
+            "ranking to <checkpoint_dir>/<model>.search-state.pt (and reuses "
+            "them on resume) so ``core.plan_export.export_plan_without_model`` "
+            "can record and bake any trial's plan without the model. Needs "
+            "enforce_eager when safety experts are profiled with routing hooks."
+        ),
+    )
+
     max_model_len: int | None = Field(
         default=None,
         description=(
