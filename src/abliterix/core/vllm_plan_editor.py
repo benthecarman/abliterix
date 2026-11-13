@@ -31,8 +31,9 @@ collective, so the ranks cannot disagree about which collectives run.
 
 Each edited tensor goes through a codec: decode the stored tensor(s) to
 values, apply the edits, encode back into the stored format and the layout the
-kernel reads. Only the dense codec (BF16/FP16/FP32 weights) exists here;
-quantized formats register theirs with :func:`register_codec`. The first time a
+kernel reads. The dense codec covers BF16/FP16/FP32 weights, Inkling 2's
+NVFP4 and MXFP8 experts have theirs (:mod:`.vllm_expert_codecs`), and other
+formats can register theirs with :func:`register_codec`. The first time a
 tensor is edited, the codec's stored tensors are copied to CPU as they are
 (quantized or not); :func:`_worker_restore_plan` writes them back after each
 trial.
@@ -50,6 +51,7 @@ import torch
 from torch import Tensor
 
 from .fp4_repack import TensorEdit, apply_tensor_edits, group_edits
+from .vllm_expert_codecs import inkling_expert_codec
 from .vllm_moe_editor import _worker_resolve_model
 
 EXPERT_CHUNK = 16
@@ -237,7 +239,10 @@ def _resolve(
         transposed = any(e.transposed for e in group)
         local = w2.data.transpose(1, 2) if transposed else w2.data
         ids = _local_expert_ids(moe, local.shape[0], hf_shape[0])
-        shard = _shard_dim(tuple(local.shape), hf_shape, world, (1, 2))
+        logical = tuple(local.shape)
+        if w2.dtype == torch.uint8 and not transposed:  # two FP4 codes a byte
+            logical = (*logical[:-1], logical[-1] * 2)
+        shard = _shard_dim(logical, hf_shape, world, (1, 2))
         if ids is not None and shard is not None:
             raise ValueError(
                 f"plan tensor {name!r}: experts split across ranks AND sharded within an expert"
@@ -408,7 +413,7 @@ def _dense_codec(tgt: _Target):
 
 
 # Factories tried in order (newest first); each returns a codec or None.
-_CODECS: list = [_dense_codec]
+_CODECS: list = [inkling_expert_codec, _dense_codec]
 
 
 def register_codec(factory) -> None:
