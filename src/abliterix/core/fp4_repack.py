@@ -43,6 +43,7 @@ from __future__ import annotations
 import gc
 import json
 import math
+import os
 import re
 import shutil
 import time
@@ -53,6 +54,7 @@ from typing import Any, Iterable
 import torch
 from torch import Tensor
 
+from . import expert_formats as xf
 from . import fp4_utils as f4
 from . import fp8_utils as f8
 from ..types import DecayKernel, DirectTransform, WeightNorm
@@ -1188,7 +1190,9 @@ class RepackStats:
     tensors_written: int = 0
     fp4_edited: int = 0
     fp8_edited: int = 0
+    codec_edited: int = 0
     dense_edited: int = 0
+    linked_shards: int = 0
     copied: int = 0
     skipped_edits: list[str] = field(default_factory=list)
     unmatched_edits: list[str] = field(default_factory=list)
@@ -1258,11 +1262,12 @@ def _checkpoint_layout(
 class _Encoding:
     """How one edited tensor is stored: its keys (primary first) and format."""
 
-    kind: str  # "fp4" | "fp8" | "dense"
+    kind: str  # "fp4" | "fp8" | "codec" | "dense"
     keys: tuple[str, ...]
     fp4: _Fp4KeySet | None = None
     fmt: f4.Fp4Format | None = None
     fp8: tuple[str, str] | None = None
+    codec: xf.Codec | None = None
 
 
 def _infer_fp4_format(meta: dict[str, Tensor], keys: _Fp4KeySet) -> f4.Fp4Format:
@@ -1302,6 +1307,12 @@ def _resolve_encoding(
     bytes without a recognised scale, which a dense edit would corrupt.
     """
     present = set(meta)
+    # Formats with their own scale rule first: Inkling 2's NVFP4 shares the
+    # ModelOpt layout's ``_scale`` suffix but scales per expert.
+    found_codec = xf.find_codec(name, meta) if fmt is None and layout is None else None
+    if found_codec is not None:
+        codec, keys = found_codec
+        return _Encoding("codec", keys, codec=codec)
     candidates = [name]
     if name.endswith(".weight"):
         candidates.append(name[: -len(".weight")])
@@ -1354,6 +1365,8 @@ def _edit_encoded(
     encoding (on CPU) and the requant relative error, if it was requantised.
     Raises ``ValueError`` when an edit does not fit the tensor."""
     name = enc.keys[0]
+    if enc.kind == "codec":
+        return _edit_codec(enc, group, tensors, device, verify_idempotent=verify_idempotent)
     if enc.kind == "fp4":
         keys, fmt = enc.fp4, enc.fmt
         W = _dequant_fp4_tensor(tensors, keys, fmt).to(device)
@@ -1393,6 +1406,56 @@ def _edit_encoded(
     stored = tensors[name]
     W_new = apply_tensor_edits(stored.to(device), group)
     return {name: W_new.to(stored.dtype).cpu()}, None
+
+
+# Edits that treat every expert alike; a tensor edited only by these can be
+# decoded, edited and encoded a slice of experts at a time.
+_EXPERT_UNIFORM = {"ega", "direct"}
+EXPERT_CHUNK = 32
+
+
+def _edit_codec(
+    enc: _Encoding,
+    group: list[TensorEdit],
+    tensors: dict[str, Tensor],
+    device: str,
+    *,
+    verify_idempotent: bool,
+) -> tuple[dict[str, Tensor], float]:
+    """Decode, edit and encode a tensor stored with one of ``expert_formats``'
+    codecs. A 3-D tensor that only expert-uniform edits touch goes a slice of
+    experts at a time, so its FP32 copy never sits in memory whole."""
+    codec, keys = enc.codec, enc.keys
+    stored = tensors[keys[0]]
+    on = {k: tensors[k].to(device) for k in keys}
+    if stored.dim() == 3 and all(e.kind in _EXPERT_UNIFORM for e in group):
+        spans = [(i, min(i + EXPERT_CHUNK, stored.shape[0])) for i in range(0, stored.shape[0], EXPERT_CHUNK)]
+    else:
+        spans = [None]
+    if verify_idempotent:
+        first = on if spans[0] is None else xf.expert_slices(codec, keys, on, *spans[0])
+        xf.assert_reencode_fixed_point(codec, keys, first, name=keys[0])
+    parts: dict[str, list[Tensor]] = {k: [] for k in keys}
+    err_num = err_den = 0.0
+    for span in spans:
+        part = on if span is None else xf.expert_slices(codec, keys, on, *span)
+        W = codec.decode(part, keys)
+        W_new = apply_tensor_edits(W, group)
+        written = codec.encode(W_new, part, keys)
+        back = codec.decode(written, keys)
+        err_num += float((back - W_new).abs().sum())
+        err_den += float(W_new.abs().sum())
+        for k in keys:
+            parts[k].append(written[k].cpu())
+        del W, W_new, written, back
+    shared = set(codec.shared(keys))
+    out = {k: v[0] if (k in shared or len(v) == 1) else torch.cat(v) for k, v in parts.items()}
+    for k in keys:
+        assert out[k].dtype == tensors[k].dtype and out[k].shape == tensors[k].shape, (
+            f"{k}: re-encoded as {out[k].dtype}{tuple(out[k].shape)}, "
+            f"stored as {tensors[k].dtype}{tuple(tensors[k].shape)}"
+        )
+    return out, err_num / max(err_den, 1e-9)
 
 
 def abliterate_fp4_to_disk(
@@ -1495,7 +1558,17 @@ def abliterate_fp4_to_disk(
     t0 = time.time()
     skipped: set[str] = set()
 
+    edited_shards = {shard_of[k] for enc, _ in resolved.values() for k in enc.keys}
     for i, (fname, keys) in enumerate(sorted(shards.items()), 1):
+        if fname not in edited_shards:
+            # Nothing in it changes: the source file itself, byte for byte.
+            _link_or_copy(src_dir / fname, dst_dir / fname)
+            stats.linked_shards += 1
+            stats.copied += len(keys)
+            for k in keys:
+                new_weight_map[k] = fname
+            total_bytes += (dst_dir / fname).stat().st_size
+            continue
         with safe_open(src_dir / fname, framework="pt") as f:
             src = {k: f.get_tensor(k) for k in keys}
 
@@ -1551,6 +1624,7 @@ def abliterate_fp4_to_disk(
             print(
                 f"[{i}/{len(shards)}] {fname}: "
                 f"{stats.fp4_edited} fp4-edited, {stats.fp8_edited} fp8-edited, "
+                f"{stats.codec_edited} codec-edited, "
                 f"{stats.dense_edited} dense-edited "
                 f"({total_bytes / 1e9:.1f} GB, {(time.time() - t0) / 60:.1f} min)",
                 flush=True,
@@ -1570,7 +1644,7 @@ def abliterate_fp4_to_disk(
     )
     # Keep config.json AS-IS (same precision) but write it out for a standalone dir.
     (dst_dir / "config.json").write_text(json.dumps(cfg, indent=2))
-    _copy_aux_files(src_dir, dst_dir)
+    _copy_aux_files(src_dir, dst_dir, shards=set(shards))
 
     if (stats.unmatched_edits or stats.skipped_edits) and verbose:
         print(
@@ -1584,6 +1658,7 @@ def abliterate_fp4_to_disk(
         print(
             f"\nDone. Model at {dst_dir} ({total_bytes / 1e9:.1f} GB). "
             f"{stats.fp4_edited} FP4 + {stats.fp8_edited} FP8 + "
+            f"{stats.codec_edited} codec + "
             f"{stats.dense_edited} dense tensors edited, "
             f"{stats.copied} copied. Worst requant rel-err {worst:.4f}."
         )
@@ -1709,15 +1784,40 @@ def map_plan_to_checkpoint(
     return mapped
 
 
-def _copy_aux_files(src_dir: Path, dst_dir: Path) -> None:
-    """Every non-weight file of the source (tokenizer, chat template, processor
-    and quantisation configs, remote code), so the output stands alone."""
+def _copy_aux_files(src_dir: Path, dst_dir: Path, shards: set[str] | None = None) -> None:
+    """Every file of the source besides its weight shards, the index and the
+    config (tokenizer, chat template, processor and quantisation configs,
+    remote code, folders such as Inkling 2's ``tiktoken/``, and weights
+    outside the index such as its DSpark draft ``mtp.safetensors``), so the
+    output stands alone. ``shards=None`` skips every safetensors file."""
     for p in src_dir.iterdir():
-        if not p.is_file() or p.suffix == ".safetensors":
+        if p.is_dir() and not p.name.startswith("."):  # e.g. Inkling 2's tiktoken/
+            if not (dst_dir / p.name).exists():
+                shutil.copytree(p, dst_dir / p.name)
+            continue
+        if not p.is_file():
+            continue
+        if p.suffix == ".safetensors" and (shards is None or p.name in shards):
             continue
         if p.name in ("model.safetensors.index.json", "config.json"):
             continue
-        shutil.copy2(p, dst_dir / p.name)
+        # Small files are copied: a later in-place write to one (a tokenizer
+        # fix) must not reach the source through a shared inode.
+        if p.suffix == ".safetensors":
+            _link_or_copy(p, dst_dir / p.name)
+        else:
+            shutil.copy2(p, dst_dir / p.name)
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """A hard link when both sit on one filesystem, else a copy. For weights
+    only, which nothing writes in place."""
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src.resolve(), dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
 
 # ---------------------------------------------------------------------------
