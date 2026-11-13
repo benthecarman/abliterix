@@ -247,3 +247,84 @@ def test_partial_router_apply_failure_restores_router_and_adapter_state():
     assert engine._vllm_gen.router_restore_calls == 1
     assert engine._vllm_gen.mutated is False
     assert engine._current_adapter_path is None
+
+
+class _PlanGenerator:
+    """A vLLM generator with only the in-place plan editor attached."""
+
+    attention_editor = None
+    expert_editor = None
+    moe_editor = None
+
+    def __init__(self, fail: bool = False) -> None:
+        self.plan_editor = SimpleNamespace(engine=object(), _applied=False)
+        self.fail = fail
+        self.plans: list = []
+        self.plan_restore_calls = 0
+        self.mutated = False
+
+    def apply_plan(self, edits):
+        self.plans.append(edits)
+        self.mutated = True
+        self.plan_editor._applied = True
+        if self.fail:
+            raise RuntimeError("partial plan apply")
+        return {"tensors": len(edits), "edits": len(edits), "not_local": 0}
+
+    def restore_plan_edits(self) -> int:
+        if not self.plan_editor._applied:
+            return 0
+        self.plan_restore_calls += 1
+        self.mutated = False
+        self.plan_editor._applied = False
+        return 1
+
+
+class _PlanEngine(_InPlaceEngine):
+    def list_steerable_components(self) -> list[str]:
+        return ["attn.o_proj"]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_plan_trial_records_the_export_plan_and_restores_once(monkeypatch, fail):
+    """The plan path records the trial with the export's recorder, applies it
+    on the workers, and restores exactly once, also after a failed apply."""
+    config = AbliterixConfig(
+        model={"model_id": "dummy/model"},
+        steering={"steering_mode": "direct", "fixed_vector_scope": "per layer"},
+        optimization={"num_trials": 1, "num_warmup_trials": 1},
+    )
+    generator = _PlanGenerator(fail=fail)
+    engine = _PlanEngine(generator)
+    recorded = []
+
+    def record(plan_engine, vectors, vector_index, profiles, cfg, **kwargs):
+        recorded.append((plan_engine, vector_index, set(profiles), kwargs))
+        return ["edit"]
+
+    monkeypatch.setattr(
+        "abliterix.core.fp4_repack.record_steering_plan_from_trial", record
+    )
+    monkeypatch.setattr(
+        "abliterix.optimizer.apply_steering",
+        lambda *a, **k: pytest.fail("the HF engine must not be steered"),
+    )
+    search = lambda: run_search(  # noqa: E731
+        config,
+        engine,
+        scorer=_Scorer(),
+        steering_vectors=torch.randn(5, 8),
+        safety_experts=None,
+        storage=InMemoryStorage(),
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="partial plan apply"):
+            search()
+    else:
+        assert len(search().trials) == 1
+
+    assert recorded and recorded[0][0] is generator.plan_editor.engine
+    assert recorded[0][2] == {"attn.o_proj"}
+    assert generator.plans == [["edit"]]
+    assert generator.plan_restore_calls == 1
+    assert generator.mutated is False

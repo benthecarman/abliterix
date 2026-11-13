@@ -317,7 +317,12 @@ class ModelConfig(BaseModel):
         default=False,
         description=(
             "Skip the LoRA-adapter path and edit vLLM weights in-place via "
-            "``collective_rpc`` instead.  Requires an unquantized BF16 MoE "
+            "``collective_rpc`` instead.  With steering_mode='direct' and the "
+            "HF model loaded for direction extraction, each trial records the "
+            "same steering plan the export records and the workers apply it "
+            "with the export's math, so the search scores the exported model "
+            "(TP-sharded rows are gathered, so row norms are whole-row).  "
+            "Requires an unquantized BF16 MoE "
             "checkpoint (MXFP4 / FP8 repack is NOT supported — see "
             "``Mxfp4MoEMethod.process_weights_after_loading``) and "
             "``enforce_eager = true``.  Advantages over LoRA adapter path:\n"
@@ -1145,7 +1150,8 @@ class SteeringConfig(BaseModel):
             "span{d, D_0 d, ..., D_{K-1} d} (the direction and its image under "
             "each conv tap) instead of d alone, so the direction is removed "
             "after the conv too. A rank up to K+1 edit per writer; writers "
-            "with no conv keep the rank-1 edit. Standard direct_transform only."
+            "with no conv keep the rank-1 edit. Standard direct_transform only; "
+            "on backend='vllm' it needs use_in_place_editing."
         ),
     )
 
@@ -2166,8 +2172,15 @@ class AbliterixConfig(BaseSettings):
                 unsupported.append("weight_normalization='full'")
             if self.iterative.enabled:
                 unsupported.append("iterative.enabled=true")
-            if self.steering.conv_span_projection:
-                unsupported.append("conv_span_projection=true")
+            # The in-place path applies the export's own plan, conv span
+            # included; only the LoRA path is rank 1.
+            if (
+                self.steering.conv_span_projection
+                and not self.model.use_in_place_editing
+            ):
+                unsupported.append(
+                    "conv_span_projection=true without use_in_place_editing"
+                )
 
             if unsupported:
                 details = ", ".join(unsupported)

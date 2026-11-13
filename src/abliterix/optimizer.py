@@ -321,8 +321,35 @@ def run_search(
             vllm_gen is not None
             and getattr(vllm_gen, "attention_editor", None) is not None
         )
+        # Plan path: the trial's edits are recorded with the export's own
+        # code and applied on the workers with its math, so the search scores
+        # the model the export writes.
+        _plan_mode = (
+            vllm_gen is not None and getattr(vllm_gen, "plan_editor", None) is not None
+        )
 
-        if _in_place_mode:
+        if _plan_mode:
+            from .core.fp4_repack import record_steering_plan_from_trial
+
+            edits = record_steering_plan_from_trial(
+                vllm_gen.plan_editor.engine,
+                trial_vectors,
+                vector_index,
+                profiles,
+                config,
+                benign_states=benign_states,
+                target_states=target_states,
+                safety_experts=safety_experts,
+                routing_config=routing,
+            )
+            print("* Applying steering plan (vLLM in-place)...")
+            _plan_result = vllm_gen.apply_plan(edits)
+            if trial_counter == 1:
+                print(
+                    f"  * plan: {_plan_result.get('edits', 0)} edits on "
+                    f"{_plan_result.get('tensors', 0)} tensors per worker"
+                )
+        elif _in_place_mode:
             from .core.steering import apply_steering_vllm_inplace
 
             # Resolve n_layers + hidden_dim from the attention editor's
@@ -529,8 +556,10 @@ def run_search(
             from .types import ChatMessage
 
             system = scorer.target_msgs[0].system if scorer.target_msgs else ""
-            control_msgs = [ChatMessage(system=system, user=p)
-                            for p in config.detection.control_prompts]
+            control_msgs = [
+                ChatMessage(system=system, user=p)
+                for p in config.detection.control_prompts
+            ]
             kept = scorer.detector.evaluate_compliance(engine, control_msgs)
             print(f"  * Controls still refused: [bold]{kept}[/]/{len(control_msgs)}")
             trial.set_user_attr("controls_kept", kept)
@@ -553,11 +582,18 @@ def run_search(
             vllm_gen is not None
             and getattr(vllm_gen, "attention_editor", None) is not None
         )
+        plan_cleanup_needed = bool(
+            vllm_gen is not None and getattr(vllm_gen, "plan_editor", None) is not None
+        )
         vllm_adapter_mode = bool(
             vllm_gen is not None
             and (proj_cache is not None or getattr(vllm_gen, "_lora_disabled", False))
         )
-        hf_cleanup_needed = not in_place_cleanup_needed and not vllm_adapter_mode
+        hf_cleanup_needed = (
+            not in_place_cleanup_needed
+            and not plan_cleanup_needed
+            and not vllm_adapter_mode
+        )
         router_cleanup_needed = bool(
             vllm_gen is not None
             and callable(getattr(vllm_gen, "restore_router_suppression", None))
@@ -584,6 +620,8 @@ def run_search(
                     vllm_gen.restore_router_suppression()
             finally:
                 try:
+                    if plan_cleanup_needed:
+                        vllm_gen.restore_plan_edits()
                     if in_place_cleanup_needed:
                         try:
                             vllm_gen.restore_attention_weights()

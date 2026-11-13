@@ -1397,6 +1397,11 @@ def restore_all_vllm_inplace(vllm_gen) -> dict:
         "attention": vllm_gen.restore_attention_weights(),
         "ega": vllm_gen.restore_expert_weights(),
         "router": vllm_gen.restore_router_suppression(),
+        "plan": (
+            vllm_gen.restore_plan_edits()
+            if callable(getattr(vllm_gen, "restore_plan_edits", None))
+            else 0
+        ),
     }
 
 

@@ -1028,7 +1028,25 @@ def run() -> int:
                 and (model_path / "model.safetensors.index.json").exists()
             )
             skip_projection_cache = config.model.disable_lora
-            if skip_projection_cache:
+            # In-place plan editing: each trial records the export's plan on
+            # the HF model's structure (weights freed) and the vLLM workers
+            # apply it, so no LoRA projection cache is needed.
+            plan_engine = None
+            if (
+                config.model.backend == "vllm"
+                and config.model.use_in_place_editing
+                and config.steering.steering_mode == SteeringMode.DIRECT
+                and engine.model is not None
+            ):
+                print(
+                    "* Unloading HF model, keeping its structure for steering plans..."
+                )
+                plan_engine = engine.plan_skeleton()
+                engine.prepare_for_unload()
+                engine.model = None
+            if plan_engine is not None:
+                pass
+            elif skip_projection_cache:
                 print(
                     "* LoRA disabled: skipping projection cache (router-only steering)"
                 )
@@ -1104,7 +1122,11 @@ def run() -> int:
             # Attach MoE router editor so the optimizer can apply router
             # suppression per trial via collective_rpc.  Only on vLLM
             # backend (SGLang has no equivalent editor yet).
-            if config.model.backend == "vllm" and hasattr(tp_gen, "set_moe_editor"):
+            if (
+                config.model.backend == "vllm"
+                and hasattr(tp_gen, "set_moe_editor")
+                and plan_engine is None  # the plan scales router rows itself
+            ):
                 # If HF profiling was skipped (fast vLLM-native extraction
                 # path → no HF model loaded), profile directly on the TP
                 # vLLM instance via collective_rpc-attached router hooks.
@@ -1179,7 +1201,10 @@ def run() -> int:
             # Requires TRITON backend (FLASHINFER_TRTLLM repacks w2_weight
             # into an opaque block layout) and enforce_eager=True. See
             # VllmConfig.use_in_place_editing for env-var requirements.
-            if (
+            if plan_engine is not None:
+                print("* Attaching vLLM in-place steering-plan editor...")
+                tp_gen.set_plan_editor(plan_engine)  # ty:ignore[call-non-callable]
+            elif (
                 config.model.backend == "vllm"
                 and config.model.use_in_place_editing
                 and hasattr(tp_gen, "set_expert_editor")

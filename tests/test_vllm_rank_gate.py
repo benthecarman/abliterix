@@ -53,6 +53,27 @@ def test_vllm_rejects_recipes_that_produce_rank_k_vectors(steering, iterative, r
         AbliterixConfig(**kwargs)
 
 
+def test_vllm_conv_span_needs_in_place_editing():
+    """The LoRA path is rank 1; the in-place path applies the export's plan,
+    conv span included."""
+    with pytest.raises(
+        ValueError, match="conv_span_projection=true without use_in_place_editing"
+    ):
+        AbliterixConfig(
+            model={"model_id": "test/model", "backend": "vllm"},
+            steering={"conv_span_projection": True},
+        )
+    config = AbliterixConfig(
+        model={
+            "model_id": "test/model",
+            "backend": "vllm",
+            "use_in_place_editing": True,
+        },
+        steering={"conv_span_projection": True},
+    )
+    assert config.steering.conv_span_projection
+
+
 def test_hf_keeps_rank_k_recipes_available():
     config = AbliterixConfig(
         model={"model_id": "test/model", "backend": "hf"},

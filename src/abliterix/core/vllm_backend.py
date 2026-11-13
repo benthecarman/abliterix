@@ -705,6 +705,38 @@ class VLLMGenerator:
     # Direct attention projection (q/k/v/o_proj) under vLLM TP
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Steering plans applied in place (the export's own edits)
+    # ------------------------------------------------------------------
+
+    def set_plan_editor(self, plan_engine) -> None:
+        """Attach a :class:`VLLMPlanEditor`: each trial's plan, recorded on
+        ``plan_engine`` (the HF engine's skeleton), is applied to the
+        workers' weights with the export's math."""
+        from .vllm_plan_editor import VLLMPlanEditor
+
+        self.plan_editor = VLLMPlanEditor(self.llm, plan_engine)
+
+    def apply_plan(self, edits) -> dict[str, Any]:
+        result = self.plan_editor.apply(edits)
+        if result.get("tensors", 0) > 0:
+            try:
+                self.llm.reset_prefix_cache()
+            except Exception:
+                pass
+        return result
+
+    def restore_plan_edits(self) -> int:
+        if getattr(self, "plan_editor", None) is None:
+            return 0
+        touched = self.plan_editor.restore()
+        if touched > 0:
+            try:
+                self.llm.reset_prefix_cache()
+            except Exception:
+                pass
+        return touched
+
     def set_attention_editor(self) -> None:
         """Attach a :class:`VLLMAttentionEditor` for in-place attention weight
         edits (orthogonal projection on q/k/v/o_proj under TP). Slices the

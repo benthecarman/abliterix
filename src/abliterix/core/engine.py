@@ -400,6 +400,24 @@ def _forward_supports_logits_to_keep(model: Module) -> bool:
         return False
 
 
+def _move_to_meta(model: Module) -> None:
+    """Replace every parameter and buffer of ``model`` with an empty meta
+    tensor of the same shape and dtype, in place. Module identities stay, so
+    code that walks the structure (plan recording) works unchanged."""
+    for module in model.modules():
+        for name, p in list(module._parameters.items()):
+            if p is not None:
+                module._parameters[name] = Parameter(
+                    torch.empty(p.shape, dtype=p.dtype, device="meta"),
+                    requires_grad=False,
+                )
+        for name, b in list(module._buffers.items()):
+            if b is not None:
+                module._buffers[name] = torch.empty(
+                    b.shape, dtype=b.dtype, device="meta"
+                )
+
+
 def _required_lora_rank(config: AbliterixConfig) -> int:
     """Return the adapter rank required by every configured vector recipe."""
     steering = config.steering
@@ -1360,6 +1378,32 @@ class SteeringEngine:
         if self._cached_n_layers is not None:
             return self._cached_n_layers
         return len(self.transformer_layers)
+
+    def plan_skeleton(self):
+        """A copy of this engine whose model keeps its structure but not its
+        weights (every parameter and buffer moved to the meta device, in
+        place: the weights are freed). Plan recording reads only the
+        structure, so the vLLM in-place path records each trial's plan on it
+        after the HF model is unloaded, with the export's own code.
+
+        The conv taps the conv-span edit needs are values, so they are read
+        first and kept on the copy. Call before :meth:`prepare_for_unload`.
+        """
+        import copy
+
+        n_layers = len(self.transformer_layers)
+        taps: dict[tuple[int, str], Tensor] = {}
+        for i in range(n_layers):
+            for component in ("attn.o_proj", "mlp.down_proj"):
+                t = self.output_conv_taps(i, component)
+                if t is not None:
+                    taps[(i, component)] = t.detach().to("cpu", copy=True)
+        _move_to_meta(self.model)
+        skeleton = copy.copy(self)
+        skeleton.output_conv_taps = lambda layer_index, component: taps.get(
+            (layer_index, component)
+        )
+        return skeleton
 
     def prepare_for_unload(self):
         """Cache metadata needed by the optimizer before freeing the HF model.
