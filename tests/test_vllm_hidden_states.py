@@ -153,3 +153,72 @@ def test_hidden_state_engine_skips_the_extensible_kv_cache(monkeypatch, tmp_path
         assert seen["enable_extensible_kv_cache"] is False
     else:
         assert "enable_extensible_kv_cache" not in seen
+
+
+def _aux_vllm(seen, forwards_per_prompt=1):
+    """A plain engine whose model returns Inkling 2's aux states: id ``i``
+    before layer ``i`` for ``i < N``, then the final output as id ``N``."""
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(N)])
+            self.aux_hidden_state_layers = ()
+
+        def forward(self, prompt):
+            p = int(prompt)
+            ref = _reference(p, 3 + p)  # [N + 1, len, H]
+            out = ref[N]
+            if not self.aux_hidden_state_layers:
+                return out
+            aux = [ref[i] for i in self.aux_hidden_state_layers if i < N]
+            return out, [*aux, out]
+
+    worker = NS(model_runner=NS(model=torch.nn.Sequential(Model())))
+
+    class LLM:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            self.llm_engine = NS(collective_rpc=lambda fn, args=(): [fn(worker, *args)])
+
+        def generate(self, prompts, sampling_params, use_tqdm=True):
+            for prompt in prompts:
+                for _ in range(forwards_per_prompt):
+                    worker.model_runner.model[0](prompt)
+            return []
+
+    return NS(LLM=LLM, SamplingParams=lambda **kw: None)
+
+
+def _aux_setup(monkeypatch, tmp_path, fake):
+    monkeypatch.setattr(compat, "install_gemma4_transformers_compat", lambda: None)
+    monkeypatch.setitem(sys.modules, "vllm", fake)
+    monkeypatch.setattr(hs, "_load_text_config_data", lambda *a: {"num_hidden_layers": N})
+    monkeypatch.setattr(hs, "_config_json", lambda *a: {"architectures": ["Inkling2ForConditionalGeneration"]})
+    monkeypatch.setattr(hs.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tokenizer())
+    monkeypatch.setenv("AX_HIDDEN_STATES_DIR", str(tmp_path))
+
+
+def test_aux_layer_capture_reads_hf_indices_without_the_speculator(monkeypatch, tmp_path):
+    seen = {}
+    _aux_setup(monkeypatch, tmp_path, _aux_vllm(seen))
+    sets = {"benign": [ChatMessage(system="", user="0"), ChatMessage(system="", user="1")],
+            "target": [ChatMessage(system="", user="2")]}
+    config = AbliterixConfig(model={"vllm_hidden_state_capture": "aux_layers"})
+
+    out = hs.extract_hidden_states_vllm(config, sets)
+
+    assert "speculative_config" not in seen and "kv_transfer_config" not in seen
+    assert seen["enable_prefix_caching"] is False
+    for name, prompts in (("benign", [0, 1]), ("target", [2])):
+        for row, p in enumerate(prompts):
+            got = out[name][row]
+            assert torch.equal(got[0], torch.zeros(H))
+            assert torch.equal(got[1:], _reference(p, 3 + p)[1:, -1])
+
+
+def test_aux_layer_capture_refuses_extra_forwards(monkeypatch, tmp_path):
+    _aux_setup(monkeypatch, tmp_path, _aux_vllm({}, forwards_per_prompt=2))
+    config = AbliterixConfig(model={"vllm_hidden_state_capture": "aux_layers"})
+    with pytest.raises(RuntimeError, match="one forward"):
+        hs.extract_hidden_states_vllm(config, {"benign": [ChatMessage(system="", user="0")]})

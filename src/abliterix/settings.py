@@ -492,6 +492,19 @@ class ModelConfig(BaseModel):
         ),
     )
 
+    vllm_hidden_state_capture: Literal["speculative", "aux_layers"] = Field(
+        default="speculative",
+        description=(
+            "How the vLLM path reads per-layer hidden states. 'speculative' "
+            "(default) uses vLLM's extract_hidden_states speculator and its "
+            "connector. 'aux_layers' runs a plain engine, sets the model's "
+            "Eagle-3 aux layers on each worker and takes the last token's "
+            "rows from one prefill per prompt: the same states, without the "
+            "speculator. Inkling 2's vLLM build crashes in the speculator "
+            "(an illegal memory access in its MoE), not in the model."
+        ),
+    )
+
     vllm_compile_mode: CompileMode = Field(
         default="eager",
         description=(

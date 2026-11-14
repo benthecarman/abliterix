@@ -171,6 +171,55 @@ def layer_rows(hs: Tensor, num_layers: int, token_offset: int = -1) -> Tensor:
     return torch.cat([placeholder, layer_vecs], dim=0)
 
 
+def _worker_aux_model(worker: Any):
+    """The module whose forward returns ``(out, aux_hidden_states)`` once
+    its ``aux_hidden_state_layers`` are set (vLLM's Eagle-3 interface)."""
+    for module in worker.model_runner.model.modules():
+        if hasattr(module, "aux_hidden_state_layers") and hasattr(module, "layers"):
+            return module
+    raise RuntimeError("this vLLM model has no aux_hidden_state_layers to capture")
+
+
+def _worker_install_aux_capture(worker: Any, layer_ids: list[int], token_offset: int) -> None:
+    """Set the aux layers and wrap the model's forward so it keeps one
+    ``[len(layer_ids), hidden]`` row per forward (the token at
+    ``token_offset``) and returns only its output, as without aux layers."""
+    model = _worker_aux_model(worker)
+    model.aux_hidden_state_layers = tuple(layer_ids)
+    rows: list[Tensor] = []
+    inner = model.forward
+
+    def forward(*args, **kwargs):
+        out, aux = inner(*args, **kwargs)
+        rows.append(torch.stack([a[token_offset] for a in aux]).float().cpu())
+        return out
+
+    model.forward = forward
+    worker._abliterix_aux_rows = rows
+
+
+def _worker_take_aux_rows(worker: Any) -> list[Tensor]:
+    rows = list(worker._abliterix_aux_rows)
+    worker._abliterix_aux_rows.clear()
+    return rows
+
+
+def _capture_aux_rows(llm, prompts, sampling_params, layer_ids, num_layers, token_offset) -> list[Tensor]:
+    """Each prompt's ``[N + 1, hidden]`` rows (see :func:`layer_rows`), read
+    from the model's aux hidden states, one prompt per forward."""
+    rpc = llm.llm_engine.collective_rpc
+    rpc(_worker_install_aux_capture, args=(layer_ids, token_offset))
+    results = []
+    for prompt in prompts:
+        llm.generate([prompt], sampling_params, use_tqdm=False)
+        # Every rank holds the same rows (gathered under sequence parallel).
+        rows = rpc(_worker_take_aux_rows)[0]
+        if len(rows) != 1:
+            raise RuntimeError(f"expected one forward for the prompt, got {len(rows)}")
+        results.append(layer_rows(rows[0].unsqueeze(0), num_layers, 0))
+    return results
+
+
 @contextlib.contextmanager
 def _without_expandable_segments():
     """vLLM refuses the hidden-states KV connector when PyTorch's allocator
@@ -341,6 +390,13 @@ def extract_hidden_states_vllm(
     # finally block below exists precisely to guarantee teardown, and its
     # own comment notes that a partially-initialised engine pins the frame
     # and keeps its VRAM. It also guarantees the temp dir is removed.
+    aux_capture = config.model.vllm_hidden_state_capture == "aux_layers"
+    if aux_capture:
+        # A plain engine: no speculator, no connector. Every token is
+        # prefilled, so each prompt is one forward whose last row is read.
+        del kwargs["speculative_config"], kwargs["kv_transfer_config"]
+        kwargs["enable_prefix_caching"] = False
+
     try:
         with _without_expandable_segments():
             llm = LLM(**kwargs)
@@ -401,10 +457,16 @@ def extract_hidden_states_vllm(
         )
 
         sampling_params = SamplingParams(max_tokens=1)
-        outputs = llm.generate(prompts, sampling_params)
+        if aux_capture:
+            batch_residuals = _capture_aux_rows(
+                llm, prompts, sampling_params, layer_ids, num_layers, token_offset
+            )
+            outputs = []
+        else:
+            outputs = llm.generate(prompts, sampling_params)
+            batch_residuals = []
 
         # Collect hidden states from safetensors files.
-        batch_residuals: list[Tensor] = []
         for out in outputs:
             hs_path = out.kv_transfer_params.get("hidden_states_path")
             if hs_path is None:
