@@ -55,6 +55,7 @@ def test_aux_id_k_lands_at_hf_index_k(monkeypatch, tmp_path):
     monkeypatch.setattr(compat, "install_gemma4_transformers_compat", lambda: None)
     monkeypatch.setitem(sys.modules, "vllm", _fake_vllm(tmp_path, seen))
     monkeypatch.setattr(hs, "_load_text_config_data", lambda *a: {"num_hidden_layers": N})
+    monkeypatch.setattr(hs, "_config_json", lambda *a: {"architectures": ["LlamaForCausalLM"]})
     monkeypatch.setattr(hs.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tokenizer())
     monkeypatch.setenv("AX_HIDDEN_STATES_DIR", str(tmp_path))
     sets = {"benign": [ChatMessage(system="", user="0"), ChatMessage(system="", user="1")],
@@ -116,3 +117,21 @@ def test_engine_starts_without_expandable_segments(monkeypatch):
     with hs._without_expandable_segments():
         assert "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
     assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+
+
+def test_hidden_state_engine_uses_the_recipe_attention_backend(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(compat, "install_gemma4_transformers_compat", lambda: None)
+    monkeypatch.setitem(sys.modules, "vllm", _fake_vllm(tmp_path, seen))
+    monkeypatch.setattr(hs, "_load_text_config_data", lambda *a: {"num_hidden_layers": N})
+    monkeypatch.setattr(hs, "_config_json", lambda *a: {"architectures": ["Gemma4ForConditionalGeneration"]})
+    monkeypatch.setattr(hs.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tokenizer())
+    monkeypatch.setenv("AX_HIDDEN_STATES_DIR", str(tmp_path))
+    sets = {"benign": [ChatMessage(system="", user="0")]}
+
+    hs.extract_hidden_states_vllm(AbliterixConfig(model={"attention_backend": "FLASH_ATTN"}), sets)
+    assert seen["attention_config"] == {"backend": "FLASH_ATTN"}
+
+    seen.clear()
+    hs.extract_hidden_states_vllm(AbliterixConfig(), sets)
+    assert "attention_config" not in seen

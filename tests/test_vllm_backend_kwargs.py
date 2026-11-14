@@ -516,3 +516,42 @@ def test_model_config_rejects_invalid_compile_mode():
     """PR #21 review item 1: vllm_compile_mode is a Literal."""
     with pytest.raises(ValueError):
         ModelConfig(model_id="x", vllm_compile_mode="eagar")  # typo
+
+
+@pytest.mark.parametrize(
+    "routed, in_place, caching",
+    [(True, True, True), (False, True, False), (True, False, True), (False, False, True)],
+)
+def test_prefix_caching_stays_on_for_routed_experts(routed, in_place, caching):
+    """vLLM's AuxOutput connector (routed experts) requires prefix caching;
+    otherwise in-place edits keep it off."""
+    cfg = _make_config(vllm_return_routed_experts=routed, use_in_place_editing=in_place)
+    with patch("abliterix.core.vllm_backend.torch.cuda.device_count", return_value=1):
+        kwargs = _build_llm_kwargs(
+            cfg,
+            model_arch="CustomMoeForCausalLM",
+            is_fp8=False,
+            kv_cache_dtype=None,
+            lora_max_rank=1,
+            is_moe=True,
+        )
+    assert kwargs["enable_return_routed_experts"] is routed
+    assert kwargs["enable_prefix_caching"] is caching
+
+
+def test_failed_prefix_cache_reset_after_an_edit_raises():
+    from types import SimpleNamespace
+
+    from abliterix.core.vllm_backend import VLLMGenerator
+
+    gen = VLLMGenerator.__new__(VLLMGenerator)
+    gen.plan_editor = SimpleNamespace(apply=lambda edits: {"tensors": 1}, restore=lambda: 1)
+    gen.llm = SimpleNamespace(reset_prefix_cache=lambda: True)
+    assert gen.apply_plan([]) == {"tensors": 1}
+    assert gen.restore_plan_edits() == 1
+
+    gen.llm = SimpleNamespace(reset_prefix_cache=lambda: False)
+    with pytest.raises(RuntimeError, match="prefix cache"):
+        gen.apply_plan([])
+    with pytest.raises(RuntimeError, match="prefix cache"):
+        gen.restore_plan_edits()

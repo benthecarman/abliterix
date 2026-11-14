@@ -338,6 +338,7 @@ def test_vllm_constructor_failure_removes_hidden_state_tempdir(monkeypatch, tmp_
     monkeypatch.setattr(
         hs, "_load_text_config_data", lambda *args: {"num_hidden_layers": 2}
     )
+    monkeypatch.setattr(hs, "_config_json", lambda *args: {})
     monkeypatch.setenv("AX_HIDDEN_STATES_DIR", str(tmp_path))
     with pytest.raises(RuntimeError, match="constructor failed"):
         hs.extract_hidden_states_vllm(AbliterixConfig(), {})

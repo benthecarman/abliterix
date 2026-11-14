@@ -337,6 +337,11 @@ def _build_llm_kwargs(
         config.model.enforce_eager, config.model.vllm_compile_mode
     )
     compilation_config = vllm_compilation_config.build(compile_mode)
+    return_routed_experts = _resolve_return_routed_experts(
+        config.model.vllm_return_routed_experts,
+        model_arch=model_arch,
+        is_moe=is_moe,
+    )
 
     kwargs: dict[str, Any] = dict(
         model=config.model.model_id,
@@ -369,11 +374,7 @@ def _build_llm_kwargs(
         # Auto-enable only for MoE topology. vLLM 0.20.x tries to read MoE-only
         # config fields during startup when this is True, which crashes dense
         # models. An explicit recipe True/False remains authoritative.
-        enable_return_routed_experts=_resolve_return_routed_experts(
-            config.model.vllm_return_routed_experts,
-            model_arch=model_arch,
-            is_moe=is_moe,
-        ),
+        enable_return_routed_experts=return_routed_experts,
         # vLLM 0.20.x compilation_config encodes the eager/non-eager
         # intent. ``enforce_eager`` is intentionally NOT passed here —
         # _resolve_compile_mode folds it into ``compile_mode`` above so
@@ -384,7 +385,11 @@ def _build_llm_kwargs(
         disable_custom_all_reduce=_should_disable_custom_all_reduce(
             config.model.disable_custom_all_reduce
         ),
-        enable_prefix_caching=not bool(config.model.use_in_place_editing),
+        # In-place edits change the weights under the KV cache. Prefix caching
+        # stays off for them unless routed experts are returned: vLLM's
+        # AuxOutput connector requires it, and every edit resets the cache.
+        enable_prefix_caching=return_routed_experts
+        or not bool(config.model.use_in_place_editing),
     )
 
     attention_backend = _resolve_attention_backend(
@@ -572,6 +577,19 @@ class VLLMGenerator:
     # MoE router suppression (attached after HF safety-expert profiling)
     # ------------------------------------------------------------------
 
+    def _reset_prefix_cache(self) -> None:
+        """Drop KV computed with the weights before an in-place edit.
+
+        Prefix caching stays on when vLLM returns routed experts (its
+        AuxOutput connector requires it), so a reset that fails would let
+        the next trial reuse KV from the previous weights. Fail instead.
+        """
+        if not self.llm.reset_prefix_cache():
+            raise RuntimeError(
+                "vLLM did not reset its prefix cache after a weight edit; "
+                "the next generation would reuse KV from the old weights"
+            )
+
     def set_moe_editor(
         self,
         safety_experts: dict[int, list[tuple[int, float]]],
@@ -609,10 +627,7 @@ class VLLMGenerator:
             return 0
         touched = self.moe_editor.apply(n_suppress=n_suppress, bias_value=bias_value)
         if touched > 0:
-            try:
-                self.llm.reset_prefix_cache()
-            except Exception:
-                pass
+            self._reset_prefix_cache()
         return touched
 
     def restore_router_suppression(self) -> int:
@@ -623,10 +638,7 @@ class VLLMGenerator:
             return 0
         touched = self.moe_editor.restore()
         if touched > 0:
-            try:
-                self.llm.reset_prefix_cache()
-            except Exception:
-                pass
+            self._reset_prefix_cache()
         return touched
 
     # ------------------------------------------------------------------
@@ -681,10 +693,7 @@ class VLLMGenerator:
             return {"applied": 0, "errors": ["no expert editor"], "per_layer": []}
         result = self.expert_editor.apply_ega(plan, norm_preserve=norm_preserve)
         if result.get("applied", 0) > 0:
-            try:
-                self.llm.reset_prefix_cache()
-            except Exception:
-                pass
+            self._reset_prefix_cache()
         return result
 
     def restore_expert_weights(self) -> int:
@@ -695,10 +704,7 @@ class VLLMGenerator:
             return 0
         touched = self.expert_editor.restore()
         if touched > 0:
-            try:
-                self.llm.reset_prefix_cache()
-            except Exception:
-                pass
+            self._reset_prefix_cache()
         return touched
 
     # ------------------------------------------------------------------
@@ -720,10 +726,7 @@ class VLLMGenerator:
     def apply_plan(self, edits) -> dict[str, Any]:
         result = self.plan_editor.apply(edits)
         if result.get("tensors", 0) > 0:
-            try:
-                self.llm.reset_prefix_cache()
-            except Exception:
-                pass
+            self._reset_prefix_cache()
         return result
 
     def restore_plan_edits(self) -> int:
@@ -731,10 +734,7 @@ class VLLMGenerator:
             return 0
         touched = self.plan_editor.restore()
         if touched > 0:
-            try:
-                self.llm.reset_prefix_cache()
-            except Exception:
-                pass
+            self._reset_prefix_cache()
         return touched
 
     def set_attention_editor(self) -> None:
@@ -765,10 +765,7 @@ class VLLMGenerator:
             return {"applied": 0, "errors": ["no attention editor"], "per_layer": []}
         result = self.attention_editor.apply(plan, norm_preserve=norm_preserve)
         if result.get("applied", 0) > 0:
-            try:
-                self.llm.reset_prefix_cache()
-            except Exception:
-                pass
+            self._reset_prefix_cache()
         return result
 
     def restore_attention_weights(self) -> int:
@@ -777,10 +774,7 @@ class VLLMGenerator:
             return 0
         touched = self.attention_editor.restore()
         if touched > 0:
-            try:
-                self.llm.reset_prefix_cache()
-            except Exception:
-                pass
+            self._reset_prefix_cache()
         return touched
 
     # ------------------------------------------------------------------

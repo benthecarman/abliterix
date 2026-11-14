@@ -297,6 +297,17 @@ def extract_hidden_states_vllm(
         "audio": 0,
     }
 
+    # The generation engine's attention backend: some builds pick one that
+    # lacks kernels for the model's head size (Gemma 4's 512 on B300).
+    from .vllm_backend import _resolve_attention_backend
+
+    attention_backend = _resolve_attention_backend(
+        config.model.attention_backend,
+        (_config_json(model_id, config.model.revision).get("architectures") or [""])[0],
+    )
+    if attention_backend is not None:
+        kwargs["attention_config"] = {"backend": attention_backend}
+
     # Model config overrides (e.g. MTP-3 → MTP-1 for Step-3.5-Flash).
     if config.model.hf_overrides:
         kwargs["hf_overrides"] = config.model.hf_overrides
