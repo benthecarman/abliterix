@@ -94,6 +94,17 @@ def _load_text_config_data(
     return text_cfg
 
 
+def _engine_accepts(name: str) -> bool:
+    """Whether the installed vLLM's engine arguments include ``name``."""
+    import dataclasses
+
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+    except ImportError:
+        return False
+    return name in {f.name for f in dataclasses.fields(EngineArgs)}
+
+
 def _top_level_model_type(config: AbliterixConfig) -> str:
     return _config_json(config.model.model_id, config.model.revision).get("model_type", "")
 
@@ -296,6 +307,14 @@ def extract_hidden_states_vllm(
         "video": 0,
         "audio": 0,
     }
+
+    # Extraction is one prefill per prompt, so the engine needs no warmup. Builds
+    # with an extensible KV cache warm up anyway, with a decode step that carries
+    # the extractor's draft token; on Inkling 2 that step fails in the NVFP4 MoE
+    # GEMM. Without the extensible cache (and eager), vLLM skips the warmup and
+    # sizes the KV cache by profiling, as older builds did.
+    if _engine_accepts("enable_extensible_kv_cache"):
+        kwargs["enable_extensible_kv_cache"] = False
 
     # The generation engine's attention backend: some builds pick one that
     # lacks kernels for the model's head size (Gemma 4's 512 on B300).

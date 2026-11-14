@@ -135,3 +135,21 @@ def test_hidden_state_engine_uses_the_recipe_attention_backend(monkeypatch, tmp_
     seen.clear()
     hs.extract_hidden_states_vllm(AbliterixConfig(), sets)
     assert "attention_config" not in seen
+
+
+@pytest.mark.parametrize("accepts", [True, False])
+def test_hidden_state_engine_skips_the_extensible_kv_cache(monkeypatch, tmp_path, accepts):
+    seen = {}
+    monkeypatch.setattr(compat, "install_gemma4_transformers_compat", lambda: None)
+    monkeypatch.setitem(sys.modules, "vllm", _fake_vllm(tmp_path, seen))
+    monkeypatch.setattr(hs, "_load_text_config_data", lambda *a: {"num_hidden_layers": N})
+    monkeypatch.setattr(hs, "_config_json", lambda *a: {"architectures": ["Inkling2ForConditionalGeneration"]})
+    monkeypatch.setattr(hs, "_engine_accepts", lambda name: accepts and name == "enable_extensible_kv_cache")
+    monkeypatch.setattr(hs.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tokenizer())
+    monkeypatch.setenv("AX_HIDDEN_STATES_DIR", str(tmp_path))
+
+    hs.extract_hidden_states_vllm(AbliterixConfig(), {"benign": [ChatMessage(system="", user="0")]})
+    if accepts:
+        assert seen["enable_extensible_kv_cache"] is False
+    else:
+        assert "enable_extensible_kv_cache" not in seen
