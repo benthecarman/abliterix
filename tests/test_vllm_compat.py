@@ -164,3 +164,23 @@ def test_ensure_vllm_env_does_not_set_deprecated_var():
     env: dict[str, str] = {}
     ensure_vllm_env(needs_collective_rpc=True, env=env)
     assert "VLLM_FUSED_MOE_UNQUANTIZED_BACKEND" not in env
+
+
+def test_untagged_source_build_is_accepted_with_a_warning():
+    import warnings
+
+    from abliterix.core.vllm_compat import check_vllm_version
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        check_vllm_version("0.1.dev25249+gb974b306f.cu130")
+    assert any("untagged source build" in str(w.message) for w in caught)
+
+
+def test_old_release_is_still_refused():
+    import pytest
+
+    from abliterix.core.vllm_compat import check_vllm_version
+
+    with pytest.raises(ImportError):
+        check_vllm_version("0.17.1")

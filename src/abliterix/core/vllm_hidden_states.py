@@ -288,6 +288,15 @@ def extract_hidden_states_vllm(
     if config.model.max_num_seqs:
         kwargs["max_num_seqs"] = config.model.max_num_seqs
 
+    # Text prompts only, as the generation engine (vllm_backend) runs them: no
+    # image/video/audio inputs, which also skips vLLM's multimodal profiling
+    # (Gemma 4's processor fails on its own dummy video in some builds).
+    kwargs["limit_mm_per_prompt"] = config.model.limit_mm_per_prompt or {
+        "image": 0,
+        "video": 0,
+        "audio": 0,
+    }
+
     # Model config overrides (e.g. MTP-3 → MTP-1 for Step-3.5-Flash).
     if config.model.hf_overrides:
         kwargs["hf_overrides"] = config.model.hf_overrides

@@ -87,6 +87,15 @@ def check_vllm_version(installed: str | None = None) -> tuple[int, ...]:
             ) from exc
 
     parsed = _parse_version(installed)
+    if parsed[:2] == (0, 1) and ".dev" in installed:
+        # A source build without a release tag (vLLM's model-launch images report
+        # "0.1.devN+g<commit>"): its version says nothing about its age.
+        warnings.warn(
+            f"vLLM {installed} is an untagged source build; abliterix cannot "
+            "tell its version and assumes it is recent. Run smoke tests first.",
+            stacklevel=2,
+        )
+        return parsed
     if parsed < _MIN_VLLM:
         raise ImportError(
             f"abliterix requires vllm>={'.'.join(str(p) for p in _MIN_VLLM)}, "
