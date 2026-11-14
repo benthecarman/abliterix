@@ -4,6 +4,8 @@ state after ``k`` layers) lands at index ``k``, HF's ``hidden_states[k]``."""
 import sys
 from types import SimpleNamespace as NS
 
+import os
+
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -222,3 +224,20 @@ def test_aux_layer_capture_refuses_extra_forwards(monkeypatch, tmp_path):
     config = AbliterixConfig(model={"vllm_hidden_state_capture": "aux_layers"})
     with pytest.raises(RuntimeError, match="one forward"):
         hs.extract_hidden_states_vllm(config, {"benign": [ChatMessage(system="", user="0")]})
+
+
+def test_aux_layer_capture_keeps_expandable_segments(monkeypatch, tmp_path):
+    seen = {}
+    fake = _aux_vllm(seen)
+    allocs = []
+
+    class LLM(fake.LLM):
+        def __init__(self, **kwargs):
+            allocs.append(os.environ.get("PYTORCH_CUDA_ALLOC_CONF"))
+            super().__init__(**kwargs)
+
+    _aux_setup(monkeypatch, tmp_path, NS(LLM=LLM, SamplingParams=fake.SamplingParams))
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    config = AbliterixConfig(model={"vllm_hidden_state_capture": "aux_layers"})
+    hs.extract_hidden_states_vllm(config, {"benign": [ChatMessage(system="", user="0")]})
+    assert allocs == ["expandable_segments:True"]

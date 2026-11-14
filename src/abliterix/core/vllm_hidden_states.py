@@ -398,7 +398,10 @@ def extract_hidden_states_vllm(
         kwargs["enable_prefix_caching"] = False
 
     try:
-        with _without_expandable_segments():
+        # vLLM refuses a KV connector under expandable segments; the aux-layer
+        # capture has no connector, so its engine keeps the allocator as set.
+        allocator = contextlib.nullcontext() if aux_capture else _without_expandable_segments()
+        with allocator:
             llm = LLM(**kwargs)
     except BaseException:
         shutil.rmtree(tmpdir, ignore_errors=True)
