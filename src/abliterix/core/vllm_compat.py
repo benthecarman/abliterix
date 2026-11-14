@@ -216,3 +216,26 @@ def install_gemma4_transformers_compat() -> None:
 
     from_pretrained_with_gemma4_extra_tokens._abliterix_gemma4_patch = True  # type: ignore[attr-defined]
     AutoTokenizer.from_pretrained = from_pretrained_with_gemma4_extra_tokens
+
+
+def transformers_config(path, **kwargs):
+    """``AutoConfig.from_pretrained``, but always transformers' own config class.
+
+    Loading some models in vLLM (Inkling 2) registers vLLM's config class over
+    transformers' for the same model type (``AutoConfig.register(...,
+    exist_ok=True)``). After an in-process vLLM engine, ``AutoConfig`` then
+    returns vLLM's class, which transformers' AutoModel mappings and model
+    classes do not accept. Configs from remote code are returned unchanged."""
+    import transformers
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+    config = AutoConfig.from_pretrained(path, **kwargs)
+    if not type(config).__module__.startswith("vllm."):
+        return config
+    name = CONFIG_MAPPING_NAMES.get(getattr(config, "model_type", None))
+    native = getattr(transformers, name, None) if name else None
+    if native is None:
+        return config
+    kwargs.pop("trust_remote_code", None)
+    return native.from_pretrained(path, **kwargs)

@@ -1685,7 +1685,6 @@ def checkpoint_name_map(
     defaults to the config's first architecture.
     """
     import transformers
-    from transformers import AutoConfig
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import (
         MergeModulelist,
@@ -1694,7 +1693,9 @@ def checkpoint_name_map(
         rename_source_key,
     )
 
-    config = AutoConfig.from_pretrained(str(src_dir))
+    from .vllm_compat import transformers_config
+
+    config = transformers_config(str(src_dir))
     name = model_class or (getattr(config, "architectures", None) or [None])[0]
     cls = getattr(transformers, name, None) if name else None
     if cls is None:

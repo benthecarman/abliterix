@@ -184,3 +184,32 @@ def test_old_release_is_still_refused():
 
     with pytest.raises(ImportError):
         check_vllm_version("0.17.1")
+
+
+def test_transformers_config_undoes_a_vllm_registration(tmp_path):
+    """vLLM registers its own config class over transformers' for a model
+    type (Inkling 2). ``transformers_config`` still returns transformers'
+    class, so AutoModel mappings accept it; ``AutoConfig`` does not."""
+    import json
+
+    from transformers import AutoConfig, LlamaConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from abliterix.core.vllm_compat import transformers_config
+
+    class VllmLlamaConfig(LlamaConfig):
+        model_type = "llama"
+
+    VllmLlamaConfig.__module__ = "vllm.models.fake.configs"
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "llama", "hidden_size": 64})
+    )
+    AutoConfig.register("llama", VllmLlamaConfig, exist_ok=True)
+    try:
+        assert type(AutoConfig.from_pretrained(tmp_path)) is VllmLlamaConfig
+        config = transformers_config(tmp_path, trust_remote_code=False)
+        assert type(config) is LlamaConfig
+        assert config.hidden_size == 64
+    finally:
+        CONFIG_MAPPING._extra_content.pop("llama", None)
+    assert type(transformers_config(tmp_path)) is LlamaConfig

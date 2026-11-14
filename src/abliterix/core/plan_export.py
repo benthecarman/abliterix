@@ -180,14 +180,13 @@ def config_skeleton(config: AbliterixConfig, src: Path | None = None):
     in the dtype it would load it in (the first of ``dtype_fallback_order``),
     unquantized. Conv taps come from the checkpoint (``src``, by default the
     model's own files)."""
-    from transformers import AutoConfig
-
     from .engine import SteeringEngine, resolve_model_class
+    from .vllm_compat import transformers_config
 
     src = src or model_dir(config)
     trust = config.model.trust_remote_code or False
     with tempfile.TemporaryDirectory(prefix="abliterix_skeleton_") as tmp:
-        hf_config = AutoConfig.from_pretrained(
+        hf_config = transformers_config(
             str(_loadable_config_dir(src, Path(tmp))), trust_remote_code=trust
         )
         cls = resolve_model_class(str(src), text_only=config.model.text_only)
