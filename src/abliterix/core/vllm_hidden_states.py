@@ -15,6 +15,7 @@ Requires vLLM >= 0.17.0 (PR #33736).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -159,6 +160,29 @@ def layer_rows(hs: Tensor, num_layers: int, token_offset: int = -1) -> Tensor:
     return torch.cat([placeholder, layer_vecs], dim=0)
 
 
+@contextlib.contextmanager
+def _without_expandable_segments():
+    """vLLM refuses the hidden-states KV connector when PyTorch's allocator
+    may remap memory (``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``,
+    which rented-machine drivers often set): drop that option while the
+    engine starts, so its processes inherit the environment without it, and
+    put it back after."""
+    key = "PYTORCH_CUDA_ALLOC_CONF"
+    before = os.environ.get(key)
+    if before is None or "expandable_segments" not in before:
+        yield
+        return
+    kept = [o for o in before.split(",") if o.strip() and not o.strip().startswith("expandable_segments")]
+    if kept:
+        os.environ[key] = ",".join(kept)
+    else:
+        del os.environ[key]
+    try:
+        yield
+    finally:
+        os.environ[key] = before
+
+
 def extract_hidden_states_vllm(
     config: AbliterixConfig,
     prompt_sets: dict[str, list[ChatMessage]],
@@ -279,7 +303,8 @@ def extract_hidden_states_vllm(
     # own comment notes that a partially-initialised engine pins the frame
     # and keeps its VRAM. It also guarantees the temp dir is removed.
     try:
-        llm = LLM(**kwargs)
+        with _without_expandable_segments():
+            llm = LLM(**kwargs)
     except BaseException:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise

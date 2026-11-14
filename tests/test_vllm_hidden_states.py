@@ -101,3 +101,18 @@ def test_inkling2_is_supported(monkeypatch, tmp_path, text_type, top_type, ok):
     monkeypatch.setattr(hs, "_load_text_config_data", lambda *a: text)
     config = AbliterixConfig(model={"model_id": str(tmp_path)})
     assert hs.is_model_supported(config) is ok
+
+
+def test_engine_starts_without_expandable_segments(monkeypatch):
+    import os
+
+    from abliterix.core import vllm_hidden_states as hs
+
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
+    with hs._without_expandable_segments():
+        assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:512"
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True,max_split_size_mb:512"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    with hs._without_expandable_segments():
+        assert "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
