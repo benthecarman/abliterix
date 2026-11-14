@@ -281,6 +281,26 @@ def load_search_state(config: AbliterixConfig, *, required: bool = False) -> dic
     return state
 
 
+def adopt_search_revision(config: AbliterixConfig) -> None:
+    """Give an unpinned config the model revision its search ran on.
+
+    The search pins ``model.revision`` to the Hub commit it resolved
+    (``pin_remote_sources``) and saves that in the search state; a config
+    loaded again from the same TOML has none. Taking the saved one keeps
+    the export on the search's commit, where resolving again could land on
+    a newer one. Changes nothing unless the saved state differs from the
+    config only in that revision."""
+    if config.model.revision is not None:
+        return
+    path = search_state_path(config)
+    if not path.exists():
+        return
+    state = torch.load(str(path), map_location="cpu", weights_only=False)
+    saved = state.get("fingerprint") or {}
+    if state.get("version") == SEARCH_STATE_VERSION and {**saved, "revision": None} == _fingerprint(config):
+        config.model.revision = saved.get("revision")
+
+
 # ---------------------------------------------------------------------------
 # The export
 # ---------------------------------------------------------------------------
@@ -342,6 +362,7 @@ def export_plan_without_model(
 
     artifact = extract_trial_artifact(trial)
     apply_trial_artifact(config, artifact, require_hf_backend=False)
+    adopt_search_revision(config)
     state = load_search_state(config, required=True)
     benign, target = state["benign_states"], state["target_states"]
     vectors = compute_trial_vectors(artifact, benign, target, config)

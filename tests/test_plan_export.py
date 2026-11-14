@@ -167,3 +167,18 @@ def test_export_needs_the_search_state_of_its_prompts(tmp_path):
     plan_only = pe.export_plan_without_model(config, _trial(), None)
     assert plan_only.stats is None and plan_only.edits
     assert not any(e.kind in ("row_scale", "expert_project") for e in plan_only.edits)
+
+
+def test_export_takes_the_revision_the_search_pinned(tmp_path):
+    n = _qwen3_moe(tmp_path / "m")
+    searched = _config(tmp_path / "m", tmp_path / "ck")
+    searched.model.revision = "a" * 40  # as pin_remote_sources leaves it
+    pe.save_search_state(searched, *_states(n, 32), None)
+    config = _config(tmp_path / "m", tmp_path / "ck")
+    assert config.model.revision is None
+    assert pe.export_plan_without_model(config, _trial(), None).edits
+    assert config.model.revision == "a" * 40
+    other = _config(tmp_path / "m", tmp_path / "ck")
+    other.system_prompt = "something else"
+    pe.adopt_search_revision(other)
+    assert other.model.revision is None
