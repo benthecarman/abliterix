@@ -134,6 +134,15 @@ def ensure_vllm_env(
     return written
 
 
+def _transformers_knows(model_type: str) -> bool:
+    """Whether this Transformers has its own config class for ``model_type``."""
+    try:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+    except ImportError:
+        return False
+    return model_type in CONFIG_MAPPING_NAMES
+
+
 def install_gemma4_transformers_compat() -> None:
     """Register minimal Gemma4 configs and patch a tokenizer_config quirk.
 
@@ -163,19 +172,23 @@ def install_gemma4_transformers_compat() -> None:
             else:
                 self.text_config = text_config
 
-    try:
-        AutoConfig.register("gemma4", Gemma4Config, exist_ok=True)
-        AutoConfig.register("gemma4_text", Gemma4TextConfig, exist_ok=True)
-    except ValueError:
-        pass
+    # Only where Transformers lacks Gemma4: registering with exist_ok replaces
+    # its real config classes, and vLLM then rejects the config it is handed
+    # ("Invalid type of HuggingFace config").
+    if not _transformers_knows("gemma4"):
+        try:
+            AutoConfig.register("gemma4", Gemma4Config, exist_ok=True)
+            AutoConfig.register("gemma4_text", Gemma4TextConfig, exist_ok=True)
+        except ValueError:
+            pass
 
-    try:
-        from vllm.transformers_utils import config as vllm_config
+        try:
+            from vllm.transformers_utils import config as vllm_config
 
-        vllm_config._CONFIG_REGISTRY.setdefault("gemma4", Gemma4Config)
-        vllm_config._CONFIG_REGISTRY.setdefault("gemma4_text", Gemma4TextConfig)
-    except Exception:
-        pass
+            vllm_config._CONFIG_REGISTRY.setdefault("gemma4", Gemma4Config)
+            vllm_config._CONFIG_REGISTRY.setdefault("gemma4_text", Gemma4TextConfig)
+        except Exception:
+            pass
 
     if getattr(AutoTokenizer.from_pretrained, "_abliterix_gemma4_patch", False):
         return
