@@ -241,3 +241,24 @@ def test_aux_layer_capture_keeps_expandable_segments(monkeypatch, tmp_path):
     config = AbliterixConfig(model={"vllm_hidden_state_capture": "aux_layers"})
     hs.extract_hidden_states_vllm(config, {"benign": [ChatMessage(system="", user="0")]})
     assert allocs == ["expandable_segments:True"]
+
+
+def test_aux_layer_capture_lets_vllm_pickle_its_worker_functions(monkeypatch, tmp_path):
+    """collective_rpc sends functions, which vLLM pickles only with this set; the
+    hidden-state engine starts before the search's, which also sets it."""
+    seen = {}
+    fake = _aux_vllm(seen)
+    env_at_start = []
+
+    class LLM(fake.LLM):
+        def __init__(self, **kwargs):
+            env_at_start.append(os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION"))
+            super().__init__(**kwargs)
+
+    _aux_setup(monkeypatch, tmp_path, NS(LLM=LLM, SamplingParams=fake.SamplingParams))
+    # setenv first, so the variable the code under test writes is removed after
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "unset")
+    monkeypatch.delenv("VLLM_ALLOW_INSECURE_SERIALIZATION")
+    config = AbliterixConfig(model={"vllm_hidden_state_capture": "aux_layers"})
+    hs.extract_hidden_states_vllm(config, {"benign": [ChatMessage(system="", user="0")]})
+    assert env_at_start == ["1"]

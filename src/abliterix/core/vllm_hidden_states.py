@@ -274,9 +274,14 @@ def extract_hidden_states_vllm(
         a zero placeholder for the embedding layer; indices 1..N are decoder
         layer outputs.
     """
-    from .vllm_compat import install_gemma4_transformers_compat
+    from .vllm_compat import ensure_vllm_env, install_gemma4_transformers_compat
 
     install_gemma4_transformers_compat()
+    if config.model.vllm_hidden_state_capture == "aux_layers":
+        # The aux-layer capture sends functions to the workers (collective_rpc),
+        # which vLLM pickles only with VLLM_ALLOW_INSECURE_SERIALIZATION set. The
+        # search's own engine sets it too, but this one starts first.
+        ensure_vllm_env(needs_collective_rpc=True)
 
     from vllm import LLM, SamplingParams
 
