@@ -278,25 +278,21 @@ def _detect_fp8_and_kv_dtype(
         config.model.quant_method and config.model.quant_method.value == "fp8"
     )
     if not is_fp8:
+        # The checkpoint's own config.json, not a config class: transformers'
+        # Inkling2Config adds a default FP8 quantization_config to an original
+        # checkpoint's config, and vLLM's class for the same model does not, so
+        # the answer would depend on whether vLLM was loaded first.
         try:
-            from transformers import AutoConfig
+            from transformers import PretrainedConfig
 
-            _auto_cfg = AutoConfig.from_pretrained(
-                model_id,
-                trust_remote_code=trust_remote_code,
-                revision=config.model.revision,
+            raw, _ = PretrainedConfig.get_config_dict(
+                model_id, revision=config.model.revision
             )
-            _qcfg = getattr(_auto_cfg, "quantization_config", None)
-            if _qcfg is None:
-                _text_cfg = getattr(_auto_cfg, "text_config", None)
-                if _text_cfg is not None:
-                    _qcfg = getattr(_text_cfg, "quantization_config", None)
-            if _qcfg is not None:
-                _qm = (
-                    _qcfg if isinstance(_qcfg, dict) else getattr(_qcfg, "__dict__", {})
-                )
-                if _qm.get("quant_method") == "fp8":
-                    is_fp8 = True
+            _qcfg = raw.get("quantization_config") or (
+                raw.get("text_config") or {}
+            ).get("quantization_config")
+            if isinstance(_qcfg, dict) and _qcfg.get("quant_method") == "fp8":
+                is_fp8 = True
         except Exception:
             pass
 
