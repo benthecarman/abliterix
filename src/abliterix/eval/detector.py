@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.request
 from collections import Counter
+from dataclasses import replace
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, cast
@@ -28,6 +29,20 @@ from ..settings import AbliterixConfig
 from ..types import ChatMessage
 from ..util import print
 from .metrics import ComplianceResult
+
+
+def answer_after_marker(text: str, marker: str, tokenizer, max_tokens: int) -> str | None:
+    """The answer in a reply decoded with special tokens kept: the text after the
+    first ``marker``, special tokens removed, cut to ``max_tokens`` tokens. None when
+    the reply never reaches the marker (it ran out of tokens while reasoning)."""
+    start = text.find(marker)
+    if start < 0:
+        return None
+    answer = text[start + len(marker):]
+    for token in sorted(tokenizer.all_special_tokens, key=len, reverse=True):
+        answer = answer.replace(token, "")
+    ids = tokenizer.encode(answer, add_special_tokens=False)[:max_tokens]
+    return tokenizer.decode(ids).strip()
 
 # Bump whenever the cache table schema changes.
 _CACHE_SCHEMA_VERSION = 1
@@ -624,6 +639,36 @@ class RefusalDetector:
             )
         return engine.generate_text_batched(messages, **kwargs)
 
+    def _responses(self, engine, messages) -> list[str | None]:
+        """The replies refusal evaluation judges. With ``answer_marker`` set, only
+        each reply's answer, after its reasoning; None where no answer came."""
+        inference = self.config.inference
+        marker = inference.answer_marker
+        if not marker:
+            return self._gen(
+                engine,
+                messages,
+                skip_special_tokens=True,
+                max_new_tokens=inference.max_gen_tokens,
+                min_new_tokens=inference.min_gen_tokens,
+            )
+        vllm_gen = getattr(engine, "_vllm_gen", None)
+        keep = {"keep_special_tokens": True} if vllm_gen is not None else {"skip_special_tokens": False}
+        raw = self._gen(
+            engine,
+            messages,
+            max_new_tokens=inference.max_gen_tokens + inference.reasoning_max_tokens,
+            min_new_tokens=inference.min_gen_tokens,
+            **keep,
+        )
+        tokenizer = getattr(vllm_gen, "tokenizer", None) or engine.tokenizer
+        answers = [answer_after_marker(t, marker, tokenizer, inference.max_gen_tokens) for t in raw]
+        missing = sum(a is None for a in answers)
+        if missing:
+            print(f"  * {missing}/{len(answers)} replies gave no answer within the reasoning budget "
+                  "(counted as refusals)")
+        return answers
+
     def _evaluate_keyword(self, engine, target_msgs: list[ChatMessage]) -> int:
         """Compatibility wrapper for complete keyword classifications."""
         return self._evaluate_keyword_result(engine, target_msgs).refusal_count
@@ -634,19 +679,15 @@ class RefusalDetector:
         target_msgs: list[ChatMessage],
     ) -> ComplianceResult:
         """Two-phase keyword detection: short-generate then full-generate for uncertain cases."""
-        short_responses = self._gen(
-            engine,
-            target_msgs,
-            skip_special_tokens=True,
-            max_new_tokens=self.config.inference.max_gen_tokens,
-            min_new_tokens=self.config.inference.min_gen_tokens,
-        )
+        short_responses = self._responses(engine, target_msgs)
 
         uncertain: list[int] = []
         results: list[tuple[str, bool | None]] = []
 
         for i, resp in enumerate(short_responses):
-            if self.detect_refusal(resp):
+            if resp is None:  # no answer within the reasoning budget
+                results.append(("", True))
+            elif self.detect_refusal(resp):
                 results.append((resp, True))
             elif len(resp.strip()) < 20:
                 uncertain.append(i)
@@ -656,16 +697,10 @@ class RefusalDetector:
 
         if uncertain:
             full_msgs = [target_msgs[i] for i in uncertain]
-            full_responses = self._gen(
-                engine,
-                full_msgs,
-                skip_special_tokens=True,
-                max_new_tokens=self.config.inference.max_gen_tokens,
-                min_new_tokens=self.config.inference.min_gen_tokens,
-            )
+            full_responses = self._responses(engine, full_msgs)
             for idx, full in zip(uncertain, full_responses):
-                is_ref = self.detect_refusal(full)
-                results[idx] = (full, is_ref)
+                is_ref = True if full is None else self.detect_refusal(full)
+                results[idx] = (full or "", is_ref)
 
         if self.config.display.print_responses:
             for msg, (resp, is_ref) in zip(target_msgs, results):
@@ -713,16 +748,16 @@ class RefusalDetector:
         Trial 50 on Mistral-7B-Instruct-RR recorded 34/100 with the shortcut
         but only 10/100 when every response was re-judged end-to-end.
         """
-        responses = self._gen(
-            engine,
-            target_msgs,
-            skip_special_tokens=True,
-            max_new_tokens=self.config.inference.max_gen_tokens,
-            min_new_tokens=self.config.inference.min_gen_tokens,
-        )
-
-        pairs = [(msg.user, resp) for msg, resp in zip(target_msgs, responses)]
+        answers = self._responses(engine, target_msgs)
+        answered = [i for i, a in enumerate(answers) if a is not None]
+        pairs = [(target_msgs[i].user, cast(str, answers[i])) for i in answered]
         result = self._batch_judge_classify_result(pairs)
+        if len(answered) < len(answers):  # no answer within the reasoning budget: a refusal
+            labels: list[bool | None] = [True] * len(answers)
+            for i, label in zip(answered, result.labels):
+                labels[i] = label
+            result = replace(result, labels=tuple(labels))
+        responses = [a or "" for a in answers]
         results = list(zip(responses, result.labels))
         detected = result.refusal_count
         print(

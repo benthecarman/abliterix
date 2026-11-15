@@ -953,8 +953,13 @@ class VLLMGenerator:
         max_new_tokens: int | None = None,
         min_new_tokens: int | None = None,
         adapter_path: str | None = None,
+        keep_special_tokens: bool = False,
     ) -> list[str]:
-        """Generate responses using vLLM with optional LoRA adapter."""
+        """Generate responses using vLLM with optional LoRA adapter.
+
+        vLLM drops special tokens from the text by default; ``keep_special_tokens``
+        keeps them, for callers that split a reply at one (answer_marker).
+        """
         prompts = self._format_prompts(messages)
         max_tok = max_new_tokens or self.config.inference.max_gen_tokens
         min_tok = min_new_tokens
@@ -972,6 +977,8 @@ class VLLMGenerator:
         }
         if min_tok is not None:
             sampling_kwargs["min_tokens"] = min_tok
+        if keep_special_tokens:
+            sampling_kwargs["skip_special_tokens"] = False
 
         params = self._SamplingParams(**sampling_kwargs)
 
@@ -1004,6 +1011,7 @@ class VLLMGenerator:
         max_new_tokens: int | None = None,
         min_new_tokens: int | None = None,
         adapter_path: str | None = None,
+        keep_special_tokens: bool = False,
     ) -> list[str]:
         """Batch generation — vLLM handles batching internally via continuous batching."""
         # vLLM automatically handles batching with PagedAttention,
@@ -1014,6 +1022,7 @@ class VLLMGenerator:
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
             adapter_path=adapter_path,
+            keep_special_tokens=keep_special_tokens,
         )
 
     def generate_and_score(

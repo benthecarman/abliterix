@@ -577,6 +577,24 @@ class InferenceConfig(BaseModel):
         description="Token budget for each generated response.",
     )
 
+    answer_marker: str | None = Field(
+        default=None,
+        description=(
+            "For models that reason before every answer, even with thinking off "
+            "(Inkling 2: '<|content_text|>'): the special token that opens the "
+            "answer. Refusal evaluation then judges only the text after it, cut to "
+            "max_gen_tokens, and a reply that never reaches it counts as a refusal."
+        ),
+    )
+
+    reasoning_max_tokens: int = Field(
+        default=0,
+        description=(
+            "Tokens allowed for the reasoning before the answer, on top of "
+            "max_gen_tokens, when answer_marker is set."
+        ),
+    )
+
     min_gen_tokens: int | None = Field(
         default=None,
         description=(

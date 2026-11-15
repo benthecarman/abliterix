@@ -861,8 +861,9 @@ def run() -> int:
                 f"* TP backend: skipping HF batch-size tuning, "
                 f"using batch_size={config.inference.batch_size}"
             )
-        if not _skip_hf_model:
-            # HF model is loaded — do minimal prefix detection.
+        if not _skip_hf_model and not config.inference.answer_marker:
+            # HF model is loaded — do minimal prefix detection. (With answer_marker the
+            # replies open with reasoning, whose shared words are no prefix to force.)
             print()
             print("Checking for common response prefix (minimal for TP backend)...")
             _mini_sample = benign_msgs[:1] + target_msgs[:1]
@@ -886,7 +887,8 @@ def run() -> int:
     else:
         if config.inference.batch_size == 0:
             config.inference.batch_size = _auto_batch_size(engine, benign_msgs, config)
-        _detect_response_prefix(engine, benign_msgs, target_msgs)
+        if not config.inference.answer_marker:
+            _detect_response_prefix(engine, benign_msgs, target_msgs)
 
     detector = RefusalDetector(config)
     try:
@@ -1388,7 +1390,7 @@ def run() -> int:
                     )
 
             # Detect response prefix via the fast TP backend (if not done earlier).
-            if not engine.response_prefix:
+            if not engine.response_prefix and not config.inference.answer_marker:
                 print("* Detecting response prefix via TP backend...")
                 _mini = benign_msgs[:2] + target_msgs[:2]
                 _resps = tp_gen.generate_text_batched(_mini, max_new_tokens=20)
