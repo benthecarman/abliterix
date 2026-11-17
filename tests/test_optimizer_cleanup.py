@@ -247,3 +247,38 @@ def test_partial_router_apply_failure_restores_router_and_adapter_state():
     assert engine._vllm_gen.router_restore_calls == 1
     assert engine._vllm_gen.mutated is False
     assert engine._current_adapter_path is None
+
+
+def test_trial_records_which_controls_held():
+    """A control count cannot say which hard limit went; the labels can."""
+    from abliterix.eval.metrics import ComplianceResult
+
+    class _ControlScorer(_Scorer):
+        detector = SimpleNamespace(
+            evaluate_compliance=lambda *_args: 0,
+            evaluate_compliance_result=lambda _engine, msgs: ComplianceResult(
+                labels=(False, True, False)[: len(msgs)],
+                evaluator="test",
+                protocol_version="1",
+            ),
+        )
+
+    config = AbliterixConfig(
+        model={"model_id": "dummy/model"},
+        steering={"fixed_vector_scope": "per layer"},
+        optimization={"num_trials": 1, "num_warmup_trials": 1},
+        detection={"control_prompts": ["a", "b", "c"]},
+    )
+    study = run_search(
+        config,
+        _InPlaceEngine(),
+        scorer=_ControlScorer(),
+        steering_vectors=torch.randn(5, 8),
+        safety_experts=None,
+        storage=InMemoryStorage(),
+    )
+
+    attrs = study.trials[0].user_attrs
+    assert attrs["controls_kept"] == 1
+    assert attrs["controls_total"] == 3
+    assert attrs["controls_refused"] == [False, True, False]

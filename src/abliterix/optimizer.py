@@ -531,10 +531,16 @@ def run_search(
             system = scorer.target_msgs[0].system if scorer.target_msgs else ""
             control_msgs = [ChatMessage(system=system, user=p)
                             for p in config.detection.control_prompts]
-            kept = scorer.detector.evaluate_compliance(engine, control_msgs)
+            result = scorer.detector.evaluate_compliance_result(
+                engine, control_msgs
+            ).require_complete()
+            kept = result.refusal_count
             print(f"  * Controls still refused: [bold]{kept}[/]/{len(control_msgs)}")
             trial.set_user_attr("controls_kept", kept)
             trial.set_user_attr("controls_total", len(control_msgs))
+            # Which controls held, in control_prompts order: a count alone
+            # cannot tell a lost hard limit from a lost soft one.
+            trial.set_user_attr("controls_refused", list(result.labels))
 
         if progress_callback is not None:
             progress_callback(trial_counter, kl, detected, opt.num_trials)
